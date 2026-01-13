@@ -57,6 +57,9 @@
         promptShown: false  // 標記是否已顯示儲存提示
     };
 
+    // 標記是否有儲存提示正在顯示（用於阻止自動退出）
+    let isSavePromptVisible = false;
+
     // 追蹤已處理過的對話 ID（包括儲存和不儲存的）
     let processedConversationIds = new Set();
 
@@ -104,6 +107,18 @@
 
     // 初始化時載入已處理的對話 ID
     loadProcessedConversationIds();
+
+    // 簡單的字串 hash 函數
+    function hashString(str) {
+        let hash = 0;
+        if (str.length === 0) return hash.toString();
+        for (let i = 0; i < str.length; i++) {
+            const char = str.charCodeAt(i);
+            hash = ((hash << 5) - hash) + char;
+            hash = hash & hash; // Convert to 32bit integer
+        }
+        return Math.abs(hash).toString(36);
+    }
 
     // 初始化新對話
     function initNewConversation() {
@@ -160,8 +175,31 @@
             messageText = messageDiv.textContent.trim();
         }
 
+        // 過濾掉系統提示訊息（如「對方正在輸入...」）
+        const systemMessages = [
+            '對方正在輸入',
+            '正在輸入',
+            'typing',
+            'Typing'
+        ];
+
+        const isSystemMessage = systemMessages.some(systemMsg =>
+            messageText.includes(systemMsg)
+        );
+
+        // 如果是系統提示訊息，跳過不收集
+        if (isSystemMessage) {
+            console.log('跳過系統提示訊息:', messageText);
+            return;
+        }
+
+        // 使用訊息內容生成 hash 作為唯一標識
+        // 組合：文字內容 + 是否為自己的訊息 + 時間戳
+        const messageKey = `${messageText}|${isMyMessage}|${timestamp || ''}`;
+        const messageHash = hashString(messageKey);
+
         const messageData = {
-            id: messageLi.className,
+            id: messageHash,  // 使用 hash 作為 ID
             text: messageText,
             isMyMessage: isMyMessage,
             avatarUrl: avatarUrl,
@@ -169,11 +207,13 @@
             collectedAt: new Date().toISOString()
         };
 
-        // 檢查是否已經收集過這條訊息
-        const existingIndex = currentConversation.messages.findIndex(m => m.id === messageData.id);
+        // 檢查是否已經收集過這條訊息（使用 hash 來判斷）
+        const existingIndex = currentConversation.messages.findIndex(m => m.id === messageHash);
         if (existingIndex === -1) {
             currentConversation.messages.push(messageData);
             console.log('收集訊息:', messageData);
+        } else {
+            console.log('訊息已存在，跳過:', messageText);
         }
     }
 
@@ -376,6 +416,11 @@
             return;
         }
 
+        // 如果儲存提示正在顯示，不要自動點擊退出/重新配對按鈕
+        if (isSavePromptVisible) {
+            return;
+        }
+
         // Find all buttons
         const buttons = document.querySelectorAll('button');
 
@@ -385,28 +430,39 @@
                 console.log('Re-match button found! Waiting 3 seconds before clicking to avoid slow pairing...');
                 // 在重新配對前，檢查是否需要儲存對話
                 checkConversationEnd();
-                setTimeout(() => {
-                    simulateMouseClick(button);
-                    // 重新配對後初始化新對話
+                // 只有在沒有儲存提示顯示時才自動點擊
+                if (!isSavePromptVisible) {
                     setTimeout(() => {
-                        initNewConversation();
-                    }, 1000);
-                }, 3000);
+                        if (!isSavePromptVisible) {  // 再次檢查，確保提示沒有在延遲期間顯示
+                            simulateMouseClick(button);
+                            // 重新配對後初始化新對話
+                            setTimeout(() => {
+                                initNewConversation();
+                            }, 1000);
+                        }
+                    }, 3000);
+                }
                 return;
             }
 
             // Check for the "Confirm" button when exiting
             // It searches for "確定" and ensures the data-test attribute is "ok"
             if (button.textContent.includes('確定') && button.getAttribute('data-test') === 'ok') {
-                console.log('Confirm exit button found! Clicking...');
+                console.log('Confirm exit button found!');
                 // 在退出前，檢查是否需要儲存對話
                 checkConversationEnd();
-                simulateMouseClick(button);
-                // 退出後初始化新對話
-                setTimeout(() => {
+                // 只有在沒有儲存提示顯示時才自動點擊
+                if (!isSavePromptVisible) {
+                    console.log('Clicking confirm exit button...');
+                    simulateMouseClick(button);
+                    // 退出後初始化新對話
+                    setTimeout(() => {
                         console.log('Initializing new conversation...');
-                    initNewConversation();
-                }, 1000);
+                        initNewConversation();
+                    }, 1000);
+                } else {
+                    console.log('儲存提示顯示中，等待用戶決定...');
+                }
                 return;
             }
         }
@@ -655,6 +711,9 @@
             return;
         }
 
+        // 標記儲存提示正在顯示
+        isSavePromptVisible = true;
+
         const prompt = document.createElement('div');
         prompt.id = 'knock-save-prompt';
         prompt.style.cssText = `
@@ -708,6 +767,7 @@
         // 不儲存按鈕
         document.getElementById('knock-save-cancel').addEventListener('click', () => {
             prompt.remove();
+            isSavePromptVisible = false; // 清除標記，允許繼續自動操作
             // 將對話 ID 加入已處理列表，避免重複詢問
             if (currentConversation.id) {
                 processedConversationIds.add(currentConversation.id);
@@ -735,16 +795,24 @@
                 `;
                 setTimeout(() => {
                     prompt.remove();
+                    isSavePromptVisible = false; // 清除標記，允許繼續自動操作
                 }, 1500);
             } else {
                 alert('儲存失敗，請重試');
             }
         });
 
-        // 點擊背景關閉
+        // 點擊背景關閉（視為不儲存）
         prompt.addEventListener('click', (e) => {
             if (e.target === prompt) {
                 prompt.remove();
+                isSavePromptVisible = false; // 清除標記，允許繼續自動操作
+                // 將對話 ID 加入已處理列表（視為不儲存）
+                if (currentConversation.id) {
+                    processedConversationIds.add(currentConversation.id);
+                    saveProcessedConversationIds();
+                }
+                currentConversation.saved = true;
             }
         });
     }
@@ -931,6 +999,29 @@
             return;
         }
 
+        // 對訊息按時間排序（使用 timestamp）
+        const sortedMessages = [...conversation.messages].sort((a, b) => {
+            // 將 timestamp (如 "01:59") 轉換為可比較的格式
+            const parseTime = (timeStr) => {
+                if (!timeStr) return 0; // 沒有時間戳的訊息放在前面
+                const parts = timeStr.split(':');
+                if (parts.length !== 2) return Infinity;
+                const hours = parseInt(parts[0], 10);
+                const minutes = parseInt(parts[1], 10);
+                if (isNaN(hours) || isNaN(minutes)) return Infinity;
+                return hours * 60 + minutes; // 轉換為分鐘數
+            };
+
+            const timeA = parseTime(a.timestamp);
+            const timeB = parseTime(b.timestamp);
+
+            if (timeA === Infinity && timeB === Infinity) return 0;
+            if (timeA === Infinity) return 1;
+            if (timeB === Infinity) return -1;
+
+            return timeA - timeB;
+        });
+
         const detail = document.createElement('div');
         detail.id = 'knock-conversation-detail';
         detail.style.cssText = `
@@ -971,20 +1062,52 @@
                 </div>
 
                 <div id="knock-messages-container" style="display: flex; flex-direction: column; gap: 12px;">
-                    ${conversation.messages.map(msg => `
+                    ${sortedMessages.map(msg => `
                         <div style="
-                            background: ${msg.isMyMessage ? '#2d5a3d' : '#2d2d3d'};
-                            border-radius: 8px;
-                            padding: 12px;
-                            margin-left: ${msg.isMyMessage ? 'auto' : '0'};
-                            margin-right: ${msg.isMyMessage ? '0' : 'auto'};
-                            max-width: 70%;
+                            display: flex;
+                            align-items: flex-start;
+                            gap: 8px;
+                            flex-direction: ${msg.isMyMessage ? 'row-reverse' : 'row'};
+                            margin-bottom: 12px;
                         ">
-                            <div style="font-size: 12px; color: #888; margin-bottom: 4px;">
-                                ${msg.isMyMessage ? '我' : '對方'} ${msg.timestamp || ''}
+                            <div style="
+                                width: 40px;
+                                height: 40px;
+                                border-radius: 50%;
+                                flex-shrink: 0;
+                                background: #333;
+                                display: flex;
+                                align-items: center;
+                                justify-content: center;
+                                overflow: hidden;
+                            ">
+                                ${msg.avatarUrl ?
+                                    `<img src="${msg.avatarUrl}" style="width: 100%; height: 100%; object-fit: cover;" alt="avatar">` :
+                                    `<div style="color: #888; font-size: 18px;">${msg.isMyMessage ? '我' : '對'}</div>`
+                                }
                             </div>
-                            <div style="font-size: 14px; line-height: 1.6; white-space: pre-wrap; word-wrap: break-word;">
-                                ${msg.text}
+                            <div style="
+                                background: ${msg.isMyMessage ? '#2d5a3d' : '#2d2d3d'};
+                                border-radius: 8px;
+                                padding: 10px 12px;
+                                max-width: 70%;
+                                position: relative;
+                                display: flex;
+                                flex-direction: column;
+                            ">
+                                <div style="font-size: 14px; line-height: 1.6; word-wrap: break-word; margin-bottom: ${msg.timestamp ? '4px' : '0'};">
+                                    ${msg.text}
+                                </div>
+                                ${msg.timestamp ? `
+                                    <div style="
+                                        font-size: 11px;
+                                        color: rgba(255, 255, 255, 0.5);
+                                        align-self: flex-end;
+                                        margin-top: 2px;
+                                    ">
+                                        ${msg.timestamp}
+                                    </div>
+                                ` : ''}
                             </div>
                         </div>
                     `).join('')}
@@ -1003,6 +1126,62 @@
                 detail.remove();
             }
         });
+    }
+    // ====================
+
+    // ===== 手動儲存對話功能 =====
+    function manualSaveConversation() {
+        // 檢查是否有當前對話
+        if (!currentConversation.id || currentConversation.messages.length === 0) {
+            alert('目前沒有可儲存的對話');
+            return;
+        }
+
+        // 檢查對話是否已經儲存
+        if (currentConversation.saved) {
+            alert('此對話已經儲存過了');
+            return;
+        }
+
+        // 檢查對話是否已經被處理過
+        if (isConversationProcessed(currentConversation.id)) {
+            alert('此對話已經儲存過了');
+            return;
+        }
+
+        // 儲存對話
+        if (saveConversation(currentConversation)) {
+            // 顯示成功提示
+            const toast = document.createElement('div');
+            toast.style.cssText = `
+                position: fixed;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%, -50%);
+                z-index: 10004;
+                background: rgba(0, 0, 0, 0.9);
+                border-radius: 12px;
+                padding: 20px 32px;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                font-size: 16px;
+                color: #fff;
+                box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+                display: flex;
+                align-items: center;
+                gap: 12px;
+            `;
+            toast.innerHTML = `
+                <span style="font-size: 24px;">✓</span>
+                <span>對話已成功儲存</span>
+            `;
+            document.body.appendChild(toast);
+
+            setTimeout(() => {
+                toast.remove();
+            }, 2000);
+        } else {
+            alert('儲存失敗，請重試');
+        }
     }
     // ====================
 
@@ -1063,11 +1242,72 @@
         });
     }
 
-    // 等待 DOM 載入完成後創建管理按鈕
+    // ===== 手動儲存按鈕 =====
+    function createManualSaveButton() {
+        if (document.getElementById('knock-manual-save-button')) {
+            return;
+        }
+
+        const button = document.createElement('div');
+        button.id = 'knock-manual-save-button';
+        button.style.cssText = `
+            position: fixed;
+            top: 120px;
+            right: 20px;
+            z-index: 10000;
+            background: rgba(0, 0, 0, 0.8);
+            border-radius: 8px;
+            padding: 12px 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            font-size: 14px;
+            color: #fff;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+            cursor: pointer;
+            user-select: none;
+            transition: all 0.3s ease;
+        `;
+
+        button.innerHTML = `
+            <span>💾</span>
+            <span>儲存對話</span>
+        `;
+
+        button.addEventListener('click', (e) => {
+            e.stopPropagation();
+            manualSaveConversation();
+        });
+
+        document.body.appendChild(button);
+
+        // 確保按鈕始終存在
+        const ensureButtonVisible = () => {
+            if (!document.getElementById('knock-manual-save-button')) {
+                createManualSaveButton();
+            }
+        };
+
+        const buttonObserver = new MutationObserver(() => {
+            ensureButtonVisible();
+        });
+
+        buttonObserver.observe(document.body, {
+            childList: true,
+            subtree: false
+        });
+    }
+
+    // 等待 DOM 載入完成後創建按鈕
     if (document.body) {
         createManagerButton();
+        createManualSaveButton();
     } else {
-        window.addEventListener('DOMContentLoaded', createManagerButton);
+        window.addEventListener('DOMContentLoaded', () => {
+            createManagerButton();
+            createManualSaveButton();
+        });
     }
     // ====================
 
@@ -1077,6 +1317,8 @@
         checkNewMessages();
         // 檢查按鈕（原有的重新配對和確認退出功能）
         checkForButtonAndClick();
+        // 獨立檢測對話是否結束（不依賴自動點擊功能）
+        checkConversationEnd();
     });
 
     // Start observing the body for added nodes
@@ -1085,8 +1327,14 @@
         subtree: true
     });
 
+    // 定期檢查對話是否結束（確保即使自動點擊關閉也能檢測到）
+    setInterval(() => {
+        checkConversationEnd();
+    }, 2000); // 每2秒檢查一次
+
     // Initial check in case the button is already there
     checkForButtonAndClick();
     checkNewMessages();
+    checkConversationEnd();
 
 })();
