@@ -17,6 +17,7 @@
     ];
     const PENDING_START_CHAT_KEY = 'knockPendingStartChat';
     const PENDING_START_CHAT_TTL_MS = 30000;
+    const FIRST_MSG_FILTER_KEY = 'knockFirstMessageFilters';
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const FLOAT_STYLE = `
@@ -55,6 +56,7 @@
     let isSavePromptVisible = false;
     let processedConversationIds = new Set(storageGet('knockProcessedConversationIds', []));
     let notificationsArmed = false;
+    let sawFirstOtherMessage = false;
 
     function emptyConversation() {
         return { id: null, messages: [], startTime: null, endTime: null, saved: false, promptShown: false };
@@ -102,7 +104,70 @@
             saved: false,
             promptShown: false
         };
+        sawFirstOtherMessage = false;
         console.log('初始化新對話:', currentConversation.id);
+    }
+
+    function getFirstMessageFilters() {
+        return storageGet(FIRST_MSG_FILTER_KEY, []);
+    }
+
+    function isFirstMessageFiltered(text) {
+        return getFirstMessageFilters().includes((text || '').trim());
+    }
+
+    function addFirstMessageFilter(text) {
+        const t = (text || '').trim();
+        if (!t || TYPING_RE.test(t)) return false;
+        const list = getFirstMessageFilters();
+        if (list.includes(t)) return false;
+        list.push(t);
+        return storageSet(FIRST_MSG_FILTER_KEY, list);
+    }
+
+    function removeFirstMessageFilter(text) {
+        return storageSet(FIRST_MSG_FILTER_KEY, getFirstMessageFilters().filter(t => t !== text));
+    }
+
+    function clearFirstMessageFilters() {
+        return storageSet(FIRST_MSG_FILTER_KEY, []);
+    }
+
+    function paintRememberButton(btn, on) {
+        btn.textContent = on ? '已記住' : '記住首則';
+        btn.style.background = on ? '#666' : '#ff9800';
+    }
+
+    function syncRememberButtons() {
+        document.querySelectorAll('.knock-remember-first, .knock-remember-first-saved').forEach(btn => {
+            const text = decodeURIComponent(btn.dataset.filterText || '');
+            paintRememberButton(btn, !!(text && isFirstMessageFiltered(text)));
+        });
+        const badge = document.getElementById('knock-filter-count');
+        if (badge) badge.textContent = String(getFirstMessageFilters().length);
+    }
+
+    function toggleFirstMessageFilter(text) {
+        const t = (text || '').trim();
+        if (!t) return false;
+        if (isFirstMessageFiltered(t)) {
+            removeFirstMessageFilter(t);
+            syncRememberButtons();
+            showToast('已從首則過濾移除');
+            return false;
+        }
+        if (addFirstMessageFilter(t)) {
+            syncRememberButtons();
+            showToast('已記住這則，之後首則相同會自動離開');
+            return true;
+        }
+        return false;
+    }
+
+    function escapeHtml(s) {
+        return String(s).replace(/[&<>"']/g, c => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }[c]));
     }
 
     function isMyMessageLi(messageLi) {
@@ -351,8 +416,20 @@
             const messageDiv = messageLi.querySelector('div[data-test="message"]');
             if (!messageDiv || isMyMessageLi(messageLi)) continue;
 
+            const messageText = getMessageText(messageDiv);
+            if (TYPING_RE.test(messageText)) continue;
+
+            if (!sawFirstOtherMessage) {
+                sawFirstOtherMessage = true;
+                if (autoClickEnabled && isFirstMessageFiltered(messageText)) {
+                    console.log('首則訊息命中過濾，自動離開:', messageText);
+                    activelyLeaveConversation(messageId);
+                    return;
+                }
+            }
+
             const notifyText = (messageDiv.textContent || '').trim();
-            if (notifyText && !TYPING_RE.test(notifyText)) notifyNewMessage(notifyText);
+            if (notifyText) notifyNewMessage(notifyText);
 
             if (checkAvatarMatch(messageLi) || checkMessageAgainstBlacklist(messageDiv)) {
                 activelyLeaveConversation(messageId);
@@ -360,7 +437,41 @@
             }
         }
 
+        decorateOtherMessages();
         checkConversationEnd();
+    }
+
+    function decorateOtherMessages() {
+        const list = document.querySelector('ul[data-test="messages"]');
+        if (!list) return;
+
+        for (const li of list.querySelectorAll('li.message-li')) {
+            if (li.querySelector('.knock-remember-first') || isMyMessageLi(li)) continue;
+            const messageDiv = li.querySelector('div[data-test="message"]');
+            if (!messageDiv) continue;
+            const text = getMessageText(messageDiv);
+            if (!text || TYPING_RE.test(text)) continue;
+
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'knock-remember-first';
+            btn.dataset.filterText = encodeURIComponent(text);
+            btn.textContent = isFirstMessageFiltered(text) ? '已記住' : '記住首則';
+            btn.title = '之後對方第一則若完全相同，會自動離開並開新對話';
+            btn.style.cssText = `
+                flex-shrink:0;align-self:center;margin:0 6px;padding:2px 8px;
+                font-size:11px;font-family:${FONT};line-height:1.4;white-space:nowrap;
+                background:${isFirstMessageFiltered(text) ? '#666' : '#ff9800'};color:#fff;
+                border:none;border-radius:4px;cursor:pointer;
+            `;
+            btn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                toggleFirstMessageFilter(text);
+            });
+            const row = li.firstElementChild;
+            (row || li).appendChild(btn);
+        }
     }
 
     function showToast(message) {
@@ -583,6 +694,60 @@
             </div>`;
     }
 
+    function refreshFirstFilterManager() {
+        if (!document.getElementById('knock-first-filter-manager')) return;
+        document.getElementById('knock-first-filter-manager').remove();
+        createFirstFilterManager();
+    }
+
+    function createFirstFilterManager() {
+        const existing = document.getElementById('knock-first-filter-manager');
+        if (existing) {
+            existing.remove();
+            return;
+        }
+
+        const filters = getFirstMessageFilters();
+        const panel = document.createElement('div');
+        panel.id = 'knock-first-filter-manager';
+        panel.style.cssText = `
+            position:fixed;top:0;left:0;width:100%;height:100%;z-index:10002;
+            background:rgba(0,0,0,0.9);font-family:${FONT};color:#fff;overflow-y:auto;
+        `;
+        panel.innerHTML = `
+            <div style="max-width:720px;margin:0 auto;padding:24px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;">
+                    <h2 style="margin:0;font-size:24px;">首則過濾（${filters.length}）</h2>
+                    <div style="display:flex;gap:8px;">
+                        <button id="knock-clear-first-filters" style="padding:8px 16px;background:#d32f2f;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;" ${filters.length ? '' : 'disabled'}>全部清空</button>
+                        <button id="knock-filter-manager-close" style="padding:8px 16px;background:#444;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;">關閉</button>
+                    </div>
+                </div>
+                <div style="font-size:13px;color:#888;margin-bottom:16px;">對方第一則若與下列完全相同，會自動離開並開新對話。聊天中再點一次「已記住」也可移除。</div>
+                <input type="text" id="knock-filter-search" placeholder="搜尋已記住的訊息..." style="width:100%;padding:12px;background:#333;border:1px solid #555;border-radius:6px;color:#fff;font-size:14px;box-sizing:border-box;margin-bottom:16px;">
+                <div id="knock-filter-list" style="display:flex;flex-direction:column;gap:8px;">
+                    ${filters.length === 0
+                        ? '<div style="text-align:center;padding:40px;color:#888;">尚未記住任何訊息</div>'
+                        : filters.map(t => `
+                            <div class="knock-filter-card" style="display:flex;gap:8px;align-items:flex-start;background:#222;border:1px solid #444;border-radius:8px;padding:12px;">
+                                <div style="flex:1;font-size:14px;color:#ccc;white-space:pre-wrap;word-break:break-word;">${escapeHtml(t)}</div>
+                                <button class="knock-remove-first-filter" data-filter-text="${encodeURIComponent(t)}" style="padding:6px 10px;background:#d32f2f;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;flex-shrink:0;">刪除</button>
+                            </div>`).join('')}
+                </div>
+            </div>`;
+        document.body.appendChild(panel);
+
+        const close = () => panel.remove();
+        document.getElementById('knock-filter-manager-close').onclick = close;
+        panel.addEventListener('click', (e) => { if (e.target === panel) close(); });
+        document.getElementById('knock-filter-search').addEventListener('input', (e) => {
+            const term = e.target.value.toLowerCase();
+            panel.querySelectorAll('.knock-filter-card').forEach(card => {
+                card.style.display = card.textContent.toLowerCase().includes(term) ? 'flex' : 'none';
+            });
+        });
+    }
+
     function createConversationManager() {
         const existing = document.getElementById('knock-conversation-manager');
         if (existing) {
@@ -662,8 +827,9 @@
                                     : `<div style="color:#888;font-size:18px;">${msg.isMyMessage ? '我' : '對'}</div>`}
                             </div>
                             <div style="background:${msg.isMyMessage ? '#2d5a3d' : '#2d2d3d'};border-radius:8px;padding:8px 10px;max-width:70%;display:flex;align-items:center;gap:8px;">
-                                <div style="font-size:14px;line-height:1.4;word-wrap:break-word;flex:1;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;max-height:2.8em;">${msg.text}</div>
+                                <div style="font-size:14px;line-height:1.4;word-wrap:break-word;flex:1;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;max-height:2.8em;">${escapeHtml(msg.text)}</div>
                                 ${msg.timestamp ? `<div style="font-size:11px;color:rgba(255,255,255,0.5);flex-shrink:0;white-space:nowrap;">${msg.timestamp}</div>` : ''}
+                                ${!msg.isMyMessage ? `<button class="knock-remember-first-saved" data-filter-text="${encodeURIComponent(msg.text)}" style="padding:2px 8px;background:${isFirstMessageFiltered(msg.text) ? '#666' : '#ff9800'};color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:11px;flex-shrink:0;white-space:nowrap;">${isFirstMessageFiltered(msg.text) ? '已記住' : '記住首則'}</button>` : ''}
                             </div>
                         </div>
                     `).join('')}
@@ -689,6 +855,28 @@
     }
 
     document.addEventListener('click', (e) => {
+        if (e.target.classList.contains('knock-remove-first-filter')) {
+            const text = decodeURIComponent(e.target.dataset.filterText || '');
+            if (text) {
+                removeFirstMessageFilter(text);
+                syncRememberButtons();
+                refreshFirstFilterManager();
+            }
+            return;
+        }
+        if (e.target.classList.contains('knock-remember-first-saved')) {
+            toggleFirstMessageFilter(decodeURIComponent(e.target.dataset.filterText || ''));
+            return;
+        }
+        if (e.target.id === 'knock-clear-first-filters') {
+            if (getFirstMessageFilters().length && confirm('確定清空全部首則過濾？')) {
+                clearFirstMessageFilters();
+                syncRememberButtons();
+                refreshFirstFilterManager();
+            }
+            return;
+        }
+
         const convId = e.target.getAttribute?.('data-conv-id');
         if (!convId) return;
         if (e.target.classList.contains('knock-delete-btn')) {
@@ -708,6 +896,12 @@
         createToggleSwitch();
         createFloatButton('knock-manager-button', 70, '<span>📚</span><span>對話記錄</span>', createConversationManager);
         createFloatButton('knock-manual-save-button', 120, '<span>💾</span><span>儲存對話</span>', manualSaveConversation);
+        createFloatButton(
+            'knock-filter-manager-button',
+            170,
+            `<span>🚫</span><span>首則過濾</span><span id="knock-filter-count" style="background:#ff9800;border-radius:10px;padding:0 6px;font-size:12px;min-width:1.2em;text-align:center;">${getFirstMessageFilters().length}</span>`,
+            createFirstFilterManager
+        );
     }
 
     if (document.body) mountChrome();
@@ -716,6 +910,7 @@
     new MutationObserver(() => {
         mountChrome();
         checkNewMessages();
+        decorateOtherMessages();
         checkForButtonAndClick();
         checkConversationEnd();
     }).observe(document.documentElement, { childList: true, subtree: true });
