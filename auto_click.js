@@ -556,6 +556,33 @@
         }
     }
 
+    // 失焦時對方新訊息才通知；第一次掃描不發，避免舊訊息洗版
+    let notificationsArmed = false;
+
+    function isPageUnfocused() {
+        return document.hidden || !document.hasFocus();
+    }
+
+    function requestNotifyPermission() {
+        if (!('Notification' in window) || Notification.permission !== 'default') return;
+        Notification.requestPermission().catch(() => {});
+    }
+
+    function notifyNewMessage(text) {
+        if (!notificationsArmed || !isPageUnfocused()) return;
+        if (!('Notification' in window) || Notification.permission !== 'granted') return;
+
+        const body = (text || '你有一則新訊息').replace(/\s+/g, ' ').trim().slice(0, 80) || '你有一則新訊息';
+        const notification = new Notification('Knock 新訊息', {
+            body,
+            tag: 'knock-new-message'
+        });
+        notification.onclick = () => {
+            window.focus();
+            notification.close();
+        };
+    }
+
     // 檢查新訊息並處理黑名單
     function checkNewMessages() {
         // 找到訊息列表
@@ -613,6 +640,11 @@
             if (isMyMessage) {
                 console.log('自己的訊息，不進行檢查');
                 continue;
+            }
+
+            const notifyText = (messageDiv.textContent || '').trim();
+            if (notifyText && !/對方正在輸入|正在輸入/i.test(notifyText)) {
+                notifyNewMessage(notifyText);
             }
 
             // 檢查頭像是否與自己相同
@@ -709,6 +741,7 @@
             toggleSlider.style.left = autoClickEnabled ? '26px' : '2px';
 
             console.log('自動點擊功能已', autoClickEnabled ? '開啟' : '關閉');
+            requestNotifyPermission();
         });
 
         // 添加到頁面
@@ -1593,8 +1626,10 @@
     if (isPendingStartChat()) {
         console.log('重整後繼續：等待「開始聊天」按鈕...');
     }
+    requestNotifyPermission();
     checkForButtonAndClick();
     checkNewMessages();
+    notificationsArmed = true;
     checkConversationEnd();
 
 })();
