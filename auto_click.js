@@ -188,7 +188,20 @@
         if (!timeEl) return messageDiv.textContent.trim();
         const clone = messageDiv.cloneNode(true);
         clone.querySelector('div[style*="grid-area: date"]')?.remove();
+        clone.querySelectorAll('[data-test="message-image"]').forEach(el => el.remove());
         return clone.textContent.trim();
+    }
+
+    function getMessageImages(messageDiv) {
+        return Array.from(messageDiv.querySelectorAll('[data-test="message-image"] img'))
+            .map(img => img.currentSrc || img.src)
+            .filter(src => src && /^https?:\/\//.test(src));
+    }
+
+    function messagePreviewText(msg) {
+        if (msg.text) return msg.text;
+        if (msg.imageUrls && msg.imageUrls.length) return '[圖片]';
+        return '';
     }
 
     function collectMessage(messageLi) {
@@ -199,20 +212,24 @@
         const timeElement = messageDiv.querySelector('span[data-test="date"]');
         const timestamp = timeElement ? timeElement.textContent.trim() : null;
         const messageText = getMessageText(messageDiv);
+        const imageUrls = getMessageImages(messageDiv);
         if (TYPING_RE.test(messageText)) return;
+        if (!messageText && !imageUrls.length) return;
 
-        const messageHash = hashString(`${messageText}|${isMyMessage}|${timestamp || ''}`);
+        const messageHash = hashString(`${messageText}|${imageUrls.join(',')}|${isMyMessage}|${timestamp || ''}`);
         if (currentConversation.messages.some(m => m.id === messageHash)) return;
 
         currentConversation.messages.push({
             id: messageHash,
             text: messageText,
+            imageUrls,
             isMyMessage,
             avatarUrl: getAvatarUrl(messageLi),
             timestamp,
+            seq: currentConversation.messages.length,
             collectedAt: new Date().toISOString()
         });
-        console.log('收集訊息:', messageText);
+        console.log('收集訊息:', messageText || '[圖片]', imageUrls);
     }
 
     function getSavedConversations() {
@@ -223,6 +240,7 @@
         if (conversation.saved) return;
         conversation.endTime = new Date().toISOString();
         conversation.saved = true;
+        conversation.messages = sortMessages(conversation.messages);
         const saved = getSavedConversations();
         saved.unshift(conversation);
         if (saved.length > 100) saved.length = 100;
@@ -417,18 +435,20 @@
             if (!messageDiv || isMyMessageLi(messageLi)) continue;
 
             const messageText = getMessageText(messageDiv);
+            const imageUrls = getMessageImages(messageDiv);
             if (TYPING_RE.test(messageText)) continue;
 
             if (!sawFirstOtherMessage) {
                 sawFirstOtherMessage = true;
-                if (autoClickEnabled && isFirstMessageFiltered(messageText)) {
-                    console.log('首則訊息命中過濾，自動離開:', messageText);
+                const filterKey = messageText || imageUrls[0] || '';
+                if (autoClickEnabled && (isFirstMessageFiltered(filterKey) || imageUrls.some(isFirstMessageFiltered))) {
+                    console.log('首則訊息命中過濾，自動離開:', filterKey);
                     activelyLeaveConversation(messageId);
                     return;
                 }
             }
 
-            const notifyText = (messageDiv.textContent || '').trim();
+            const notifyText = messageText || (imageUrls.length ? '[圖片]' : '');
             if (notifyText) notifyNewMessage(notifyText);
 
             if (checkAvatarMatch(messageLi) || checkMessageAgainstBlacklist(messageDiv)) {
@@ -445,33 +465,44 @@
         const list = document.querySelector('ul[data-test="messages"]');
         if (!list) return;
 
+        let firstLi = null;
+        let filterKey = '';
         for (const li of list.querySelectorAll('li.message-li')) {
-            if (li.querySelector('.knock-remember-first') || isMyMessageLi(li)) continue;
+            if (isMyMessageLi(li)) continue;
             const messageDiv = li.querySelector('div[data-test="message"]');
             if (!messageDiv) continue;
             const text = getMessageText(messageDiv);
-            if (!text || TYPING_RE.test(text)) continue;
-
-            const btn = document.createElement('button');
-            btn.type = 'button';
-            btn.className = 'knock-remember-first';
-            btn.dataset.filterText = encodeURIComponent(text);
-            btn.textContent = isFirstMessageFiltered(text) ? '已記住' : '記住首則';
-            btn.title = '之後對方第一則若完全相同，會自動離開並開新對話';
-            btn.style.cssText = `
-                flex-shrink:0;align-self:center;margin:0 6px;padding:2px 8px;
-                font-size:11px;font-family:${FONT};line-height:1.4;white-space:nowrap;
-                background:${isFirstMessageFiltered(text) ? '#666' : '#ff9800'};color:#fff;
-                border:none;border-radius:4px;cursor:pointer;
-            `;
-            btn.addEventListener('click', (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                toggleFirstMessageFilter(text);
-            });
-            const row = li.firstElementChild;
-            (row || li).appendChild(btn);
+            const imageUrls = getMessageImages(messageDiv);
+            const key = text || imageUrls[0] || '';
+            if (!key || TYPING_RE.test(text)) continue;
+            firstLi = li;
+            filterKey = key;
+            break;
         }
+
+        list.querySelectorAll('.knock-remember-first').forEach(btn => {
+            if (!firstLi || !firstLi.contains(btn)) btn.remove();
+        });
+        if (!firstLi || firstLi.querySelector('.knock-remember-first')) return;
+
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'knock-remember-first';
+        btn.dataset.filterText = encodeURIComponent(filterKey);
+        btn.title = '之後對方第一則若完全相同，會自動離開並開新對話';
+        btn.style.cssText = `
+            flex-shrink:0;align-self:center;margin:0 6px;padding:2px 8px;
+            font-size:11px;font-family:${FONT};line-height:1.4;white-space:nowrap;
+            color:#fff;border:none;border-radius:4px;cursor:pointer;
+        `;
+        paintRememberButton(btn, isFirstMessageFiltered(filterKey));
+        btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            toggleFirstMessageFilter(filterKey);
+        });
+        const row = firstLi.firstElementChild;
+        (row || firstLi).appendChild(btn);
     }
 
     function showToast(message) {
@@ -591,26 +622,35 @@
         };
     }
 
-    function parseTime(timeStr) {
-        if (!timeStr) return Infinity;
-        const m = /^(\d{1,2}):(\d{2})$/.exec(timeStr);
-        return m ? Number(m[1]) * 60 + Number(m[2]) : Infinity;
+    // 支援「15:52」「昨天 15:52」「前天 15:52」；沒時間回傳 null（開頭訊息）
+    function parseClockMinutes(timeStr) {
+        if (!timeStr) return null;
+        const m = /(\d{1,2}):(\d{2})/.exec(timeStr);
+        if (!m) return null;
+        let minutes = Number(m[1]) * 60 + Number(m[2]);
+        if (timeStr.includes('前天')) minutes -= 2880;
+        else if (timeStr.includes('昨天')) minutes -= 1440;
+        return minutes;
     }
 
-    function timeToDate(timeMinutes, baseDate) {
-        if (timeMinutes === Infinity) return null;
+    function timestampToDate(timeStr, baseDate) {
+        const minutes = parseClockMinutes(timeStr);
+        if (minutes == null) return null;
         const date = new Date(baseDate);
-        date.setHours(Math.floor(timeMinutes / 60), timeMinutes % 60, 0, 0);
+        date.setHours(0, 0, 0, 0);
+        date.setMinutes(minutes);
         return date;
     }
 
     function getMessageTime(conversation, isOldest = true) {
         const start = conversation.startTime ? new Date(conversation.startTime) : new Date();
         const end = conversation.endTime ? new Date(conversation.endTime) : null;
-        const times = (conversation.messages || []).map(m => parseTime(m.timestamp)).filter(t => t !== Infinity);
-        if (times.length === 0) return isOldest ? start : end;
         const base = isOldest ? start : (end || start);
-        return timeToDate(isOldest ? Math.min(...times) : Math.max(...times), base);
+        const dates = (conversation.messages || [])
+            .map(m => timestampToDate(m.timestamp, base))
+            .filter(Boolean);
+        if (dates.length === 0) return isOldest ? start : end;
+        return new Date(isOldest ? Math.min(...dates) : Math.max(...dates));
     }
 
     function formatDuration(startDate, endDate) {
@@ -622,21 +662,27 @@
         return rem > 0 ? `${min} 分鐘 ${rem} 秒` : `${min} 分鐘`;
     }
 
+    // 沒時間的是開頭，放最前；其餘依「昨天／今天」+ 鐘點
     function sortMessages(messages) {
-        return [...messages].sort((a, b) => {
-            const ta = parseTime(a.timestamp);
-            const tb = parseTime(b.timestamp);
-            if (ta === Infinity && tb === Infinity) return 0;
-            if (ta === Infinity) return 1;
-            if (tb === Infinity) return -1;
-            return ta - tb;
-        });
+        return messages
+            .map((msg, index) => ({ msg, index }))
+            .sort((a, b) => {
+                const ta = parseClockMinutes(a.msg.timestamp);
+                const tb = parseClockMinutes(b.msg.timestamp);
+                if (ta == null && tb == null) return a.index - b.index;
+                if (ta == null) return -1;
+                if (tb == null) return 1;
+                if (ta !== tb) return ta - tb;
+                return a.index - b.index;
+            })
+            .map(x => x.msg);
     }
 
     function formatConversationForCopy(conversation) {
         return sortMessages(conversation.messages).map(msg => {
             const speaker = msg.isMyMessage ? '我  ' : '對方';
-            return `${speaker}(${msg.timestamp || '未知時間'}):${msg.text || ''}`;
+            const content = [msg.text, ...(msg.imageUrls || [])].filter(Boolean).join(' ') || '[圖片]';
+            return `${speaker}(${msg.timestamp || '未知時間'}):${content}`;
         }).join('\n');
     }
 
@@ -670,9 +716,9 @@
         const startDate = getMessageTime(conversation, true);
         const endDate = getMessageTime(conversation, false);
         const durationText = formatDuration(startDate, endDate);
-        const preview = conversation.messages.slice(0, 3).map(msg => {
-            const text = msg.text.substring(0, 50);
-            return (msg.isMyMessage ? '我: ' : '對方: ') + text + (msg.text.length > 50 ? '...' : '');
+        const preview = sortMessages(conversation.messages).slice(0, 3).map(msg => {
+            const text = messagePreviewText(msg);
+            return (msg.isMyMessage ? '我: ' : '對方: ') + text.substring(0, 50) + (text.length > 50 ? '...' : '');
         }).join('<br>');
 
         return `
@@ -800,6 +846,8 @@
         const startDate = getMessageTime(conversation, true);
         const endDate = getMessageTime(conversation, false);
         const durationText = formatDuration(startDate, endDate);
+        const sorted = sortMessages(conversation.messages);
+        const firstOther = sorted.find(m => !m.isMyMessage);
         const detail = document.createElement('div');
         detail.id = 'knock-conversation-detail';
         detail.style.cssText = `
@@ -819,20 +867,30 @@
                     <div>訊息數量: ${conversation.messages.length} 條</div>
                 </div>
                 <div style="display:flex;flex-direction:column;gap:12px;">
-                    ${sortMessages(conversation.messages).map(msg => `
+                    ${sorted.map(msg => {
+                        const filterKey = msg.text || (msg.imageUrls && msg.imageUrls[0]) || '';
+                        const showRemember = msg === firstOther && filterKey;
+                        return `
                         <div style="display:flex;align-items:flex-start;gap:8px;flex-direction:${msg.isMyMessage ? 'row-reverse' : 'row'};margin-bottom:12px;">
                             <div style="width:40px;height:40px;border-radius:50%;flex-shrink:0;background:#333;display:flex;align-items:center;justify-content:center;overflow:hidden;">
                                 ${msg.avatarUrl
                                     ? `<img src="${msg.avatarUrl}" style="width:100%;height:100%;object-fit:cover;" alt="avatar">`
                                     : `<div style="color:#888;font-size:18px;">${msg.isMyMessage ? '我' : '對'}</div>`}
                             </div>
-                            <div style="background:${msg.isMyMessage ? '#2d5a3d' : '#2d2d3d'};border-radius:8px;padding:8px 10px;max-width:70%;display:flex;align-items:center;gap:8px;">
-                                <div style="font-size:14px;line-height:1.4;word-wrap:break-word;flex:1;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;max-height:2.8em;">${escapeHtml(msg.text)}</div>
+                            <div style="background:${msg.isMyMessage ? '#2d5a3d' : '#2d2d3d'};border-radius:8px;padding:8px 10px;max-width:70%;display:flex;align-items:flex-start;gap:8px;">
+                                <div style="flex:1;min-width:0;">
+                                    ${msg.text ? `<div style="font-size:14px;line-height:1.4;word-wrap:break-word;">${escapeHtml(msg.text)}</div>` : ''}
+                                    ${(msg.imageUrls || []).map(src => `
+                                        <a href="${escapeHtml(src)}" target="_blank" rel="noreferrer">
+                                            <img src="${escapeHtml(src)}" alt="圖片" style="max-width:180px;max-height:240px;border-radius:6px;display:block;margin-top:6px;">
+                                        </a>`).join('')}
+                                    ${!msg.text && !(msg.imageUrls || []).length ? `<div style="color:#888;font-size:13px;">（空訊息）</div>` : ''}
+                                </div>
                                 ${msg.timestamp ? `<div style="font-size:11px;color:rgba(255,255,255,0.5);flex-shrink:0;white-space:nowrap;">${msg.timestamp}</div>` : ''}
-                                ${!msg.isMyMessage ? `<button class="knock-remember-first-saved" data-filter-text="${encodeURIComponent(msg.text)}" style="padding:2px 8px;background:${isFirstMessageFiltered(msg.text) ? '#666' : '#ff9800'};color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:11px;flex-shrink:0;white-space:nowrap;">${isFirstMessageFiltered(msg.text) ? '已記住' : '記住首則'}</button>` : ''}
+                                ${showRemember ? `<button class="knock-remember-first-saved" data-filter-text="${encodeURIComponent(filterKey)}" style="padding:2px 8px;background:${isFirstMessageFiltered(filterKey) ? '#666' : '#ff9800'};color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:11px;flex-shrink:0;white-space:nowrap;">${isFirstMessageFiltered(filterKey) ? '已記住' : '記住首則'}</button>` : ''}
                             </div>
-                        </div>
-                    `).join('')}
+                        </div>`;
+                    }).join('')}
                 </div>
             </div>`;
         document.body.appendChild(detail);
