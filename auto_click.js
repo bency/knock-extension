@@ -277,7 +277,7 @@
 
     // 檢測對話是否結束（當出現退出按鈕或重新配對按鈕時）
     function checkConversationEnd() {
-        // 如果已經顯示過提示或已儲存，不再檢查
+        // 如果已經顯示過提示或已處理，不再檢查
         if (currentConversation.promptShown || currentConversation.saved) {
             return;
         }
@@ -300,11 +300,35 @@
             }
         }
 
-        // 如果對話結束且尚未顯示儲存提示
+        // 如果對話結束
         if (conversationEnded && currentConversation.messages.length > 0) {
+            // 若「自動開啟新對話」為開啟：不儲存、不跳提示，直接標記為已處理（視為不儲存）
+            if (autoClickEnabled) {
+                currentConversation.promptShown = true;
+                currentConversation.saved = true;
+                if (currentConversation.id) {
+                    processedConversationIds.add(currentConversation.id);
+                    saveProcessedConversationIds();
+                }
+                console.log('自動開啟新對話啟用中，略過儲存提示並標記為不儲存:', currentConversation.id);
+                return;
+            }
+
+            // 若「自動開啟新對話」為關閉：才顯示儲存提示
             currentConversation.promptShown = true; // 標記已顯示提示
             // 延遲一下，確保對話已完全結束
             setTimeout(() => {
+                // 若在延遲期間開啟自動開啟新對話，就同樣略過提示並標記為不儲存
+                if (autoClickEnabled) {
+                    currentConversation.saved = true;
+                    if (currentConversation.id) {
+                        processedConversationIds.add(currentConversation.id);
+                        saveProcessedConversationIds();
+                    }
+                    console.log('延遲期間啟用自動開啟新對話，略過儲存提示並標記為不儲存:', currentConversation.id);
+                    return;
+                }
+
                 // 再次檢查是否已被處理（防止在延遲期間被處理）
                 if (!isConversationProcessed(currentConversation.id)) {
                     showSavePrompt();
@@ -410,6 +434,29 @@
         return true;
     }
 
+    // ponytail: sessionStorage 跨重整傳遞意圖；逾時 30s 避免殘留旗標誤點
+    const PENDING_START_CHAT_KEY = 'knockPendingStartChat';
+    const PENDING_START_CHAT_TTL_MS = 30000;
+
+    function markPendingStartChat() {
+        sessionStorage.setItem(PENDING_START_CHAT_KEY, Date.now().toString());
+    }
+
+    function isPendingStartChat() {
+        const raw = sessionStorage.getItem(PENDING_START_CHAT_KEY);
+        if (!raw) return false;
+        const ts = Number(raw);
+        if (!ts || Date.now() - ts > PENDING_START_CHAT_TTL_MS) {
+            sessionStorage.removeItem(PENDING_START_CHAT_KEY);
+            return false;
+        }
+        return true;
+    }
+
+    function clearPendingStartChat() {
+        sessionStorage.removeItem(PENDING_START_CHAT_KEY);
+    }
+
     function checkForButtonAndClick() {
         // 檢查開關狀態，如果關閉則不執行
         if (!autoClickEnabled) {
@@ -425,6 +472,15 @@
         const buttons = document.querySelectorAll('button');
 
         for (const button of buttons) {
+            // 退出重整後：有旗標才自動點「開始聊天」，避免一般首頁誤點
+            if (isPendingStartChat() && button.textContent.includes('開始聊天')) {
+                console.log('重整後找到「開始聊天」按鈕，點擊中...');
+                clearPendingStartChat();
+                simulateMouseClick(button);
+                console.log('已點「開始聊天」，等待配對...');
+                return;
+            }
+
             // Check if the button contains the specific text for re-matching
             if (button.textContent.includes('對方已離開聊天，點我重新配對')) {
                 console.log('Re-match button found! Waiting 3 seconds before clicking to avoid slow pairing...');
@@ -455,11 +511,10 @@
                 if (!isSavePromptVisible) {
                     console.log('Clicking confirm exit button...');
                     simulateMouseClick(button);
-                    // 退出後初始化新對話
-                    setTimeout(() => {
-                        console.log('Initializing new conversation...');
-                        initNewConversation();
-                    }, 1000);
+                    // 主動退出會重整，對話物件會一起消失，這裡不必先 init
+                    if (isPendingStartChat()) {
+                        console.log('已記下「開始聊天」，等待頁面重整...');
+                    }
                 } else {
                     console.log('儲存提示顯示中，等待用戶決定...');
                 }
@@ -493,21 +548,9 @@
             simulateMouseClick(exitButton);
             // 標記為已檢查，避免重複觸發
             checkedMessages.add(messageId);
+            // 重整後 setTimeout 會失效，改用 sessionStorage 記住要點「開始聊天」
+            markPendingStartChat();
             checkForButtonAndClick();
-
-            // 等待退出完成後，自動點擊「開始聊天」按鈕
-            setTimeout(() => {
-                console.log('尋找「開始聊天」按鈕...');
-                const buttons = document.querySelectorAll('button');
-                for (const button of buttons) {
-                    if (button.textContent.includes('開始聊天')) {
-                        console.log('找到「開始聊天」按鈕，點擊中...');
-                        simulateMouseClick(button);
-                        return;
-                    }
-                }
-                console.warn('未找到「開始聊天」按鈕');
-            }, 2000); // 等待 2 秒讓退出流程完成
         } else {
             console.warn('未找到退出按鈕');
         }
@@ -909,10 +952,180 @@
         });
     }
 
+    // 解析 timestamp (HH:MM) 為分鐘數
+    function parseTime(timeStr) {
+        if (!timeStr) return Infinity;
+        const parts = timeStr.split(':');
+        if (parts.length !== 2) return Infinity;
+        const hours = parseInt(parts[0], 10);
+        const minutes = parseInt(parts[1], 10);
+        if (isNaN(hours) || isNaN(minutes)) return Infinity;
+        return hours * 60 + minutes; // 轉換為分鐘數
+    }
+
+    // 將時間值（分鐘數）轉換為完整的 Date 物件
+    function timeToDate(timeMinutes, baseDate) {
+        if (timeMinutes === Infinity) return null;
+        const hours = Math.floor(timeMinutes / 60);
+        const minutes = timeMinutes % 60;
+        const date = new Date(baseDate);
+        date.setHours(hours, minutes, 0, 0);
+        return date;
+    }
+
+    // 獲取對話中訊息時間（最舊或最晚）
+    function getMessageTime(conversation, isOldest = true) {
+        if (!conversation.messages || conversation.messages.length === 0) {
+            if (isOldest) {
+                return conversation.startTime ? new Date(conversation.startTime) : new Date();
+            } else {
+                return conversation.endTime ? new Date(conversation.endTime) : null;
+            }
+        }
+
+        // 找到所有有 timestamp 的訊息
+        const messagesWithTimestamp = conversation.messages.filter(msg => msg.timestamp);
+        if (messagesWithTimestamp.length > 0) {
+            // 根據 isOldest 決定找最舊（最小值）還是最晚（最大值）
+            const targetTime = messagesWithTimestamp.reduce((target, msg) => {
+                const msgTime = parseTime(msg.timestamp);
+                return isOldest ? (msgTime < target ? msgTime : target) : (msgTime > target ? msgTime : target);
+            }, parseTime(messagesWithTimestamp[0].timestamp));
+
+            if (targetTime !== Infinity) {
+                // 決定 baseDate：最舊用 startTime，最晚優先 endTime 其次 startTime
+                const baseDate = isOldest
+                    ? (conversation.startTime ? new Date(conversation.startTime) : new Date())
+                    : (conversation.endTime ? new Date(conversation.endTime) :
+                       (conversation.startTime ? new Date(conversation.startTime) : new Date()));
+                return timeToDate(targetTime, baseDate);
+            }
+        }
+
+        // 如果沒有 timestamp，使用 fallback 時間
+        if (isOldest) {
+            return conversation.startTime ? new Date(conversation.startTime) : new Date();
+        } else {
+            return conversation.endTime ? new Date(conversation.endTime) : null;
+        }
+    }
+
+    // 格式化對話內容為可複製的文字格式
+    function formatConversationForCopy(conversation) {
+        // 對訊息按時間排序（使用 timestamp）
+        const sortedMessages = [...conversation.messages].sort((a, b) => {
+            // 將 timestamp (如 "01:59") 轉換為可比較的格式
+            const parseTime = (timeStr) => {
+                if (!timeStr) return 0; // 沒有時間戳的訊息放在前面
+                const parts = timeStr.split(':');
+                if (parts.length !== 2) return Infinity;
+                const hours = parseInt(parts[0], 10);
+                const minutes = parseInt(parts[1], 10);
+                if (isNaN(hours) || isNaN(minutes)) return Infinity;
+                return hours * 60 + minutes; // 轉換為分鐘數
+            };
+
+            const timeA = parseTime(a.timestamp);
+            const timeB = parseTime(b.timestamp);
+
+            if (timeA === Infinity && timeB === Infinity) return 0;
+            if (timeA === Infinity) return 1;
+            if (timeB === Infinity) return -1;
+
+            return timeA - timeB;
+        });
+
+        // 格式化每條訊息為「發話者、時間、內容」的格式
+        const formattedLines = sortedMessages.map(msg => {
+            const speaker = msg.isMyMessage ? '我  ' : '對方';
+            const time = msg.timestamp || '未知時間';
+            const content = msg.text || '';
+            return `${speaker}(${time}):${content}`;
+        });
+
+        return formattedLines.join('\n');
+    }
+
+    // 複製對話內容到剪貼板
+    async function copyConversation(conversationId) {
+        const savedConversations = getSavedConversations();
+        const conversation = savedConversations.find(conv => conv.id === conversationId);
+
+        if (!conversation) {
+            alert('找不到此對話');
+            return;
+        }
+
+        const formattedText = formatConversationForCopy(conversation);
+
+        try {
+            // 使用 Clipboard API 複製
+            await navigator.clipboard.writeText(formattedText);
+
+            // 顯示成功提示
+            const toast = document.createElement('div');
+            toast.style.cssText = `
+                position: fixed;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%, -50%);
+                z-index: 10005;
+                background: rgba(0, 0, 0, 0.9);
+                border-radius: 12px;
+                padding: 20px 32px;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                font-size: 16px;
+                color: #fff;
+                box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+                display: flex;
+                align-items: center;
+                gap: 12px;
+            `;
+            toast.innerHTML = `
+                <span style="font-size: 24px;">✓</span>
+                <span>對話內容已複製到剪貼板</span>
+            `;
+            document.body.appendChild(toast);
+
+            setTimeout(() => {
+                toast.remove();
+            }, 2000);
+        } catch (err) {
+            console.error('複製失敗:', err);
+            // 降級方案：使用傳統方法
+            const textArea = document.createElement('textarea');
+            textArea.value = formattedText;
+            textArea.style.position = 'fixed';
+            textArea.style.left = '-999999px';
+            document.body.appendChild(textArea);
+            textArea.select();
+            try {
+                document.execCommand('copy');
+                alert('對話內容已複製到剪貼板');
+            } catch (e) {
+                alert('複製失敗，請手動複製');
+            }
+            document.body.removeChild(textArea);
+        }
+    }
+
     function createConversationCard(conversation) {
-        const startDate = new Date(conversation.startTime);
-        const endDate = conversation.endTime ? new Date(conversation.endTime) : null;
-        const duration = endDate ? Math.round((endDate - startDate) / 1000 / 60) : 0;
+        const startDate = getMessageTime(conversation, true);
+        const endDate = getMessageTime(conversation, false);
+        let durationText = '';
+        if (endDate) {
+            const durationSeconds = Math.round((endDate - startDate) / 1000);
+            const durationMinutes = Math.floor(durationSeconds / 60);
+            if (durationMinutes > 0) {
+                durationText = `${durationMinutes} 分鐘`;
+                const remainingSeconds = durationSeconds % 60;
+                if (remainingSeconds > 0) {
+                    durationText += ` ${remainingSeconds} 秒`;
+                }
+            } else {
+                durationText = `${durationSeconds} 秒`;
+            }
+        }
 
         // 獲取對話預覽（前幾條訊息）
         const preview = conversation.messages.slice(0, 3).map(msg => {
@@ -932,21 +1145,32 @@
                     <div>
                         <div style="font-size: 14px; color: #888; margin-bottom: 4px;">
                             ${startDate.toLocaleString('zh-TW')}
-                            ${duration > 0 ? ` · 持續 ${duration} 分鐘` : ''}
+                            ${durationText ? ` · 持續 ${durationText}` : ''}
                         </div>
                         <div style="font-size: 12px; color: #666;">
                             ${conversation.messages.length} 條訊息
                         </div>
                     </div>
-                    <button class="knock-delete-btn" data-conv-id="${conversation.id}" style="
-                        padding: 6px 12px;
-                        background: #d32f2f;
-                        color: #fff;
-                        border: none;
-                        border-radius: 4px;
-                        cursor: pointer;
-                        font-size: 12px;
-                    ">刪除</button>
+                    <div style="display: flex; gap: 8px;">
+                        <button class="knock-copy-btn" data-conv-id="${conversation.id}" style="
+                            padding: 6px 12px;
+                            background: #2196F3;
+                            color: #fff;
+                            border: none;
+                            border-radius: 4px;
+                            cursor: pointer;
+                            font-size: 12px;
+                        ">複製</button>
+                        <button class="knock-delete-btn" data-conv-id="${conversation.id}" style="
+                            padding: 6px 12px;
+                            background: #d32f2f;
+                            color: #fff;
+                            border: none;
+                            border-radius: 4px;
+                            cursor: pointer;
+                            font-size: 12px;
+                        ">刪除</button>
+                    </div>
                 </div>
                 <div style="
                     background: #1a1a1a;
@@ -982,6 +1206,11 @@
                     createConversationManager(); // 重新載入管理介面
                 }
             }
+        }
+
+        if (e.target.classList.contains('knock-copy-btn')) {
+            const convId = e.target.getAttribute('data-conv-id');
+            copyConversation(convId);
         }
 
         if (e.target.classList.contains('knock-view-btn')) {
@@ -1037,8 +1266,22 @@
             overflow-y: auto;
         `;
 
-        const startDate = new Date(conversation.startTime);
-        const endDate = conversation.endTime ? new Date(conversation.endTime) : null;
+        const startDate = getMessageTime(conversation, true);
+        const endDate = getMessageTime(conversation, false);
+        let durationText = '';
+        if (endDate) {
+            const durationSeconds = Math.round((endDate - startDate) / 1000);
+            const durationMinutes = Math.floor(durationSeconds / 60);
+            if (durationMinutes > 0) {
+                durationText = `${durationMinutes} 分鐘`;
+                const remainingSeconds = durationSeconds % 60;
+                if (remainingSeconds > 0) {
+                    durationText += ` ${remainingSeconds} 秒`;
+                }
+            } else {
+                durationText = `${durationSeconds} 秒`;
+            }
+        }
 
         detail.innerHTML = `
             <div style="max-width: 800px; margin: 0 auto; padding: 24px;">
@@ -1058,6 +1301,7 @@
                 <div style="background: #222; border-radius: 8px; padding: 16px; margin-bottom: 20px; font-size: 13px; color: #888;">
                     <div>開始時間: ${startDate.toLocaleString('zh-TW')}</div>
                     ${endDate ? `<div>結束時間: ${endDate.toLocaleString('zh-TW')}</div>` : ''}
+                    ${durationText ? `<div>持續時間: ${durationText}</div>` : ''}
                     <div>訊息數量: ${conversation.messages.length} 條</div>
                 </div>
 
@@ -1089,21 +1333,34 @@
                             <div style="
                                 background: ${msg.isMyMessage ? '#2d5a3d' : '#2d2d3d'};
                                 border-radius: 8px;
-                                padding: 10px 12px;
+                                padding: 8px 10px;
                                 max-width: 70%;
                                 position: relative;
                                 display: flex;
-                                flex-direction: column;
+                                flex-direction: row;
+                                align-items: center;
+                                gap: 8px;
                             ">
-                                <div style="font-size: 14px; line-height: 1.6; word-wrap: break-word; margin-bottom: ${msg.timestamp ? '4px' : '0'};">
+                                <div style="
+                                    font-size: 14px;
+                                    line-height: 1.4;
+                                    word-wrap: break-word;
+                                    flex: 1;
+                                    overflow: hidden;
+                                    text-overflow: ellipsis;
+                                    display: -webkit-box;
+                                    -webkit-line-clamp: 2;
+                                    -webkit-box-orient: vertical;
+                                    max-height: 2.8em;
+                                ">
                                     ${msg.text}
                                 </div>
                                 ${msg.timestamp ? `
                                     <div style="
                                         font-size: 11px;
                                         color: rgba(255, 255, 255, 0.5);
-                                        align-self: flex-end;
-                                        margin-top: 2px;
+                                        flex-shrink: 0;
+                                        white-space: nowrap;
                                     ">
                                         ${msg.timestamp}
                                     </div>
@@ -1333,6 +1590,9 @@
     }, 2000); // 每2秒檢查一次
 
     // Initial check in case the button is already there
+    if (isPendingStartChat()) {
+        console.log('重整後繼續：等待「開始聊天」按鈕...');
+    }
     checkForButtonAndClick();
     checkNewMessages();
     checkConversationEnd();
