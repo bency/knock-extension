@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.3.5
+// @version      1.3.9
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -16,7 +16,13 @@
         /is\.gd\/[a-zA-Z0-9]+/i,
     ];
     const PENDING_START_CHAT_KEY = 'knockPendingStartChat';
+    const PENDING_START_CHAT_REASON_KEY = 'knockPendingStartChatReason';
     const PENDING_START_CHAT_TTL_MS = 30000;
+    const START_CHAT_REASON_LABEL = {
+        otherLeft: '對方主動斷線',
+        selfLeft: '我主動斷線',
+        firstFilter: '發語詞略過而重連'
+    };
     const FIRST_MSG_FILTER_KEY = 'knockFirstMessageFilters';
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
@@ -58,7 +64,12 @@
     let notificationsArmed = false;
     let pendingForcedLeave = false;
     let lastExitClickAt = 0;
-    let skipFirstFilterThisConversation = false;
+    let skipFirstFilterFor = null;
+    let rematchScheduled = false;
+    let startChatScheduled = false;
+    let cooldownUntil = 0;
+    let cooldownLabel = '';
+    let cooldownTick = null;
 
     function emptyConversation() {
         return { id: null, messages: [], startTime: null, endTime: null, saved: false, promptShown: false };
@@ -108,7 +119,10 @@
         };
         pendingForcedLeave = false;
         lastExitClickAt = 0;
-        skipFirstFilterThisConversation = false;
+        skipFirstFilterFor = null;
+        rematchScheduled = false;
+        startChatScheduled = false;
+        hideCooldown();
         console.log('初始化新對話:', currentConversation.id);
     }
 
@@ -137,6 +151,39 @@
         return storageSet(FIRST_MSG_FILTER_KEY, []);
     }
 
+    function exportFirstMessageFilters() {
+        const list = getFirstMessageFilters();
+        const blob = new Blob([JSON.stringify(list, null, 2)], { type: 'application/json' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `knock-發語詞過濾-${new Date().toISOString().slice(0, 10)}.json`;
+        a.click();
+        URL.revokeObjectURL(a.href);
+        return list.length;
+    }
+
+    function parseImportedFilters(raw) {
+        const data = JSON.parse(raw);
+        const list = Array.isArray(data) ? data : data && data.filters;
+        if (!Array.isArray(list)) throw new Error('格式不對');
+        return list.map(x => String(x ?? '').trim()).filter(Boolean);
+    }
+
+    function importFirstMessageFilters(incoming) {
+        const list = getFirstMessageFilters();
+        const seen = new Set(list);
+        let added = 0;
+        for (const item of incoming) {
+            const t = String(item || '').trim();
+            if (!t || TYPING_RE.test(t) || seen.has(t)) continue;
+            seen.add(t);
+            list.push(t);
+            added++;
+        }
+        if (added) storageSet(FIRST_MSG_FILTER_KEY, list);
+        return added;
+    }
+
     function paintRememberButton(btn, on) {
         btn.style.cssText = `
             flex-shrink:0;align-self:center;margin:0 6px;padding:0;
@@ -150,7 +197,7 @@
             : '';
         btn.setAttribute('role', 'checkbox');
         btn.setAttribute('aria-checked', on ? 'true' : 'false');
-        btn.title = on ? '已記住首則，再點取消' : '記住首則';
+        btn.title = on ? '已記住發語詞，再點取消' : '記住發語詞';
     }
 
     function syncRememberButtons() {
@@ -168,14 +215,15 @@
         if (isFirstMessageFiltered(t)) {
             removeFirstMessageFilter(t);
             syncRememberButtons();
-            showToast('已從首則過濾移除');
+            showToast('已從發語詞過濾移除');
             return false;
         }
         if (addFirstMessageFilter(t)) {
-            skipFirstFilterThisConversation = true;
+            const first = findFirstOtherMessage();
+            skipFirstFilterFor = first ? pairingIdOf(first) : t;
             pendingForcedLeave = false;
             syncRememberButtons();
-            showToast('已記住這則，之後首則相同會自動離開');
+            showToast('已記住這則，之後發語詞相同會自動離開');
             return true;
         }
         return false;
@@ -284,6 +332,10 @@
         return button.textContent.includes('確定') && button.getAttribute('data-test') === 'ok';
     }
 
+    function isStartChatButton(button) {
+        return button.textContent.includes('開始聊天');
+    }
+
     function checkConversationEnd() {
         if (currentConversation.promptShown || currentConversation.saved) return;
         if (currentConversation.id && isConversationProcessed(currentConversation.id)) {
@@ -296,6 +348,7 @@
 
         if (autoClickEnabled) {
             markProcessed(currentConversation);
+            markPendingStartChat(findButtons().some(isRematchButton) ? 'otherLeft' : pendingForcedLeave ? undefined : 'selfLeft');
             console.log('自動開啟新對話啟用中，略過儲存提示:', currentConversation.id);
             return;
         }
@@ -343,14 +396,17 @@
         return true;
     }
 
-    function markPendingStartChat() {
+    function markPendingStartChat(reason) {
         sessionStorage.setItem(PENDING_START_CHAT_KEY, Date.now().toString());
+        if (reason && !sessionStorage.getItem(PENDING_START_CHAT_REASON_KEY)) {
+            sessionStorage.setItem(PENDING_START_CHAT_REASON_KEY, reason);
+        }
     }
 
     function isPendingStartChat() {
         const ts = Number(sessionStorage.getItem(PENDING_START_CHAT_KEY));
         if (!ts || Date.now() - ts > PENDING_START_CHAT_TTL_MS) {
-            sessionStorage.removeItem(PENDING_START_CHAT_KEY);
+            clearPendingStartChat();
             return false;
         }
         return true;
@@ -358,25 +414,90 @@
 
     function clearPendingStartChat() {
         sessionStorage.removeItem(PENDING_START_CHAT_KEY);
+        sessionStorage.removeItem(PENDING_START_CHAT_REASON_KEY);
+    }
+
+    function startChatCooldownLabel() {
+        const reason = START_CHAT_REASON_LABEL[sessionStorage.getItem(PENDING_START_CHAT_REASON_KEY)];
+        return reason ? `開始聊天 · ${reason}` : '開始聊天';
+    }
+
+    function hideCooldown() {
+        cooldownUntil = 0;
+        cooldownLabel = '';
+        if (cooldownTick) {
+            clearInterval(cooldownTick);
+            cooldownTick = null;
+        }
+        document.getElementById('knock-cooldown')?.remove();
+    }
+
+    function showCooldown(label, ms) {
+        cooldownLabel = label;
+        cooldownUntil = Date.now() + ms;
+        const paint = () => {
+            const left = cooldownUntil - Date.now();
+            if (left <= 0) {
+                hideCooldown();
+                return;
+            }
+            let el = document.getElementById('knock-cooldown');
+            if (!el && document.body) {
+                el = document.createElement('div');
+                el.id = 'knock-cooldown';
+                el.style.cssText = `
+                    position:fixed;bottom:28px;left:50%;transform:translateX(-50%);
+                    z-index:10006;background:rgba(0,0,0,0.78);color:#fff;
+                    font-family:${FONT};font-size:13px;padding:6px 14px;border-radius:16px;
+                    pointer-events:none;letter-spacing:0.04em;white-space:nowrap;
+                    box-shadow:0 2px 10px rgba(0,0,0,0.35);
+                `;
+                document.body.appendChild(el);
+            }
+            if (el) el.textContent = `${cooldownLabel} ${Math.ceil(left / 1000)}`;
+        };
+        paint();
+        if (!cooldownTick) cooldownTick = setInterval(paint, 100);
     }
 
     function checkForButtonAndClick() {
         if (!autoClickEnabled || isSavePromptVisible) return;
 
         for (const button of findButtons()) {
-            if (isPendingStartChat() && button.textContent.includes('開始聊天')) {
-                console.log('重整後找到「開始聊天」按鈕，點擊中...');
-                clearPendingStartChat();
-                simulateMouseClick(button);
+            if (isPendingStartChat() && isStartChatButton(button)) {
+                if (!startChatScheduled) {
+                    startChatScheduled = true;
+                    showCooldown(startChatCooldownLabel(), 2000);
+                    setTimeout(() => {
+                        startChatScheduled = false;
+                        hideCooldown();
+                        if (!autoClickEnabled || !isPendingStartChat()) return;
+                        const btn = findButtons().find(isStartChatButton);
+                        if (btn) {
+                            console.log('倒數結束，點擊「開始聊天」...');
+                            clearPendingStartChat();
+                            skipFirstFilterFor = null;
+                            simulateMouseClick(btn);
+                            initNewConversation();
+                        }
+                    }, 2000);
+                }
                 return;
             }
 
             if (isRematchButton(button)) {
+                markPendingStartChat('otherLeft');
                 checkConversationEnd();
-                if (!isSavePromptVisible) {
+                if (!isSavePromptVisible && !rematchScheduled) {
+                    rematchScheduled = true;
+                    showCooldown('重新配對', 3000);
                     setTimeout(() => {
-                        if (!isSavePromptVisible) {
-                            simulateMouseClick(button);
+                        rematchScheduled = false;
+                        hideCooldown();
+                        if (isSavePromptVisible) return;
+                        const btn = findButtons().find(isRematchButton);
+                        if (btn) {
+                            simulateMouseClick(btn);
                             setTimeout(initNewConversation, 1000);
                         }
                     }, 3000);
@@ -387,10 +508,9 @@
             if (isConfirmExitButton(button)) {
                 checkConversationEnd();
                 if (!isSavePromptVisible) {
+                    markPendingStartChat(pendingForcedLeave ? undefined : 'selfLeft');
                     simulateMouseClick(button);
-                    if (isPendingStartChat()) {
-                        console.log('已記下「開始聊天」，等待頁面重整...');
-                    }
+                    console.log('已記下「開始聊天」，等待頁面重整...');
                 }
                 return;
             }
@@ -406,7 +526,7 @@
         if (!autoClickEnabled) return;
         if (!pendingForcedLeave) {
             pendingForcedLeave = true;
-            markPendingStartChat();
+            markPendingStartChat(reason);
             console.log('已記下要離開，等待退出按鈕:', reason);
         }
         tryForcedLeave();
@@ -430,8 +550,13 @@
 
     function activelyLeaveConversation(messageId) {
         if (messageId) checkedMessages.add(messageId);
-        requestForcedLeave('規則觸發');
+        requestForcedLeave('selfLeft');
         return pendingForcedLeave;
+    }
+
+    function pairingIdOf(first) {
+        const unique = String(first.li.className || '').match(/message-li-(\S+)/);
+        return unique ? unique[1] : `${first.filterKey}|${first.messageId}`;
     }
 
     function findFirstOtherMessage() {
@@ -451,13 +576,14 @@
     }
 
     function maybeLeaveOnFirstMessageFilter() {
-        if (!autoClickEnabled || isSavePromptVisible || skipFirstFilterThisConversation) return false;
+        if (!autoClickEnabled || isSavePromptVisible) return false;
         const first = findFirstOtherMessage();
         if (!first) return false;
+        if (skipFirstFilterFor && skipFirstFilterFor === pairingIdOf(first)) return false;
         const hit = isFirstMessageFiltered(first.filterKey) || first.imageUrls.some(isFirstMessageFiltered);
         if (!hit) return false;
-        console.log('首則訊息命中過濾，準備重連:', first.filterKey);
-        requestForcedLeave(first.filterKey);
+        console.log('發語詞命中過濾，準備重連:', first.filterKey);
+        requestForcedLeave('firstFilter');
         return pendingForcedLeave;
     }
 
@@ -797,18 +923,21 @@
         `;
         panel.innerHTML = `
             <div style="max-width:720px;margin:0 auto;padding:24px;">
-                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;">
-                    <h2 style="margin:0;font-size:24px;">首則過濾（${filters.length}）</h2>
-                    <div style="display:flex;gap:8px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;flex-wrap:wrap;">
+                    <h2 style="margin:0;font-size:24px;">發語詞過濾（${filters.length}）</h2>
+                    <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                        <button id="knock-export-first-filters" style="padding:8px 16px;background:#2d5a3d;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;" ${filters.length ? '' : 'disabled'}>匯出</button>
+                        <button id="knock-import-first-filters" style="padding:8px 16px;background:#2d4a6d;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;">匯入</button>
                         <button id="knock-clear-first-filters" style="padding:8px 16px;background:#d32f2f;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;" ${filters.length ? '' : 'disabled'}>全部清空</button>
                         <button id="knock-filter-manager-close" style="padding:8px 16px;background:#444;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;">關閉</button>
                     </div>
+                    <input type="file" id="knock-import-first-filters-file" accept="application/json,.json" hidden>
                 </div>
-                <div style="font-size:13px;color:#888;margin-bottom:16px;">對方第一則若與下列完全相同，會自動離開並開新對話。聊天中再點一次打勾也可移除。</div>
+                <div style="font-size:13px;color:#888;margin-bottom:16px;">對方發語詞若與下列完全相同，會自動離開並開新對話。聊天中再點一次打勾也可移除。</div>
                 <input type="text" id="knock-filter-search" placeholder="搜尋已記住的訊息..." style="width:100%;padding:12px;background:#333;border:1px solid #555;border-radius:6px;color:#fff;font-size:14px;box-sizing:border-box;margin-bottom:16px;">
                 <div id="knock-filter-list" style="display:flex;flex-direction:column;gap:8px;">
                     ${filters.length === 0
-                        ? '<div style="text-align:center;padding:40px;color:#888;">尚未記住任何訊息</div>'
+                        ? '<div style="text-align:center;padding:40px;color:#888;">尚未封鎖任何發語詞</div>'
                         : filters.map(t => `
                             <div class="knock-filter-card" style="display:flex;gap:8px;align-items:flex-start;background:#222;border:1px solid #444;border-radius:8px;padding:12px;">
                                 <div style="flex:1;font-size:14px;color:#ccc;white-space:pre-wrap;word-break:break-word;">${escapeHtml(t)}</div>
@@ -821,6 +950,26 @@
         const close = () => panel.remove();
         document.getElementById('knock-filter-manager-close').onclick = close;
         panel.addEventListener('click', (e) => { if (e.target === panel) close(); });
+        document.getElementById('knock-export-first-filters').onclick = () => {
+            const n = exportFirstMessageFilters();
+            showToast(n ? `已匯出 ${n} 則` : '沒有可匯出的發語詞');
+        };
+        document.getElementById('knock-import-first-filters').onclick = () => {
+            document.getElementById('knock-import-first-filters-file').click();
+        };
+        document.getElementById('knock-import-first-filters-file').addEventListener('change', async (e) => {
+            const file = e.target.files && e.target.files[0];
+            e.target.value = '';
+            if (!file) return;
+            try {
+                const added = importFirstMessageFilters(parseImportedFilters(await file.text()));
+                syncRememberButtons();
+                refreshFirstFilterManager();
+                showToast(added ? `已匯入 ${added} 則` : '沒有新增（皆已存在或檔案為空）');
+            } catch (err) {
+                alert('匯入失敗：請使用本功能匯出的 JSON');
+            }
+        });
         document.getElementById('knock-filter-search').addEventListener('input', (e) => {
             const term = e.target.value.toLowerCase();
             panel.querySelectorAll('.knock-filter-card').forEach(card => {
@@ -964,7 +1113,7 @@
             return;
         }
         if (e.target.id === 'knock-clear-first-filters') {
-            if (getFirstMessageFilters().length && confirm('確定清空全部首則過濾？')) {
+            if (getFirstMessageFilters().length && confirm('確定清空全部發語詞過濾？')) {
                 clearFirstMessageFilters();
                 syncRememberButtons();
                 refreshFirstFilterManager();
@@ -994,7 +1143,7 @@
         createFloatButton(
             'knock-filter-manager-button',
             170,
-            `<span>🚫</span><span>首則過濾</span><span id="knock-filter-count" style="background:#ff9800;border-radius:10px;padding:0 6px;font-size:12px;min-width:1.2em;text-align:center;">${getFirstMessageFilters().length}</span>`,
+            `<span>🚫</span><span>發語詞過濾</span><span id="knock-filter-count" style="background:#ff9800;border-radius:10px;padding:0 6px;font-size:12px;min-width:1.2em;text-align:center;">${getFirstMessageFilters().length}</span>`,
             createFirstFilterManager
         );
     }
@@ -1011,6 +1160,7 @@
     }).observe(document.documentElement, { childList: true, subtree: true });
 
     setInterval(() => {
+        maybeLeaveOnFirstMessageFilter();
         tryForcedLeave();
         checkForButtonAndClick();
         checkConversationEnd();
