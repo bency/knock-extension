@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.3
+// @version      1.3.5
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -56,7 +56,9 @@
     let isSavePromptVisible = false;
     let processedConversationIds = new Set(storageGet('knockProcessedConversationIds', []));
     let notificationsArmed = false;
-    let sawFirstOtherMessage = false;
+    let pendingForcedLeave = false;
+    let lastExitClickAt = 0;
+    let skipFirstFilterThisConversation = false;
 
     function emptyConversation() {
         return { id: null, messages: [], startTime: null, endTime: null, saved: false, promptShown: false };
@@ -104,7 +106,9 @@
             saved: false,
             promptShown: false
         };
-        sawFirstOtherMessage = false;
+        pendingForcedLeave = false;
+        lastExitClickAt = 0;
+        skipFirstFilterThisConversation = false;
         console.log('初始化新對話:', currentConversation.id);
     }
 
@@ -134,8 +138,19 @@
     }
 
     function paintRememberButton(btn, on) {
-        btn.textContent = on ? '已記住' : '記住首則';
-        btn.style.background = on ? '#666' : '#ff9800';
+        btn.style.cssText = `
+            flex-shrink:0;align-self:center;margin:0 6px;padding:0;
+            width:18px;height:18px;box-sizing:border-box;
+            border:1.5px solid ${on ? '#4CAF50' : 'rgba(255,255,255,0.5)'};
+            border-radius:4px;background:${on ? '#4CAF50' : 'transparent'};
+            cursor:pointer;display:inline-flex;align-items:center;justify-content:center;
+        `;
+        btn.innerHTML = on
+            ? '<svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3.5 8.5l3 3 6-6" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+            : '';
+        btn.setAttribute('role', 'checkbox');
+        btn.setAttribute('aria-checked', on ? 'true' : 'false');
+        btn.title = on ? '已記住首則，再點取消' : '記住首則';
     }
 
     function syncRememberButtons() {
@@ -157,6 +172,8 @@
             return false;
         }
         if (addFirstMessageFilter(t)) {
+            skipFirstFilterThisConversation = true;
+            pendingForcedLeave = false;
             syncRememberButtons();
             showToast('已記住這則，之後首則相同會自動離開');
             return true;
@@ -385,17 +402,63 @@
         return BLACKLIST_PATTERNS.some(pattern => pattern.test(messageText));
     }
 
-    function activelyLeaveConversation(messageId) {
-        const exitButton = document.querySelector('button[data-test="chat-exit-button"]');
-        if (!exitButton) {
-            console.warn('未找到退出按鈕');
-            return;
+    function requestForcedLeave(reason) {
+        if (!autoClickEnabled) return;
+        if (!pendingForcedLeave) {
+            pendingForcedLeave = true;
+            markPendingStartChat();
+            console.log('已記下要離開，等待退出按鈕:', reason);
         }
-        console.log('主動離開對話，準備退出...');
+        tryForcedLeave();
+    }
+
+    function tryForcedLeave() {
+        if (!pendingForcedLeave || !autoClickEnabled || isSavePromptVisible) return false;
+        if (findButtons().some(isConfirmExitButton)) {
+            checkForButtonAndClick();
+            return true;
+        }
+        const exitButton = document.querySelector('button[data-test="chat-exit-button"]');
+        if (!exitButton) return false;
+        if (Date.now() - lastExitClickAt < 400) return true;
+        lastExitClickAt = Date.now();
+        console.log('找到退出按鈕，點擊中...');
         simulateMouseClick(exitButton);
-        checkedMessages.add(messageId);
-        markPendingStartChat();
         checkForButtonAndClick();
+        return true;
+    }
+
+    function activelyLeaveConversation(messageId) {
+        if (messageId) checkedMessages.add(messageId);
+        requestForcedLeave('規則觸發');
+        return pendingForcedLeave;
+    }
+
+    function findFirstOtherMessage() {
+        const list = document.querySelector('ul[data-test="messages"]');
+        if (!list) return null;
+        for (const li of list.querySelectorAll('li.message-li')) {
+            if (isMyMessageLi(li)) continue;
+            const messageDiv = li.querySelector('div[data-test="message"]');
+            if (!messageDiv) continue;
+            const text = getMessageText(messageDiv);
+            const imageUrls = getMessageImages(messageDiv);
+            const filterKey = text || imageUrls[0] || '';
+            if (!filterKey || TYPING_RE.test(text)) continue;
+            return { li, messageId: li.className, filterKey, imageUrls, messageDiv };
+        }
+        return null;
+    }
+
+    function maybeLeaveOnFirstMessageFilter() {
+        if (!autoClickEnabled || isSavePromptVisible || skipFirstFilterThisConversation) return false;
+        const first = findFirstOtherMessage();
+        if (!first) return false;
+        const hit = isFirstMessageFiltered(first.filterKey) || first.imageUrls.some(isFirstMessageFiltered);
+        if (!hit) return false;
+        console.log('首則訊息命中過濾，準備重連:', first.filterKey);
+        requestForcedLeave(first.filterKey);
+        return pendingForcedLeave;
     }
 
     function requestNotifyPermission() {
@@ -425,6 +488,8 @@
             initNewConversation();
         }
 
+        if (maybeLeaveOnFirstMessageFilter() || tryForcedLeave()) return;
+
         for (const messageLi of messageElements) {
             const messageId = messageLi.className;
             collectMessage(messageLi);
@@ -437,16 +502,6 @@
             const messageText = getMessageText(messageDiv);
             const imageUrls = getMessageImages(messageDiv);
             if (TYPING_RE.test(messageText)) continue;
-
-            if (!sawFirstOtherMessage) {
-                sawFirstOtherMessage = true;
-                const filterKey = messageText || imageUrls[0] || '';
-                if (autoClickEnabled && (isFirstMessageFiltered(filterKey) || imageUrls.some(isFirstMessageFiltered))) {
-                    console.log('首則訊息命中過濾，自動離開:', filterKey);
-                    activelyLeaveConversation(messageId);
-                    return;
-                }
-            }
 
             const notifyText = messageText || (imageUrls.length ? '[圖片]' : '');
             if (notifyText) notifyNewMessage(notifyText);
@@ -465,44 +520,24 @@
         const list = document.querySelector('ul[data-test="messages"]');
         if (!list) return;
 
-        let firstLi = null;
-        let filterKey = '';
-        for (const li of list.querySelectorAll('li.message-li')) {
-            if (isMyMessageLi(li)) continue;
-            const messageDiv = li.querySelector('div[data-test="message"]');
-            if (!messageDiv) continue;
-            const text = getMessageText(messageDiv);
-            const imageUrls = getMessageImages(messageDiv);
-            const key = text || imageUrls[0] || '';
-            if (!key || TYPING_RE.test(text)) continue;
-            firstLi = li;
-            filterKey = key;
-            break;
-        }
-
+        const first = findFirstOtherMessage();
         list.querySelectorAll('.knock-remember-first').forEach(btn => {
-            if (!firstLi || !firstLi.contains(btn)) btn.remove();
+            if (!first || !first.li.contains(btn)) btn.remove();
         });
-        if (!firstLi || firstLi.querySelector('.knock-remember-first')) return;
+        if (!first || first.li.querySelector('.knock-remember-first')) return;
 
         const btn = document.createElement('button');
         btn.type = 'button';
         btn.className = 'knock-remember-first';
-        btn.dataset.filterText = encodeURIComponent(filterKey);
-        btn.title = '之後對方第一則若完全相同，會自動離開並開新對話';
-        btn.style.cssText = `
-            flex-shrink:0;align-self:center;margin:0 6px;padding:2px 8px;
-            font-size:11px;font-family:${FONT};line-height:1.4;white-space:nowrap;
-            color:#fff;border:none;border-radius:4px;cursor:pointer;
-        `;
-        paintRememberButton(btn, isFirstMessageFiltered(filterKey));
+        btn.dataset.filterText = encodeURIComponent(first.filterKey);
+        paintRememberButton(btn, isFirstMessageFiltered(first.filterKey));
         btn.addEventListener('click', (e) => {
             e.preventDefault();
             e.stopPropagation();
-            toggleFirstMessageFilter(filterKey);
+            toggleFirstMessageFilter(first.filterKey);
         });
-        const row = firstLi.firstElementChild;
-        (row || firstLi).appendChild(btn);
+        const row = first.li.firstElementChild;
+        (row || first.li).appendChild(btn);
     }
 
     function showToast(message) {
@@ -769,7 +804,7 @@
                         <button id="knock-filter-manager-close" style="padding:8px 16px;background:#444;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;">關閉</button>
                     </div>
                 </div>
-                <div style="font-size:13px;color:#888;margin-bottom:16px;">對方第一則若與下列完全相同，會自動離開並開新對話。聊天中再點一次「已記住」也可移除。</div>
+                <div style="font-size:13px;color:#888;margin-bottom:16px;">對方第一則若與下列完全相同，會自動離開並開新對話。聊天中再點一次打勾也可移除。</div>
                 <input type="text" id="knock-filter-search" placeholder="搜尋已記住的訊息..." style="width:100%;padding:12px;background:#333;border:1px solid #555;border-radius:6px;color:#fff;font-size:14px;box-sizing:border-box;margin-bottom:16px;">
                 <div id="knock-filter-list" style="display:flex;flex-direction:column;gap:8px;">
                     ${filters.length === 0
@@ -887,13 +922,14 @@
                                     ${!msg.text && !(msg.imageUrls || []).length ? `<div style="color:#888;font-size:13px;">（空訊息）</div>` : ''}
                                 </div>
                                 ${msg.timestamp ? `<div style="font-size:11px;color:rgba(255,255,255,0.5);flex-shrink:0;white-space:nowrap;">${msg.timestamp}</div>` : ''}
-                                ${showRemember ? `<button class="knock-remember-first-saved" data-filter-text="${encodeURIComponent(filterKey)}" style="padding:2px 8px;background:${isFirstMessageFiltered(filterKey) ? '#666' : '#ff9800'};color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:11px;flex-shrink:0;white-space:nowrap;">${isFirstMessageFiltered(filterKey) ? '已記住' : '記住首則'}</button>` : ''}
+                                ${showRemember ? `<button type="button" class="knock-remember-first-saved" data-filter-text="${encodeURIComponent(filterKey)}"></button>` : ''}
                             </div>
                         </div>`;
                     }).join('')}
                 </div>
             </div>`;
         document.body.appendChild(detail);
+        syncRememberButtons();
         const close = () => detail.remove();
         document.getElementById('knock-detail-close').onclick = close;
         detail.addEventListener('click', (e) => { if (e.target === detail) close(); });
@@ -922,8 +958,9 @@
             }
             return;
         }
-        if (e.target.classList.contains('knock-remember-first-saved')) {
-            toggleFirstMessageFilter(decodeURIComponent(e.target.dataset.filterText || ''));
+        const rememberBtn = e.target.closest?.('.knock-remember-first-saved');
+        if (rememberBtn) {
+            toggleFirstMessageFilter(decodeURIComponent(rememberBtn.dataset.filterText || ''));
             return;
         }
         if (e.target.id === 'knock-clear-first-filters') {
@@ -973,7 +1010,11 @@
         checkConversationEnd();
     }).observe(document.documentElement, { childList: true, subtree: true });
 
-    setInterval(checkConversationEnd, 2000);
+    setInterval(() => {
+        tryForcedLeave();
+        checkForButtonAndClick();
+        checkConversationEnd();
+    }, 200);
 
     if (isPendingStartChat()) console.log('重整後繼續：等待「開始聊天」按鈕...');
     requestNotifyPermission();
