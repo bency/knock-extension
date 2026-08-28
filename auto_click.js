@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.3.9
+// @version      1.4.2
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -24,6 +24,8 @@
         firstFilter: '發語詞略過而重連'
     };
     const FIRST_MSG_FILTER_KEY = 'knockFirstMessageFilters';
+    const SAVED_CONV_KEY = 'knockSavedConversations';
+    const AUTO_CONV_KEY = 'knockAutoConversations';
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const FLOAT_STYLE = `
@@ -70,9 +72,11 @@
     let cooldownUntil = 0;
     let cooldownLabel = '';
     let cooldownTick = null;
+    let persistLiveTimer = null;
+    let conversationManagerTab = 'auto';
 
     function emptyConversation() {
-        return { id: null, messages: [], startTime: null, endTime: null, saved: false, promptShown: false };
+        return { id: null, messages: [], startTime: null, endTime: null, saved: false, promptShown: false, pinned: false };
     }
 
     function saveProcessedIds() {
@@ -109,13 +113,18 @@
     }
 
     function initNewConversation() {
+        if (currentConversation.id && currentConversation.messages.length) {
+            currentConversation.endTime = currentConversation.endTime || new Date().toISOString();
+            persistLiveConversation();
+        }
         currentConversation = {
             id: 'conv_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9),
             messages: [],
             startTime: new Date().toISOString(),
             endTime: null,
             saved: false,
-            promptShown: false
+            promptShown: false,
+            pinned: false
         };
         pendingForcedLeave = false;
         lastExitClickAt = 0;
@@ -295,29 +304,84 @@
             collectedAt: new Date().toISOString()
         });
         console.log('收集訊息:', messageText || '[圖片]', imageUrls);
+        persistLiveConversationSoon();
     }
 
     function getSavedConversations() {
-        return storageGet('knockSavedConversations', []);
+        return storageGet(SAVED_CONV_KEY, []);
+    }
+
+    function getAutoConversations() {
+        return storageGet(AUTO_CONV_KEY, []);
+    }
+
+    function findStoredConversation(conversationId) {
+        return getSavedConversations().find(conv => conv.id === conversationId)
+            || getAutoConversations().find(conv => conv.id === conversationId)
+            || null;
+    }
+
+    function upsertConversationList(key, conversation, limit) {
+        if (!conversation.id || !conversation.messages.length) return false;
+        const list = storageGet(key, []);
+        const snap = {
+            ...conversation,
+            messages: sortMessages(conversation.messages.slice()),
+            endTime: conversation.endTime || new Date().toISOString()
+        };
+        const i = list.findIndex(c => c.id === conversation.id);
+        if (i >= 0) list[i] = snap;
+        else list.unshift(snap);
+        if (list.length > limit) list.length = limit;
+        return storageSet(key, list);
+    }
+
+    function persistLiveConversation() {
+        if (!currentConversation.id || !currentConversation.messages.length) return;
+        if (currentConversation.pinned) {
+            upsertConversationList(SAVED_CONV_KEY, currentConversation, 100);
+            storageSet(AUTO_CONV_KEY, getAutoConversations().filter(c => c.id !== currentConversation.id));
+            return;
+        }
+        upsertConversationList(AUTO_CONV_KEY, currentConversation, 200);
+    }
+
+    function persistLiveConversationSoon() {
+        clearTimeout(persistLiveTimer);
+        persistLiveTimer = setTimeout(persistLiveConversation, 400);
+    }
+
+    function pinConversation(conversationId) {
+        const conv = findStoredConversation(conversationId)
+            || (currentConversation.id === conversationId ? currentConversation : null);
+        if (!conv) return false;
+        conv.pinned = true;
+        if (currentConversation.id === conversationId) currentConversation.pinned = true;
+        storageSet(AUTO_CONV_KEY, getAutoConversations().filter(c => c.id !== conversationId));
+        return upsertConversationList(SAVED_CONV_KEY, conv, 100);
     }
 
     function saveConversation(conversation) {
-        if (conversation.saved) return;
-        conversation.endTime = new Date().toISOString();
+        if (!conversation.id || !conversation.messages.length) return false;
+        conversation.pinned = true;
         conversation.saved = true;
-        conversation.messages = sortMessages(conversation.messages);
-        const saved = getSavedConversations();
-        saved.unshift(conversation);
-        if (saved.length > 100) saved.length = 100;
-        if (!storageSet('knockSavedConversations', saved)) return false;
+        conversation.endTime = conversation.endTime || new Date().toISOString();
+        if (currentConversation.id === conversation.id) currentConversation.pinned = true;
+        storageSet(AUTO_CONV_KEY, getAutoConversations().filter(c => c.id !== conversation.id));
+        if (!upsertConversationList(SAVED_CONV_KEY, conversation, 100)) return false;
         markProcessed(conversation);
         console.log('對話已儲存:', conversation.id);
         return true;
     }
 
     function deleteConversation(conversationId) {
-        const filtered = getSavedConversations().filter(conv => conv.id !== conversationId);
-        return storageSet('knockSavedConversations', filtered);
+        return deleteConversations([conversationId]);
+    }
+
+    function deleteConversations(ids) {
+        const set = new Set(ids);
+        return storageSet(SAVED_CONV_KEY, getSavedConversations().filter(c => !set.has(c.id)))
+            && storageSet(AUTO_CONV_KEY, getAutoConversations().filter(c => !set.has(c.id)));
     }
 
     function findButtons() {
@@ -345,6 +409,9 @@
 
         const conversationEnded = findButtons().some(b => isRematchButton(b) || isConfirmExitButton(b));
         if (!conversationEnded || currentConversation.messages.length === 0) return;
+
+        currentConversation.endTime = currentConversation.endTime || new Date().toISOString();
+        persistLiveConversation();
 
         if (autoClickEnabled) {
             markProcessed(currentConversation);
@@ -848,7 +915,7 @@
     }
 
     async function copyConversation(conversationId) {
-        const conversation = getSavedConversations().find(conv => conv.id === conversationId);
+        const conversation = findStoredConversation(conversationId);
         if (!conversation) {
             alert('找不到此對話');
             return;
@@ -884,20 +951,25 @@
 
         return `
             <div class="knock-conv-card" style="background:#222;border-radius:8px;padding:16px;border:1px solid #444;">
-                <div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:12px;">
-                    <div>
-                        <div style="font-size:14px;color:#888;margin-bottom:4px;">
-                            ${startDate.toLocaleString('zh-TW')}${durationText ? ` · 持續 ${durationText}` : ''}
+                <div style="display:flex;gap:12px;align-items:flex-start;">
+                    <input type="checkbox" class="knock-conv-check" data-conv-id="${conversation.id}" style="margin-top:4px;width:18px;height:18px;flex-shrink:0;">
+                    <div style="flex:1;min-width:0;">
+                        <div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:12px;">
+                            <div>
+                                <div style="font-size:14px;color:#888;margin-bottom:4px;">
+                                    ${startDate.toLocaleString('zh-TW')}${durationText ? ` · 持續 ${durationText}` : ''}
+                                </div>
+                                <div style="font-size:12px;color:#666;">${conversation.messages.length} 條訊息</div>
+                            </div>
+                            <div style="display:flex;gap:8px;">
+                                ${conversationManagerTab === 'auto' ? `<button class="knock-pin-btn" data-conv-id="${conversation.id}" style="padding:6px 12px;background:#4CAF50;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;">儲存</button>` : ''}
+                                <button class="knock-copy-btn" data-conv-id="${conversation.id}" style="padding:6px 12px;background:#2196F3;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;">複製</button>
+                            </div>
                         </div>
-                        <div style="font-size:12px;color:#666;">${conversation.messages.length} 條訊息</div>
-                    </div>
-                    <div style="display:flex;gap:8px;">
-                        <button class="knock-copy-btn" data-conv-id="${conversation.id}" style="padding:6px 12px;background:#2196F3;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;">複製</button>
-                        <button class="knock-delete-btn" data-conv-id="${conversation.id}" style="padding:6px 12px;background:#d32f2f;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;">刪除</button>
+                        <div style="background:#1a1a1a;border-radius:6px;padding:12px;font-size:13px;color:#ccc;line-height:1.6;max-height:150px;overflow-y:auto;">${preview}</div>
+                        <button class="knock-view-btn" data-conv-id="${conversation.id}" style="margin-top:12px;padding:8px 16px;background:#4CAF50;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;width:100%;">查看完整對話</button>
                     </div>
                 </div>
-                <div style="background:#1a1a1a;border-radius:6px;padding:12px;font-size:13px;color:#ccc;line-height:1.6;max-height:150px;overflow-y:auto;">${preview}</div>
-                <button class="knock-view-btn" data-conv-id="${conversation.id}" style="margin-top:12px;padding:8px 16px;background:#4CAF50;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;width:100%;">查看完整對話</button>
             </div>`;
     }
 
@@ -978,6 +1050,37 @@
         });
     }
 
+    function paintConvTabs() {
+        const savedBtn = document.getElementById('knock-tab-saved');
+        const autoBtn = document.getElementById('knock-tab-auto');
+        if (!savedBtn || !autoBtn) return;
+        const on = 'padding:8px 16px;border:none;border-radius:6px;cursor:pointer;font-size:14px;background:#4CAF50;color:#fff;';
+        const off = 'padding:8px 16px;border:none;border-radius:6px;cursor:pointer;font-size:14px;background:#333;color:#ccc;';
+        savedBtn.style.cssText = conversationManagerTab === 'saved' ? on : off;
+        autoBtn.style.cssText = conversationManagerTab === 'auto' ? on : off;
+        savedBtn.textContent = `已儲存（${getSavedConversations().length}）`;
+        autoBtn.textContent = `自動儲存（${getAutoConversations().length}）`;
+    }
+
+    function renderConversationList() {
+        const el = document.getElementById('knock-conversations-list');
+        if (!el) return;
+        const list = conversationManagerTab === 'saved' ? getSavedConversations() : getAutoConversations();
+        const empty = conversationManagerTab === 'saved' ? '尚無已儲存的對話' : '尚無自動儲存的對話';
+        el.innerHTML = list.length === 0
+            ? `<div style="text-align:center;padding:40px;color:#888;">${empty}</div>`
+            : list.map(createConversationCard).join('');
+        paintConvTabs();
+        const all = document.getElementById('knock-conv-select-all');
+        if (all) all.checked = false;
+    }
+
+    function selectedConversationIds() {
+        return Array.from(document.querySelectorAll('#knock-conversations-list .knock-conv-check:checked'))
+            .map(el => el.dataset.convId)
+            .filter(Boolean);
+    }
+
     function createConversationManager() {
         const existing = document.getElementById('knock-conversation-manager');
         if (existing) {
@@ -985,7 +1088,7 @@
             return;
         }
 
-        const savedConversations = getSavedConversations();
+        persistLiveConversation();
         const manager = document.createElement('div');
         manager.id = 'knock-conversation-manager';
         manager.style.cssText = `
@@ -994,24 +1097,57 @@
         `;
         manager.innerHTML = `
             <div style="max-width:900px;margin:0 auto;padding:24px;">
-                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;">
-                    <h2 style="margin:0;font-size:24px;">對話記錄管理</h2>
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;flex-wrap:wrap;">
+                    <h2 style="margin:0;font-size:24px;">對話記錄</h2>
                     <button id="knock-manager-close" style="padding:8px 16px;background:#444;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;">關閉</button>
+                </div>
+                <div style="display:flex;gap:8px;margin-bottom:16px;">
+                    <button type="button" id="knock-tab-saved"></button>
+                    <button type="button" id="knock-tab-auto"></button>
+                </div>
+                <div style="display:flex;gap:8px;align-items:center;margin-bottom:16px;flex-wrap:wrap;">
+                    <label style="display:flex;align-items:center;gap:6px;font-size:14px;color:#ccc;cursor:pointer;">
+                        <input type="checkbox" id="knock-conv-select-all" style="width:16px;height:16px;">全選
+                    </label>
+                    <button id="knock-conv-delete-selected" style="padding:6px 12px;background:#d32f2f;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:13px;">刪除所選</button>
                 </div>
                 <div style="margin-bottom:20px;">
                     <input type="text" id="knock-search-input" placeholder="搜尋對話內容..." style="width:100%;padding:12px;background:#333;border:1px solid #555;border-radius:6px;color:#fff;font-size:14px;box-sizing:border-box;">
                 </div>
-                <div id="knock-conversations-list" style="display:flex;flex-direction:column;gap:12px;">
-                    ${savedConversations.length === 0
-                        ? '<div style="text-align:center;padding:40px;color:#888;">尚無已儲存的對話</div>'
-                        : savedConversations.map(createConversationCard).join('')}
-                </div>
+                <div id="knock-conversations-list" style="display:flex;flex-direction:column;gap:12px;"></div>
             </div>`;
         document.body.appendChild(manager);
+        renderConversationList();
 
         const close = () => manager.remove();
         document.getElementById('knock-manager-close').onclick = close;
         manager.addEventListener('click', (e) => { if (e.target === manager) close(); });
+        document.getElementById('knock-tab-saved').onclick = () => {
+            conversationManagerTab = 'saved';
+            renderConversationList();
+        };
+        document.getElementById('knock-tab-auto').onclick = () => {
+            conversationManagerTab = 'auto';
+            renderConversationList();
+        };
+        document.getElementById('knock-conv-select-all').onchange = (e) => {
+            document.querySelectorAll('#knock-conversations-list .knock-conv-card').forEach(card => {
+                if (card.style.display === 'none') return;
+                const box = card.querySelector('.knock-conv-check');
+                if (box) box.checked = e.target.checked;
+            });
+        };
+        document.getElementById('knock-conv-delete-selected').onclick = () => {
+            const ids = selectedConversationIds();
+            if (!ids.length) {
+                showToast('請先勾選要刪除的對話');
+                return;
+            }
+            if (confirm(`確定刪除 ${ids.length} 則對話？`) && deleteConversations(ids)) {
+                renderConversationList();
+                showToast(`已刪除 ${ids.length} 則`);
+            }
+        };
         document.getElementById('knock-search-input').addEventListener('input', (e) => {
             const term = e.target.value.toLowerCase();
             document.querySelectorAll('#knock-conversations-list .knock-conv-card').forEach(card => {
@@ -1021,11 +1157,12 @@
     }
 
     function showConversationDetail(conversationId) {
-        const conversation = getSavedConversations().find(conv => conv.id === conversationId);
+        const conversation = findStoredConversation(conversationId);
         if (!conversation) {
             alert('找不到此對話');
             return;
         }
+        const isAuto = !getSavedConversations().some(conv => conv.id === conversationId);
 
         const startDate = getMessageTime(conversation, true);
         const endDate = getMessageTime(conversation, false);
@@ -1040,9 +1177,12 @@
         `;
         detail.innerHTML = `
             <div style="max-width:800px;margin:0 auto;padding:24px;">
-                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;">
-                    <h2 style="margin:0;font-size:20px;">對話詳情</h2>
-                    <button id="knock-detail-close" style="padding:8px 16px;background:#444;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;">關閉</button>
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;gap:12px;flex-wrap:wrap;">
+                    <h2 style="margin:0;font-size:20px;">${isAuto ? '自動儲存' : '已儲存'}對話</h2>
+                    <div style="display:flex;gap:8px;">
+                        ${isAuto ? '<button id="knock-detail-pin" style="padding:8px 16px;background:#4CAF50;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;">移到已儲存</button>' : ''}
+                        <button id="knock-detail-close" style="padding:8px 16px;background:#444;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;">關閉</button>
+                    </div>
                 </div>
                 <div style="background:#222;border-radius:8px;padding:16px;margin-bottom:20px;font-size:13px;color:#888;">
                     <div>開始時間: ${startDate.toLocaleString('zh-TW')}</div>
@@ -1081,20 +1221,15 @@
         syncRememberButtons();
         const close = () => detail.remove();
         document.getElementById('knock-detail-close').onclick = close;
+        document.getElementById('knock-detail-pin')?.addEventListener('click', () => {
+            if (pinConversation(conversationId)) {
+                showToast('已移到已儲存');
+                close();
+                conversationManagerTab = 'saved';
+                renderConversationList();
+            }
+        });
         detail.addEventListener('click', (e) => { if (e.target === detail) close(); });
-    }
-
-    function manualSaveConversation() {
-        if (!currentConversation.id || currentConversation.messages.length === 0) {
-            alert('目前沒有可儲存的對話');
-            return;
-        }
-        if (currentConversation.saved || isConversationProcessed(currentConversation.id)) {
-            alert('此對話已經儲存過了');
-            return;
-        }
-        if (saveConversation(currentConversation)) showToast('對話已成功儲存');
-        else alert('儲存失敗，請重試');
     }
 
     document.addEventListener('click', (e) => {
@@ -1125,8 +1260,12 @@
         if (!convId) return;
         if (e.target.classList.contains('knock-delete-btn')) {
             if (confirm('確定要刪除這個對話嗎？') && deleteConversation(convId)) {
-                document.getElementById('knock-conversation-manager')?.remove();
-                createConversationManager();
+                renderConversationList();
+            }
+        } else if (e.target.classList.contains('knock-pin-btn')) {
+            if (pinConversation(convId)) {
+                showToast('已移到已儲存');
+                renderConversationList();
             }
         } else if (e.target.classList.contains('knock-copy-btn')) {
             copyConversation(convId);
@@ -1138,11 +1277,13 @@
     function mountChrome() {
         if (!document.body) return;
         createToggleSwitch();
+        document.getElementById('knock-manual-save-button')?.remove();
         createFloatButton('knock-manager-button', 70, '<span>📚</span><span>對話記錄</span>', createConversationManager);
-        createFloatButton('knock-manual-save-button', 120, '<span>💾</span><span>儲存對話</span>', manualSaveConversation);
+        const filterBtn = document.getElementById('knock-filter-manager-button');
+        if (filterBtn) filterBtn.style.top = '120px';
         createFloatButton(
             'knock-filter-manager-button',
-            170,
+            120,
             `<span>🚫</span><span>發語詞過濾</span><span id="knock-filter-count" style="background:#ff9800;border-radius:10px;padding:0 6px;font-size:12px;min-width:1.2em;text-align:center;">${getFirstMessageFilters().length}</span>`,
             createFirstFilterManager
         );
