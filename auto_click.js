@@ -1,12 +1,14 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.5
+// @version      1.4.7
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=knock.tw
-// @grant        none
+// @grant        GM.xmlHttpRequest
+// @grant        GM_xmlhttpRequest
+// @connect      ntfy.sh
 // ==/UserScript==
 
 (function() {
@@ -26,6 +28,8 @@
     const FIRST_MSG_FILTER_KEY = 'knockFirstMessageFilters';
     const SAVED_CONV_KEY = 'knockSavedConversations';
     const AUTO_CONV_KEY = 'knockAutoConversations';
+    const NTFY_TOPIC_KEY = 'knockNtfyTopic';
+    const NTFY_SERVER = 'https://ntfy.sh';
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const FLOAT_STYLE = `
@@ -689,10 +693,61 @@
         Notification.requestPermission().catch(() => {});
     }
 
+    function getNtfyTopic() {
+        return (localStorage.getItem(NTFY_TOPIC_KEY) || '').trim();
+    }
+
+    function setNtfyTopic(topic) {
+        const t = (topic || '').trim();
+        if (!t) {
+            localStorage.removeItem(NTFY_TOPIC_KEY);
+            return '';
+        }
+        if (!/^[A-Za-z0-9_-]{1,64}$/.test(t)) return null;
+        localStorage.setItem(NTFY_TOPIC_KEY, t);
+        return t;
+    }
+
+    function sendNtfy(body, title) {
+        return new Promise((resolve) => {
+            const topic = getNtfyTopic();
+            if (!topic) {
+                resolve({ ok: false, detail: '尚未設定主題' });
+                return;
+            }
+            const data = JSON.stringify({
+                topic,
+                title: title || 'Knock 新訊息',
+                message: body || '你有一則新訊息'
+            });
+            const finish = (ok, detail) => resolve({ ok, detail });
+            const xhr = (typeof GM !== 'undefined' && GM.xmlHttpRequest)
+                || (typeof GM_xmlhttpRequest === 'function' && GM_xmlhttpRequest);
+            if (xhr) {
+                xhr({
+                    method: 'POST',
+                    url: `${NTFY_SERVER}/`,
+                    headers: { 'Content-Type': 'application/json' },
+                    data,
+                    onload: (r) => finish(r.status >= 200 && r.status < 300, `HTTP ${r.status}`),
+                    onerror: () => finish(false, '連線失敗：請允許腳本存取 ntfy.sh')
+                });
+                return;
+            }
+            fetch(`${NTFY_SERVER}/`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: data
+            }).then((r) => finish(r.ok, `HTTP ${r.status}`))
+                .catch((e) => finish(false, e.message || 'fetch 被網頁擋住'));
+        });
+    }
+
     function notifyNewMessage(text) {
         if (!notificationsArmed || (document.hasFocus() && !document.hidden)) return;
-        if (!('Notification' in window) || Notification.permission !== 'granted') return;
         const body = (text || '你有一則新訊息').replace(/\s+/g, ' ').trim().slice(0, 80) || '你有一則新訊息';
+        sendNtfy(body);
+        if (!('Notification' in window) || Notification.permission !== 'granted') return;
         const notification = new Notification('Knock 新訊息', { body, tag: 'knock-new-message' });
         notification.onclick = () => {
             window.focus();
@@ -1011,6 +1066,94 @@
                     </div>
                 </div>
             </div>`;
+    }
+
+    function createNtfySettings() {
+        const existing = document.getElementById('knock-ntfy-settings');
+        if (existing) {
+            existing.remove();
+            return;
+        }
+        const current = getNtfyTopic();
+        const panel = document.createElement('div');
+        panel.id = 'knock-ntfy-settings';
+        panel.style.cssText = `
+            position:fixed;top:0;left:0;width:100%;height:100%;z-index:10002;
+            background:rgba(0,0,0,0.9);font-family:${FONT};color:#fff;overflow-y:auto;
+        `;
+        panel.innerHTML = `
+            <div style="max-width:520px;margin:0 auto;padding:24px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;">
+                    <h2 style="margin:0;font-size:24px;">手機通知（ntfy）</h2>
+                    <button id="knock-ntfy-close" style="padding:8px 16px;background:#444;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;">關閉</button>
+                </div>
+                <div style="font-size:13px;color:#888;margin-bottom:16px;line-height:1.6;">
+                    分頁沒在看時，新訊息會推到手機。請安裝
+                    <a href="https://ntfy.sh/app" target="_blank" rel="noreferrer" style="color:#8ab4f8;">ntfy App</a>
+                    ，伺服器選 <b style="color:#ccc;">ntfy.sh</b>，訂閱下方同一個主題。
+                    <br><br>
+                    跨域權限：按「傳送測試」時若 Tampermonkey 跳出「允許存取 ntfy.sh」，請選<strong style="color:#ccc;">永遠允許</strong>。
+                    沒跳出或曾按錯過：Tampermonkey 圖示 → 管理面板 → 這支腳本 → <strong style="color:#ccc;">設定</strong> → 往下找 <strong style="color:#ccc;">XHR Security</strong>，把 ntfy.sh 從黑名單移除，或加到白名單。
+                </div>
+                <input type="text" id="knock-ntfy-topic" placeholder="例如 knock-x7k2m9" value="${escapeHtml(current)}" style="width:100%;padding:12px;background:#333;border:1px solid #555;border-radius:6px;color:#fff;font-size:14px;box-sizing:border-box;margin-bottom:12px;">
+                <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                    <button id="knock-ntfy-save" style="padding:8px 16px;background:#4CAF50;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;">儲存</button>
+                    <button id="knock-ntfy-test" style="padding:8px 16px;background:#2d4a6d;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;">傳送測試</button>
+                    <button id="knock-ntfy-clear" style="padding:8px 16px;background:#d32f2f;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;">關閉推播</button>
+                </div>
+                <div id="knock-ntfy-status" style="margin-top:14px;font-size:13px;color:#aaa;line-height:1.6;"></div>
+            </div>`;
+        document.body.appendChild(panel);
+        if (!current) {
+            document.getElementById('knock-ntfy-topic').value = `knock-${Math.random().toString(36).slice(2, 10)}`;
+        }
+        const close = () => panel.remove();
+        document.getElementById('knock-ntfy-close').onclick = close;
+        panel.addEventListener('click', (e) => { if (e.target === panel) close(); });
+        const status = document.getElementById('knock-ntfy-status');
+        const paintStatus = (topic) => {
+            if (!topic) {
+                status.innerHTML = '尚未儲存主題。';
+                return;
+            }
+            const href = `${NTFY_SERVER}/${encodeURIComponent(topic)}`;
+            status.innerHTML = `手機請訂閱：<a href="${href}" target="_blank" rel="noreferrer" style="color:#8ab4f8;">${escapeHtml(topic)}</a>`;
+        };
+        paintStatus(current);
+        document.getElementById('knock-ntfy-save').onclick = () => {
+            const saved = setNtfyTopic(document.getElementById('knock-ntfy-topic').value);
+            if (saved === null) {
+                alert('主題只能用英數、底線、連字號，最多 64 字');
+                return;
+            }
+            paintStatus(saved);
+            showToast(saved ? `已設定，請在手機訂閱 ${saved}` : '已關閉手機推播');
+        };
+        document.getElementById('knock-ntfy-test').onclick = async () => {
+            if (!getNtfyTopic()) {
+                const saved = setNtfyTopic(document.getElementById('knock-ntfy-topic').value);
+                if (!saved) {
+                    alert('請先填主題並儲存');
+                    return;
+                }
+                paintStatus(saved);
+            }
+            status.textContent = '傳送中…';
+            const result = await sendNtfy('這是測試通知', 'Knock 測試');
+            if (result.ok) {
+                status.textContent = `已送到 ntfy（${result.detail}）。手機沒響的話，確認 App 訂閱的主題與伺服器是 ntfy.sh。`;
+                showToast('測試已送到 ntfy');
+            } else {
+                status.textContent = `沒送出：${result.detail}。請依上方步驟允許 ntfy.sh。`;
+                showToast('測試失敗，看設定頁說明');
+            }
+        };
+        document.getElementById('knock-ntfy-clear').onclick = () => {
+            setNtfyTopic('');
+            document.getElementById('knock-ntfy-topic').value = '';
+            paintStatus('');
+            showToast('已關閉手機推播');
+        };
     }
 
     function refreshFirstFilterManager() {
@@ -1333,6 +1476,12 @@
             120,
             `<span>🚫</span><span>發語詞過濾</span><span id="knock-filter-count" style="background:#ff9800;border-radius:10px;padding:0 6px;font-size:12px;min-width:1.2em;text-align:center;">${getNormalizedFilters().length}</span>`,
             createFirstFilterManager
+        );
+        createFloatButton(
+            'knock-ntfy-button',
+            170,
+            `<span>📱</span><span>手機通知</span>`,
+            createNtfySettings
         );
     }
 
