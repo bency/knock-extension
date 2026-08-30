@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.12
+// @version      1.4.13
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -1162,9 +1162,9 @@
 
     function formatConversationForCopy(conversation) {
         return sortMessages(conversation.messages).map(msg => {
-            const speaker = msg.isMyMessage ? '我  ' : '對方';
+            const speaker = msg.isMyMessage ? '我　' : '對方';
             const content = [msg.text, ...(msg.imageUrls || [])].filter(Boolean).join(' ') || '[圖片]';
-            return `${speaker}(${msg.timestamp || '未知時間'}):${content}`;
+            return `${speaker}：${content} （${msg.timestamp || '未知時間'}）`;
         }).join('\n');
     }
 
