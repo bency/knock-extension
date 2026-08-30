@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.9
+// @version      1.4.12
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -29,6 +29,8 @@
     const SAVED_CONV_KEY = 'knockSavedConversations';
     const AUTO_CONV_KEY = 'knockAutoConversations';
     const NTFY_TOPIC_KEY = 'knockNtfyTopic';
+    const NTFY_TITLE_KEY = 'knockNtfyTitle';
+    const NTFY_TITLE_DEFAULT = 'Knock 新訊息';
     const NTFY_SERVER = 'https://ntfy.sh';
     const KEEP_ALIVE_ENABLED_KEY = 'knockKeepAliveEnabled';
     const KEEP_ALIVE_TEXT_KEY = 'knockKeepAliveText';
@@ -43,6 +45,37 @@
     ];
     const DOCK_PANEL = 'background:rgba(0,0,0,0.82);border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.3);';
     const DOCK_ROW = 'display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;box-sizing:border-box;padding:8px 10px;border:none;border-radius:8px;background:#222;color:#fff;font:inherit;font-size:13px;text-align:left;cursor:pointer;';
+    const CSS_INP = 'width:100%;padding:12px;background:#333;border:1px solid #555;border-radius:6px;color:#fff;font-size:14px;box-sizing:border-box;';
+    const cssBtn = (bg, extra = '') => `padding:8px 16px;background:${bg};color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;${extra}`;
+
+    function el(id) {
+        return document.getElementById(id);
+    }
+
+    function makeOverlay(id, maxWidth, html, z) {
+        const node = document.createElement('div');
+        node.id = id;
+        node.style.cssText = `position:fixed;inset:0;z-index:${z || 10002};background:rgba(0,0,0,0.9);font-family:${FONT};color:#fff;overflow-y:auto;`;
+        node.innerHTML = `<div style="max-width:${maxWidth}px;margin:0 auto;padding:24px;">${html}</div>`;
+        document.body.appendChild(node);
+        node.addEventListener('click', (e) => { if (e.target === node) node.remove(); });
+        return node;
+    }
+
+    function toggleOverlay(id, build) {
+        const existing = el(id);
+        if (existing) {
+            existing.remove();
+            return null;
+        }
+        return build();
+    }
+
+    function filterCardsByTerm(selector, term, displayOn) {
+        document.querySelectorAll(selector).forEach(card => {
+            card.style.display = card.textContent.toLowerCase().includes(term) ? displayOn : 'none';
+        });
+    }
 
     function storageGet(key, fallback) {
         try {
@@ -129,13 +162,9 @@
             persistLiveConversation();
         }
         currentConversation = {
+            ...emptyConversation(),
             id: 'conv_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9),
-            messages: [],
-            startTime: new Date().toISOString(),
-            endTime: null,
-            saved: false,
-            promptShown: false,
-            pinned: false
+            startTime: new Date().toISOString()
         };
         pendingForcedLeave = false;
         lastExitClickAt = 0;
@@ -147,10 +176,6 @@
         lastKeepAliveTryAt = 0;
         sessionStorage.removeItem(KEEP_ALIVE_AT_KEY);
         console.log('初始化新對話:', currentConversation.id);
-    }
-
-    function getFirstMessageFilters() {
-        return storageGet(FIRST_MSG_FILTER_KEY, []);
     }
 
     function avatarHashOf(url) {
@@ -168,7 +193,7 @@
     }
 
     function getNormalizedFilters() {
-        return getFirstMessageFilters().map(normalizeFilter).filter(Boolean);
+        return storageGet(FIRST_MSG_FILTER_KEY, []).map(normalizeFilter).filter(Boolean);
     }
 
     function isFirstMessageFiltered(text, avatarHash) {
@@ -255,7 +280,7 @@
             const avatarHash = decodeURIComponent(btn.dataset.filterAvatar || '');
             paintRememberButton(btn, !!(text && isFirstMessageFiltered(text, avatarHash)));
         });
-        const badge = document.getElementById('knock-filter-count');
+        const badge = el('knock-filter-count');
         if (badge) badge.textContent = String(getNormalizedFilters().length);
     }
 
@@ -417,10 +442,6 @@
         return true;
     }
 
-    function deleteConversation(conversationId) {
-        return deleteConversations([conversationId]);
-    }
-
     function deleteConversations(ids) {
         const set = new Set(ids);
         return storageSet(SAVED_CONV_KEY, getSavedConversations().filter(c => !set.has(c.id)))
@@ -498,9 +519,10 @@
     function simulateMouseClick(element) {
         if (!element) return false;
         element.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        const opts = { bubbles: true, cancelable: true, view: window, button: 0 };
+        // ponytail: 不傳 view。TM 沙箱的 window 是 Proxy，new MouseEvent({view:window}) 會丟，後面的 click() 就不會跑
+        const opts = { bubbles: true, cancelable: true, button: 0 };
         for (const type of ['mousedown', 'mouseup', 'click']) {
-            element.dispatchEvent(new MouseEvent(type, opts));
+            try { element.dispatchEvent(new MouseEvent(type, opts)); } catch (e) {}
         }
         try { element.click(); } catch (e) { console.warn('直接點擊失敗:', e); }
         return true;
@@ -539,7 +561,7 @@
             clearInterval(cooldownTick);
             cooldownTick = null;
         }
-        document.getElementById('knock-cooldown')?.remove();
+        el('knock-cooldown')?.remove();
     }
 
     function showCooldown(label, ms) {
@@ -551,20 +573,14 @@
                 hideCooldown();
                 return;
             }
-            let el = document.getElementById('knock-cooldown');
-            if (!el && document.body) {
-                el = document.createElement('div');
-                el.id = 'knock-cooldown';
-                el.style.cssText = `
-                    position:fixed;bottom:28px;left:50%;transform:translateX(-50%);
-                    z-index:10006;background:rgba(0,0,0,0.78);color:#fff;
-                    font-family:${FONT};font-size:13px;padding:6px 14px;border-radius:16px;
-                    pointer-events:none;letter-spacing:0.04em;white-space:nowrap;
-                    box-shadow:0 2px 10px rgba(0,0,0,0.35);
-                `;
-                document.body.appendChild(el);
+            let node = el('knock-cooldown');
+            if (!node && document.body) {
+                node = document.createElement('div');
+                node.id = 'knock-cooldown';
+                node.style.cssText = `position:fixed;bottom:28px;left:50%;transform:translateX(-50%);z-index:10006;background:rgba(0,0,0,0.78);color:#fff;font-family:${FONT};font-size:13px;padding:6px 14px;border-radius:16px;pointer-events:none;letter-spacing:0.04em;white-space:nowrap;box-shadow:0 2px 10px rgba(0,0,0,0.35);`;
+                document.body.appendChild(node);
             }
-            if (el) el.textContent = `${cooldownLabel} ${Math.ceil(left / 1000)}`;
+            if (node) node.textContent = `${cooldownLabel} ${Math.ceil(left / 1000)}`;
         };
         paint();
         if (!cooldownTick) cooldownTick = setInterval(paint, 100);
@@ -719,6 +735,20 @@
         return t;
     }
 
+    function getNtfyTitle() {
+        return (localStorage.getItem(NTFY_TITLE_KEY) || '').trim() || NTFY_TITLE_DEFAULT;
+    }
+
+    function setNtfyTitle(title) {
+        const t = (title || '').trim().slice(0, 80);
+        if (!t) {
+            localStorage.removeItem(NTFY_TITLE_KEY);
+            return NTFY_TITLE_DEFAULT;
+        }
+        localStorage.setItem(NTFY_TITLE_KEY, t);
+        return t;
+    }
+
     function sendNtfy(body, title) {
         return new Promise((resolve) => {
             const topic = getNtfyTopic();
@@ -728,7 +758,7 @@
             }
             const data = JSON.stringify({
                 topic,
-                title: title || 'Knock 新訊息',
+                title: title || getNtfyTitle(),
                 message: body || '你有一則新訊息'
             });
             const finish = (ok, detail) => resolve({ ok, detail });
@@ -874,8 +904,8 @@
     }
 
     function createDock() {
-        if (document.getElementById('knock-dock')) return;
-        OLD_FLOAT_IDS.forEach(id => document.getElementById(id)?.remove());
+        if (el('knock-dock')) return;
+        OLD_FLOAT_IDS.forEach(id => el(id)?.remove());
 
         let open = localStorage.getItem(DOCK_OPEN_KEY) === 'true';
         const dock = document.createElement('div');
@@ -940,7 +970,7 @@
             body.style.display = open ? 'flex' : 'none';
             dock.style.width = open ? '220px' : 'auto';
             header.style.width = open ? '220px' : 'auto';
-            document.getElementById('knock-dock-chevron').textContent = open ? '收合' : '選單';
+            el('knock-dock-chevron').textContent = open ? '收合' : '選單';
         };
         header.addEventListener('click', (e) => {
             e.stopPropagation();
@@ -1029,7 +1059,7 @@
     }
 
     function showSavePrompt() {
-        if (document.getElementById('knock-save-prompt') || currentConversation.saved) return;
+        if (el('knock-save-prompt') || currentConversation.saved) return;
         if (currentConversation.id && isConversationProcessed(currentConversation.id)) {
             currentConversation.saved = true;
             return;
@@ -1050,17 +1080,17 @@
                 本次對話共有 ${currentConversation.messages.length} 條訊息，是否要儲存？
             </div>
             <div style="display: flex; gap: 12px; justify-content: flex-end;">
-                <button id="knock-save-cancel" style="padding: 8px 16px; background: #444; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 14px;">不儲存</button>
-                <button id="knock-save-confirm" style="padding: 8px 16px; background: #4CAF50; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 600;">儲存對話</button>
+                <button id="knock-save-cancel" style="${cssBtn('#444')}">不儲存</button>
+                <button id="knock-save-confirm" style="${cssBtn('#4CAF50', 'font-weight:600;')}">儲存對話</button>
             </div>
         `;
         document.body.appendChild(prompt);
 
-        document.getElementById('knock-save-cancel').onclick = () => dismissSavePrompt(prompt, false);
+        el('knock-save-cancel').onclick = () => dismissSavePrompt(prompt, false);
         prompt.addEventListener('click', (e) => {
             if (e.target === prompt) dismissSavePrompt(prompt, false);
         });
-        document.getElementById('knock-save-confirm').onclick = () => {
+        el('knock-save-confirm').onclick = () => {
             if (!saveConversation(currentConversation)) {
                 alert('儲存失敗，請重試');
                 return;
@@ -1186,60 +1216,46 @@
                                 <div style="font-size:12px;color:#666;">${conversation.messages.length} 條訊息</div>
                             </div>
                             <div style="display:flex;gap:8px;">
-                                ${conversationManagerTab === 'auto' ? `<button class="knock-pin-btn" data-conv-id="${conversation.id}" style="padding:6px 12px;background:#4CAF50;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;">儲存</button>` : ''}
-                                <button class="knock-copy-btn" data-conv-id="${conversation.id}" style="padding:6px 12px;background:#2196F3;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;">複製</button>
+                                ${conversationManagerTab === 'auto' ? `<button class="knock-pin-btn" data-conv-id="${conversation.id}" style="${cssBtn('#4CAF50', 'padding:6px 12px;border-radius:4px;font-size:12px;')}">儲存</button>` : ''}
+                                <button class="knock-copy-btn" data-conv-id="${conversation.id}" style="${cssBtn('#2196F3', 'padding:6px 12px;border-radius:4px;font-size:12px;')}">複製</button>
                             </div>
                         </div>
                         <div style="background:#1a1a1a;border-radius:6px;padding:12px;font-size:13px;color:#ccc;line-height:1.6;max-height:150px;overflow-y:auto;">${preview}</div>
-                        <button class="knock-view-btn" data-conv-id="${conversation.id}" style="margin-top:12px;padding:8px 16px;background:#4CAF50;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;width:100%;">查看完整對話</button>
+                        <button class="knock-view-btn" data-conv-id="${conversation.id}" style="${cssBtn('#4CAF50', 'margin-top:12px;font-size:13px;width:100%;')}">查看完整對話</button>
                     </div>
                 </div>
             </div>`;
     }
 
     function createNtfySettings() {
-        const existing = document.getElementById('knock-ntfy-settings');
-        if (existing) {
-            existing.remove();
-            return;
-        }
         const current = getNtfyTopic();
-        const panel = document.createElement('div');
-        panel.id = 'knock-ntfy-settings';
-        panel.style.cssText = `
-            position:fixed;top:0;left:0;width:100%;height:100%;z-index:10002;
-            background:rgba(0,0,0,0.9);font-family:${FONT};color:#fff;overflow-y:auto;
-        `;
-        panel.innerHTML = `
-            <div style="max-width:520px;margin:0 auto;padding:24px;">
-                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;">
-                    <h2 style="margin:0;font-size:24px;">手機通知（ntfy）</h2>
-                    <button id="knock-ntfy-close" style="padding:8px 16px;background:#444;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;">關閉</button>
-                </div>
-                <div style="font-size:13px;color:#888;margin-bottom:16px;line-height:1.6;">
-                    分頁沒在看時，新訊息會推到手機。請安裝
-                    <a href="https://ntfy.sh/app" target="_blank" rel="noreferrer" style="color:#8ab4f8;">ntfy App</a>
-                    ，伺服器選 <b style="color:#ccc;">ntfy.sh</b>，訂閱下方同一個主題。
-                    <br><br>
-                    跨域權限：按「傳送測試」時若 Tampermonkey 跳出「允許存取 ntfy.sh」，請選<strong style="color:#ccc;">永遠允許</strong>。
-                    沒跳出或曾按錯過：Tampermonkey 圖示 → 管理面板 → 這支腳本 → <strong style="color:#ccc;">設定</strong> → 往下找 <strong style="color:#ccc;">XHR Security</strong>，把 ntfy.sh 從黑名單移除，或加到白名單。
-                </div>
-                <input type="text" id="knock-ntfy-topic" placeholder="例如 knock-x7k2m9" value="${escapeHtml(current)}" style="width:100%;padding:12px;background:#333;border:1px solid #555;border-radius:6px;color:#fff;font-size:14px;box-sizing:border-box;margin-bottom:12px;">
-                <div style="display:flex;gap:8px;flex-wrap:wrap;">
-                    <button id="knock-ntfy-save" style="padding:8px 16px;background:#4CAF50;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;">儲存</button>
-                    <button id="knock-ntfy-test" style="padding:8px 16px;background:#2d4a6d;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;">傳送測試</button>
-                    <button id="knock-ntfy-clear" style="padding:8px 16px;background:#d32f2f;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;">關閉推播</button>
-                </div>
-                <div id="knock-ntfy-status" style="margin-top:14px;font-size:13px;color:#aaa;line-height:1.6;"></div>
-            </div>`;
-        document.body.appendChild(panel);
-        if (!current) {
-            document.getElementById('knock-ntfy-topic').value = `knock-${Math.random().toString(36).slice(2, 10)}`;
-        }
-        const close = () => panel.remove();
-        document.getElementById('knock-ntfy-close').onclick = close;
-        panel.addEventListener('click', (e) => { if (e.target === panel) close(); });
-        const status = document.getElementById('knock-ntfy-status');
+        const panel = toggleOverlay('knock-ntfy-settings', () => makeOverlay('knock-ntfy-settings', 520, `
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;">
+                <h2 style="margin:0;font-size:24px;">手機通知（ntfy）</h2>
+                <button id="knock-ntfy-close" style="${cssBtn('#444')}">關閉</button>
+            </div>
+            <div style="font-size:13px;color:#888;margin-bottom:16px;line-height:1.6;">
+                分頁沒在看時，新訊息會推到手機。請安裝
+                <a href="https://ntfy.sh/app" target="_blank" rel="noreferrer" style="color:#8ab4f8;">ntfy App</a>
+                ，伺服器選 <b style="color:#ccc;">ntfy.sh</b>，訂閱下方同一個主題。
+                <br><br>
+                跨域權限：按「傳送測試」時若 Tampermonkey 跳出「允許存取 ntfy.sh」，請選<strong style="color:#ccc;">永遠允許</strong>。
+                沒跳出或曾按錯過：Tampermonkey 圖示 → 管理面板 → 這支腳本 → <strong style="color:#ccc;">設定</strong> → 往下找 <strong style="color:#ccc;">XHR Security</strong>，把 ntfy.sh 從黑名單移除，或加到白名單。
+            </div>
+            <div style="font-size:12px;color:#888;margin-bottom:6px;">主題</div>
+            <input type="text" id="knock-ntfy-topic" placeholder="例如 knock-x7k2m9" value="${escapeHtml(current)}" style="${CSS_INP}margin-bottom:12px;">
+            <div style="font-size:12px;color:#888;margin-bottom:6px;">通知標題</div>
+            <input type="text" id="knock-ntfy-title" placeholder="${escapeHtml(NTFY_TITLE_DEFAULT)}" value="${escapeHtml(getNtfyTitle())}" style="${CSS_INP}margin-bottom:12px;">
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                <button id="knock-ntfy-save" style="${cssBtn('#4CAF50')}">儲存</button>
+                <button id="knock-ntfy-test" style="${cssBtn('#2d4a6d')}">傳送測試</button>
+                <button id="knock-ntfy-clear" style="${cssBtn('#d32f2f')}">關閉推播</button>
+            </div>
+            <div id="knock-ntfy-status" style="margin-top:14px;font-size:13px;color:#aaa;line-height:1.6;"></div>`));
+        if (!panel) return;
+        if (!current) el('knock-ntfy-topic').value = `knock-${Math.random().toString(36).slice(2, 10)}`;
+        el('knock-ntfy-close').onclick = () => panel.remove();
+        const status = el('knock-ntfy-status');
         const paintStatus = (topic) => {
             if (!topic) {
                 status.innerHTML = '尚未儲存主題。';
@@ -1249,18 +1265,20 @@
             status.innerHTML = `手機請訂閱：<a href="${href}" target="_blank" rel="noreferrer" style="color:#8ab4f8;">${escapeHtml(topic)}</a>`;
         };
         paintStatus(current);
-        document.getElementById('knock-ntfy-save').onclick = () => {
-            const saved = setNtfyTopic(document.getElementById('knock-ntfy-topic').value);
+        el('knock-ntfy-save').onclick = () => {
+            const saved = setNtfyTopic(el('knock-ntfy-topic').value);
             if (saved === null) {
                 alert('主題只能用英數、底線、連字號，最多 64 字');
                 return;
             }
+            setNtfyTitle(el('knock-ntfy-title').value);
             paintStatus(saved);
             showToast(saved ? `已設定，請在手機訂閱 ${saved}` : '已關閉手機推播');
         };
-        document.getElementById('knock-ntfy-test').onclick = async () => {
+        el('knock-ntfy-test').onclick = async () => {
+            setNtfyTitle(el('knock-ntfy-title').value);
             if (!getNtfyTopic()) {
-                const saved = setNtfyTopic(document.getElementById('knock-ntfy-topic').value);
+                const saved = setNtfyTopic(el('knock-ntfy-topic').value);
                 if (!saved) {
                     alert('請先填主題並儲存');
                     return;
@@ -1268,83 +1286,62 @@
                 paintStatus(saved);
             }
             status.textContent = '傳送中…';
-            const result = await sendNtfy('這是測試通知', 'Knock 測試');
-            if (result.ok) {
-                status.textContent = `已送到 ntfy（${result.detail}）。手機沒響的話，確認 App 訂閱的主題與伺服器是 ntfy.sh。`;
-                showToast('測試已送到 ntfy');
-            } else {
-                status.textContent = `沒送出：${result.detail}。請依上方步驟允許 ntfy.sh。`;
-                showToast('測試失敗，看設定頁說明');
-            }
+            const result = await sendNtfy('這是測試通知');
+            status.textContent = result.ok
+                ? `已送到 ntfy（${result.detail}）。手機沒響的話，確認 App 訂閱的主題與伺服器是 ntfy.sh。`
+                : `沒送出：${result.detail}。請依上方步驟允許 ntfy.sh。`;
+            showToast(result.ok ? '測試已送到 ntfy' : '測試失敗，看設定頁說明');
         };
-        document.getElementById('knock-ntfy-clear').onclick = () => {
+        el('knock-ntfy-clear').onclick = () => {
             setNtfyTopic('');
-            document.getElementById('knock-ntfy-topic').value = '';
+            el('knock-ntfy-topic').value = '';
             paintStatus('');
             showToast('已關閉手機推播');
         };
     }
 
     function refreshFirstFilterManager() {
-        if (!document.getElementById('knock-first-filter-manager')) return;
-        document.getElementById('knock-first-filter-manager').remove();
+        const panel = el('knock-first-filter-manager');
+        if (!panel) return;
+        panel.remove();
         createFirstFilterManager();
     }
 
     function createFirstFilterManager() {
-        const existing = document.getElementById('knock-first-filter-manager');
-        if (existing) {
-            existing.remove();
-            return;
-        }
-
         const filters = getNormalizedFilters();
-        const panel = document.createElement('div');
-        panel.id = 'knock-first-filter-manager';
-        panel.style.cssText = `
-            position:fixed;top:0;left:0;width:100%;height:100%;z-index:10002;
-            background:rgba(0,0,0,0.9);font-family:${FONT};color:#fff;overflow-y:auto;
-        `;
-        panel.innerHTML = `
-            <div style="max-width:720px;margin:0 auto;padding:24px;">
-                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;flex-wrap:wrap;">
-                    <h2 style="margin:0;font-size:24px;">發語詞過濾（${filters.length}）</h2>
-                    <div style="display:flex;gap:8px;flex-wrap:wrap;">
-                        <button id="knock-export-first-filters" style="padding:8px 16px;background:#2d5a3d;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;" ${filters.length ? '' : 'disabled'}>匯出</button>
-                        <button id="knock-import-first-filters" style="padding:8px 16px;background:#2d4a6d;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;">匯入</button>
-                        <button id="knock-clear-first-filters" style="padding:8px 16px;background:#d32f2f;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;" ${filters.length ? '' : 'disabled'}>全部清空</button>
-                        <button id="knock-filter-manager-close" style="padding:8px 16px;background:#444;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;">關閉</button>
-                    </div>
-                    <input type="file" id="knock-import-first-filters-file" accept="application/json,.json" hidden>
+        const panel = toggleOverlay('knock-first-filter-manager', () => makeOverlay('knock-first-filter-manager', 720, `
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;flex-wrap:wrap;">
+                <h2 style="margin:0;font-size:24px;">發語詞過濾（${filters.length}）</h2>
+                <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                    <button id="knock-export-first-filters" style="${cssBtn('#2d5a3d')}" ${filters.length ? '' : 'disabled'}>匯出</button>
+                    <button id="knock-import-first-filters" style="${cssBtn('#2d4a6d')}">匯入</button>
+                    <button id="knock-clear-first-filters" style="${cssBtn('#d32f2f')}" ${filters.length ? '' : 'disabled'}>全部清空</button>
+                    <button id="knock-filter-manager-close" style="${cssBtn('#444')}">關閉</button>
                 </div>
-                <div style="font-size:13px;color:#888;margin-bottom:16px;">發語詞與對方頭像都相同才會自動離開。舊名單若沒有頭像，請重新勾選一次。</div>
-                <input type="text" id="knock-filter-search" placeholder="搜尋已記住的訊息..." style="width:100%;padding:12px;background:#333;border:1px solid #555;border-radius:6px;color:#fff;font-size:14px;box-sizing:border-box;margin-bottom:16px;">
-                <div id="knock-filter-list" style="display:flex;flex-direction:column;gap:8px;">
-                    ${filters.length === 0
-                        ? '<div style="text-align:center;padding:40px;color:#888;">尚未封鎖任何發語詞</div>'
-                        : filters.map(f => `
-                            <div class="knock-filter-card" style="display:flex;gap:8px;align-items:flex-start;background:#222;border:1px solid #444;border-radius:8px;padding:12px;">
-                                <div style="flex:1;min-width:0;">
-                                    <div style="font-size:14px;color:#ccc;white-space:pre-wrap;word-break:break-word;">${escapeHtml(f.t)}</div>
-                                    <div style="font-size:12px;color:#666;margin-top:4px;">${f.a ? `頭像 ${escapeHtml(f.a)}` : '僅發語詞（舊，需重新勾選）'}</div>
-                                </div>
-                                <button class="knock-remove-first-filter" data-filter-text="${encodeURIComponent(f.t)}" data-filter-avatar="${encodeURIComponent(f.a)}" style="padding:6px 10px;background:#d32f2f;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;flex-shrink:0;">刪除</button>
-                            </div>`).join('')}
-                </div>
-            </div>`;
-        document.body.appendChild(panel);
-
-        const close = () => panel.remove();
-        document.getElementById('knock-filter-manager-close').onclick = close;
-        panel.addEventListener('click', (e) => { if (e.target === panel) close(); });
-        document.getElementById('knock-export-first-filters').onclick = () => {
+                <input type="file" id="knock-import-first-filters-file" accept="application/json,.json" hidden>
+            </div>
+            <div style="font-size:13px;color:#888;margin-bottom:16px;">發語詞與對方頭像都相同才會自動離開。舊名單若沒有頭像，請重新勾選一次。</div>
+            <input type="text" id="knock-filter-search" placeholder="搜尋已記住的訊息..." style="${CSS_INP}margin-bottom:16px;">
+            <div id="knock-filter-list" style="display:flex;flex-direction:column;gap:8px;">
+                ${filters.length === 0
+                    ? '<div style="text-align:center;padding:40px;color:#888;">尚未封鎖任何發語詞</div>'
+                    : filters.map(f => `
+                        <div class="knock-filter-card" style="display:flex;gap:8px;align-items:flex-start;background:#222;border:1px solid #444;border-radius:8px;padding:12px;">
+                            <div style="flex:1;min-width:0;">
+                                <div style="font-size:14px;color:#ccc;white-space:pre-wrap;word-break:break-word;">${escapeHtml(f.t)}</div>
+                                <div style="font-size:12px;color:#666;margin-top:4px;">${f.a ? `頭像 ${escapeHtml(f.a)}` : '僅發語詞（舊，需重新勾選）'}</div>
+                            </div>
+                            <button class="knock-remove-first-filter" data-filter-text="${encodeURIComponent(f.t)}" data-filter-avatar="${encodeURIComponent(f.a)}" style="${cssBtn('#d32f2f', 'padding:6px 10px;border-radius:4px;font-size:12px;flex-shrink:0;')}">刪除</button>
+                        </div>`).join('')}
+            </div>`));
+        if (!panel) return;
+        el('knock-filter-manager-close').onclick = () => panel.remove();
+        el('knock-export-first-filters').onclick = () => {
             const n = exportFirstMessageFilters();
             showToast(n ? `已匯出 ${n} 則` : '沒有可匯出的發語詞');
         };
-        document.getElementById('knock-import-first-filters').onclick = () => {
-            document.getElementById('knock-import-first-filters-file').click();
-        };
-        document.getElementById('knock-import-first-filters-file').addEventListener('change', async (e) => {
+        el('knock-import-first-filters').onclick = () => el('knock-import-first-filters-file').click();
+        el('knock-import-first-filters-file').addEventListener('change', async (e) => {
             const file = e.target.files && e.target.files[0];
             e.target.value = '';
             if (!file) return;
@@ -1357,36 +1354,31 @@
                 alert('匯入失敗：請使用本功能匯出的 JSON');
             }
         });
-        document.getElementById('knock-filter-search').addEventListener('input', (e) => {
-            const term = e.target.value.toLowerCase();
-            panel.querySelectorAll('.knock-filter-card').forEach(card => {
-                card.style.display = card.textContent.toLowerCase().includes(term) ? 'flex' : 'none';
-            });
+        el('knock-filter-search').addEventListener('input', (e) => {
+            filterCardsByTerm('.knock-filter-card', e.target.value.toLowerCase(), 'flex');
         });
     }
 
     function paintConvTabs() {
-        const savedBtn = document.getElementById('knock-tab-saved');
-        const autoBtn = document.getElementById('knock-tab-auto');
+        const savedBtn = el('knock-tab-saved');
+        const autoBtn = el('knock-tab-auto');
         if (!savedBtn || !autoBtn) return;
-        const on = 'padding:8px 16px;border:none;border-radius:6px;cursor:pointer;font-size:14px;background:#4CAF50;color:#fff;';
-        const off = 'padding:8px 16px;border:none;border-radius:6px;cursor:pointer;font-size:14px;background:#333;color:#ccc;';
-        savedBtn.style.cssText = conversationManagerTab === 'saved' ? on : off;
-        autoBtn.style.cssText = conversationManagerTab === 'auto' ? on : off;
+        savedBtn.style.cssText = cssBtn(conversationManagerTab === 'saved' ? '#4CAF50' : '#333', conversationManagerTab === 'saved' ? '' : 'color:#ccc;');
+        autoBtn.style.cssText = cssBtn(conversationManagerTab === 'auto' ? '#4CAF50' : '#333', conversationManagerTab === 'auto' ? '' : 'color:#ccc;');
         savedBtn.textContent = `已儲存（${getSavedConversations().length}）`;
         autoBtn.textContent = `自動儲存（${getAutoConversations().length}）`;
     }
 
     function renderConversationList() {
-        const el = document.getElementById('knock-conversations-list');
-        if (!el) return;
+        const listEl = el('knock-conversations-list');
+        if (!listEl) return;
         const list = conversationManagerTab === 'saved' ? getSavedConversations() : getAutoConversations();
         const empty = conversationManagerTab === 'saved' ? '尚無已儲存的對話' : '尚無自動儲存的對話';
-        el.innerHTML = list.length === 0
+        listEl.innerHTML = list.length === 0
             ? `<div style="text-align:center;padding:40px;color:#888;">${empty}</div>`
             : list.map(createConversationCard).join('');
         paintConvTabs();
-        const all = document.getElementById('knock-conv-select-all');
+        const all = el('knock-conv-select-all');
         if (all) all.checked = false;
     }
 
@@ -1397,62 +1389,47 @@
     }
 
     function createConversationManager() {
-        const existing = document.getElementById('knock-conversation-manager');
-        if (existing) {
-            existing.remove();
-            return;
-        }
-
-        persistLiveConversation();
-        const manager = document.createElement('div');
-        manager.id = 'knock-conversation-manager';
-        manager.style.cssText = `
-            position:fixed;top:0;left:0;width:100%;height:100%;z-index:10002;
-            background:rgba(0,0,0,0.9);font-family:${FONT};color:#fff;overflow-y:auto;
-        `;
-        manager.innerHTML = `
-            <div style="max-width:900px;margin:0 auto;padding:24px;">
-                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;flex-wrap:wrap;">
-                    <h2 style="margin:0;font-size:24px;">對話記錄</h2>
-                    <button id="knock-manager-close" style="padding:8px 16px;background:#444;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;">關閉</button>
-                </div>
-                <div style="display:flex;gap:8px;margin-bottom:16px;">
-                    <button type="button" id="knock-tab-saved"></button>
-                    <button type="button" id="knock-tab-auto"></button>
-                </div>
-                <div style="display:flex;gap:8px;align-items:center;margin-bottom:16px;flex-wrap:wrap;">
-                    <label style="display:flex;align-items:center;gap:6px;font-size:14px;color:#ccc;cursor:pointer;">
-                        <input type="checkbox" id="knock-conv-select-all" style="width:16px;height:16px;">全選
-                    </label>
-                    <button id="knock-conv-delete-selected" style="padding:6px 12px;background:#d32f2f;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:13px;">刪除所選</button>
-                </div>
-                <div style="margin-bottom:20px;">
-                    <input type="text" id="knock-search-input" placeholder="搜尋對話內容..." style="width:100%;padding:12px;background:#333;border:1px solid #555;border-radius:6px;color:#fff;font-size:14px;box-sizing:border-box;">
-                </div>
-                <div id="knock-conversations-list" style="display:flex;flex-direction:column;gap:12px;"></div>
-            </div>`;
-        document.body.appendChild(manager);
+        const manager = toggleOverlay('knock-conversation-manager', () => {
+            persistLiveConversation();
+            return makeOverlay('knock-conversation-manager', 900, `
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;flex-wrap:wrap;">
+                <h2 style="margin:0;font-size:24px;">對話記錄</h2>
+                <button id="knock-manager-close" style="${cssBtn('#444')}">關閉</button>
+            </div>
+            <div style="display:flex;gap:8px;margin-bottom:16px;">
+                <button type="button" id="knock-tab-saved"></button>
+                <button type="button" id="knock-tab-auto"></button>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;margin-bottom:16px;flex-wrap:wrap;">
+                <label style="display:flex;align-items:center;gap:6px;font-size:14px;color:#ccc;cursor:pointer;">
+                    <input type="checkbox" id="knock-conv-select-all" style="width:16px;height:16px;">全選
+                </label>
+                <button id="knock-conv-delete-selected" style="${cssBtn('#d32f2f', 'padding:6px 12px;border-radius:4px;font-size:13px;')}">刪除所選</button>
+            </div>
+            <div style="margin-bottom:20px;">
+                <input type="text" id="knock-search-input" placeholder="搜尋對話內容..." style="${CSS_INP}">
+            </div>
+            <div id="knock-conversations-list" style="display:flex;flex-direction:column;gap:12px;"></div>`);
+        });
+        if (!manager) return;
         renderConversationList();
-
-        const close = () => manager.remove();
-        document.getElementById('knock-manager-close').onclick = close;
-        manager.addEventListener('click', (e) => { if (e.target === manager) close(); });
-        document.getElementById('knock-tab-saved').onclick = () => {
+        el('knock-manager-close').onclick = () => manager.remove();
+        el('knock-tab-saved').onclick = () => {
             conversationManagerTab = 'saved';
             renderConversationList();
         };
-        document.getElementById('knock-tab-auto').onclick = () => {
+        el('knock-tab-auto').onclick = () => {
             conversationManagerTab = 'auto';
             renderConversationList();
         };
-        document.getElementById('knock-conv-select-all').onchange = (e) => {
+        el('knock-conv-select-all').onchange = (e) => {
             document.querySelectorAll('#knock-conversations-list .knock-conv-card').forEach(card => {
                 if (card.style.display === 'none') return;
                 const box = card.querySelector('.knock-conv-check');
                 if (box) box.checked = e.target.checked;
             });
         };
-        document.getElementById('knock-conv-delete-selected').onclick = () => {
+        el('knock-conv-delete-selected').onclick = () => {
             const ids = selectedConversationIds();
             if (!ids.length) {
                 showToast('請先勾選要刪除的對話');
@@ -1463,11 +1440,8 @@
                 showToast(`已刪除 ${ids.length} 則`);
             }
         };
-        document.getElementById('knock-search-input').addEventListener('input', (e) => {
-            const term = e.target.value.toLowerCase();
-            document.querySelectorAll('#knock-conversations-list .knock-conv-card').forEach(card => {
-                card.style.display = card.textContent.toLowerCase().includes(term) ? 'block' : 'none';
-            });
+        el('knock-search-input').addEventListener('input', (e) => {
+            filterCardsByTerm('#knock-conversations-list .knock-conv-card', e.target.value.toLowerCase(), 'block');
         });
     }
 
@@ -1484,67 +1458,57 @@
         const durationText = formatDuration(startDate, endDate);
         const sorted = sortMessages(conversation.messages);
         const firstOther = sorted.find(m => !m.isMyMessage);
-        const detail = document.createElement('div');
-        detail.id = 'knock-conversation-detail';
-        detail.style.cssText = `
-            position:fixed;top:0;left:0;width:100%;height:100%;z-index:10003;
-            background:rgba(0,0,0,0.95);font-family:${FONT};color:#fff;overflow-y:auto;
-        `;
-        detail.innerHTML = `
-            <div style="max-width:800px;margin:0 auto;padding:24px;">
-                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;gap:12px;flex-wrap:wrap;">
-                    <h2 style="margin:0;font-size:20px;">${isAuto ? '自動儲存' : '已儲存'}對話</h2>
-                    <div style="display:flex;gap:8px;">
-                        ${isAuto ? '<button id="knock-detail-pin" style="padding:8px 16px;background:#4CAF50;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;">移到已儲存</button>' : ''}
-                        <button id="knock-detail-close" style="padding:8px 16px;background:#444;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;">關閉</button>
-                    </div>
+        el('knock-conversation-detail')?.remove();
+        const detail = makeOverlay('knock-conversation-detail', 800, `
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;gap:12px;flex-wrap:wrap;">
+                <h2 style="margin:0;font-size:20px;">${isAuto ? '自動儲存' : '已儲存'}對話</h2>
+                <div style="display:flex;gap:8px;">
+                    ${isAuto ? `<button id="knock-detail-pin" style="${cssBtn('#4CAF50')}">移到已儲存</button>` : ''}
+                    <button id="knock-detail-close" style="${cssBtn('#444')}">關閉</button>
                 </div>
-                <div style="background:#222;border-radius:8px;padding:16px;margin-bottom:20px;font-size:13px;color:#888;">
-                    <div>開始時間: ${startDate.toLocaleString('zh-TW')}</div>
-                    ${endDate ? `<div>結束時間: ${endDate.toLocaleString('zh-TW')}</div>` : ''}
-                    ${durationText ? `<div>持續時間: ${durationText}</div>` : ''}
-                    <div>訊息數量: ${conversation.messages.length} 條</div>
-                </div>
-                <div style="display:flex;flex-direction:column;gap:12px;">
-                    ${sorted.map(msg => {
-                        const filterKey = msg.text || (msg.imageUrls && msg.imageUrls[0]) || '';
-                        const showRemember = msg === firstOther && filterKey;
-                        return `
-                        <div style="display:flex;align-items:flex-start;gap:8px;flex-direction:${msg.isMyMessage ? 'row-reverse' : 'row'};margin-bottom:12px;">
-                            <div style="width:40px;height:40px;border-radius:50%;flex-shrink:0;background:#333;display:flex;align-items:center;justify-content:center;overflow:hidden;">
-                                ${msg.avatarUrl
-                                    ? `<img src="${msg.avatarUrl}" style="width:100%;height:100%;object-fit:cover;" alt="avatar">`
-                                    : `<div style="color:#888;font-size:18px;">${msg.isMyMessage ? '我' : '對'}</div>`}
+            </div>
+            <div style="background:#222;border-radius:8px;padding:16px;margin-bottom:20px;font-size:13px;color:#888;">
+                <div>開始時間: ${startDate.toLocaleString('zh-TW')}</div>
+                ${endDate ? `<div>結束時間: ${endDate.toLocaleString('zh-TW')}</div>` : ''}
+                ${durationText ? `<div>持續時間: ${durationText}</div>` : ''}
+                <div>訊息數量: ${conversation.messages.length} 條</div>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:12px;">
+                ${sorted.map(msg => {
+                    const filterKey = msg.text || (msg.imageUrls && msg.imageUrls[0]) || '';
+                    const showRemember = msg === firstOther && filterKey;
+                    return `
+                    <div style="display:flex;align-items:flex-start;gap:8px;flex-direction:${msg.isMyMessage ? 'row-reverse' : 'row'};margin-bottom:12px;">
+                        <div style="width:40px;height:40px;border-radius:50%;flex-shrink:0;background:#333;display:flex;align-items:center;justify-content:center;overflow:hidden;">
+                            ${msg.avatarUrl
+                                ? `<img src="${msg.avatarUrl}" style="width:100%;height:100%;object-fit:cover;" alt="avatar">`
+                                : `<div style="color:#888;font-size:18px;">${msg.isMyMessage ? '我' : '對'}</div>`}
+                        </div>
+                        <div style="background:${msg.isMyMessage ? '#2d5a3d' : '#2d2d3d'};border-radius:8px;padding:8px 10px;max-width:70%;display:flex;align-items:flex-start;gap:8px;">
+                            <div style="flex:1;min-width:0;">
+                                ${msg.text ? `<div style="font-size:14px;line-height:1.4;word-wrap:break-word;">${escapeHtml(msg.text)}</div>` : ''}
+                                ${(msg.imageUrls || []).map(src => `
+                                    <a href="${escapeHtml(src)}" target="_blank" rel="noreferrer">
+                                        <img src="${escapeHtml(src)}" alt="圖片" style="max-width:180px;max-height:240px;border-radius:6px;display:block;margin-top:6px;">
+                                    </a>`).join('')}
+                                ${!msg.text && !(msg.imageUrls || []).length ? `<div style="color:#888;font-size:13px;">（空訊息）</div>` : ''}
                             </div>
-                            <div style="background:${msg.isMyMessage ? '#2d5a3d' : '#2d2d3d'};border-radius:8px;padding:8px 10px;max-width:70%;display:flex;align-items:flex-start;gap:8px;">
-                                <div style="flex:1;min-width:0;">
-                                    ${msg.text ? `<div style="font-size:14px;line-height:1.4;word-wrap:break-word;">${escapeHtml(msg.text)}</div>` : ''}
-                                    ${(msg.imageUrls || []).map(src => `
-                                        <a href="${escapeHtml(src)}" target="_blank" rel="noreferrer">
-                                            <img src="${escapeHtml(src)}" alt="圖片" style="max-width:180px;max-height:240px;border-radius:6px;display:block;margin-top:6px;">
-                                        </a>`).join('')}
-                                    ${!msg.text && !(msg.imageUrls || []).length ? `<div style="color:#888;font-size:13px;">（空訊息）</div>` : ''}
-                                </div>
-                                ${msg.timestamp ? `<div style="font-size:11px;color:rgba(255,255,255,0.5);flex-shrink:0;white-space:nowrap;">${msg.timestamp}</div>` : ''}
-                                ${showRemember ? `<button type="button" class="knock-remember-first-saved" data-filter-text="${encodeURIComponent(filterKey)}" data-filter-avatar="${encodeURIComponent(avatarHashOf(msg.avatarUrl))}"></button>` : ''}
-                            </div>
-                        </div>`;
-                    }).join('')}
-                </div>
-            </div>`;
-        document.body.appendChild(detail);
+                            ${msg.timestamp ? `<div style="font-size:11px;color:rgba(255,255,255,0.5);flex-shrink:0;white-space:nowrap;">${msg.timestamp}</div>` : ''}
+                            ${showRemember ? `<button type="button" class="knock-remember-first-saved" data-filter-text="${encodeURIComponent(filterKey)}" data-filter-avatar="${encodeURIComponent(avatarHashOf(msg.avatarUrl))}"></button>` : ''}
+                        </div>
+                    </div>`;
+                }).join('')}
+            </div>`, 10003);
         syncRememberButtons();
-        const close = () => detail.remove();
-        document.getElementById('knock-detail-close').onclick = close;
-        document.getElementById('knock-detail-pin')?.addEventListener('click', () => {
+        el('knock-detail-close').onclick = () => detail.remove();
+        el('knock-detail-pin')?.addEventListener('click', () => {
             if (pinConversation(conversationId)) {
                 showToast('已移到已儲存');
-                close();
+                detail.remove();
                 conversationManagerTab = 'saved';
                 renderConversationList();
             }
         });
-        detail.addEventListener('click', (e) => { if (e.target === detail) close(); });
     }
 
     document.addEventListener('click', (e) => {
@@ -1567,7 +1531,7 @@
             return;
         }
         if (e.target.id === 'knock-clear-first-filters') {
-            if (getFirstMessageFilters().length && confirm('確定清空全部發語詞過濾？')) {
+            if (getNormalizedFilters().length && confirm('確定清空全部發語詞過濾？')) {
                 clearFirstMessageFilters();
                 syncRememberButtons();
                 refreshFirstFilterManager();
@@ -1577,11 +1541,7 @@
 
         const convId = e.target.getAttribute?.('data-conv-id');
         if (!convId) return;
-        if (e.target.classList.contains('knock-delete-btn')) {
-            if (confirm('確定要刪除這個對話嗎？') && deleteConversation(convId)) {
-                renderConversationList();
-            }
-        } else if (e.target.classList.contains('knock-pin-btn')) {
+        if (e.target.classList.contains('knock-pin-btn')) {
             if (pinConversation(convId)) {
                 showToast('已移到已儲存');
                 renderConversationList();
@@ -1595,7 +1555,7 @@
 
     function mountChrome() {
         if (!document.body) return;
-        OLD_FLOAT_IDS.forEach(id => document.getElementById(id)?.remove());
+        OLD_FLOAT_IDS.forEach(id => el(id)?.remove());
         createDock();
     }
 
