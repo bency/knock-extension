@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.7
+// @version      1.4.9
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -30,15 +30,19 @@
     const AUTO_CONV_KEY = 'knockAutoConversations';
     const NTFY_TOPIC_KEY = 'knockNtfyTopic';
     const NTFY_SERVER = 'https://ntfy.sh';
+    const KEEP_ALIVE_ENABLED_KEY = 'knockKeepAliveEnabled';
+    const KEEP_ALIVE_TEXT_KEY = 'knockKeepAliveText';
+    const KEEP_ALIVE_AT_KEY = 'knockKeepAliveAt';
+    const KEEP_ALIVE_AFTER_MS = 4 * 60 * 60 * 1000;
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
-    const FLOAT_STYLE = `
-        position: fixed; right: 20px; z-index: 10000;
-        background: rgba(0, 0, 0, 0.8); border-radius: 8px; padding: 12px 16px;
-        display: flex; align-items: center; gap: 8px;
-        font-family: ${FONT}; font-size: 14px; color: #fff;
-        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3); cursor: pointer; user-select: none;
-    `;
+    const DOCK_OPEN_KEY = 'knockDockOpen';
+    const OLD_FLOAT_IDS = [
+        'knock-auto-click-toggle', 'knock-manager-button', 'knock-filter-manager-button',
+        'knock-ntfy-button', 'knock-keepalive-toggle', 'knock-manual-save-button'
+    ];
+    const DOCK_PANEL = 'background:rgba(0,0,0,0.82);border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.3);';
+    const DOCK_ROW = 'display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;box-sizing:border-box;padding:8px 10px;border:none;border-radius:8px;background:#222;color:#fff;font:inherit;font-size:13px;text-align:left;cursor:pointer;';
 
     function storageGet(key, fallback) {
         try {
@@ -61,6 +65,9 @@
 
     const savedAutoClick = localStorage.getItem('knockAutoClickEnabled');
     let autoClickEnabled = savedAutoClick === null ? true : savedAutoClick === 'true';
+    let keepAliveEnabled = localStorage.getItem(KEEP_ALIVE_ENABLED_KEY) === 'true';
+    let lastActivityAt = 0;
+    let lastKeepAliveTryAt = 0;
 
     const checkedMessages = new Set();
     let myAvatarUrl = null;
@@ -136,6 +143,9 @@
         rematchScheduled = false;
         startChatScheduled = false;
         hideCooldown();
+        lastActivityAt = 0;
+        lastKeepAliveTryAt = 0;
+        sessionStorage.removeItem(KEEP_ALIVE_AT_KEY);
         console.log('初始化新對話:', currentConversation.id);
     }
 
@@ -336,6 +346,7 @@
             collectedAt: new Date().toISOString()
         });
         console.log('收集訊息:', messageText || '[圖片]', imageUrls);
+        noteActivity();
         persistLiveConversationSoon();
     }
 
@@ -841,54 +852,172 @@
         setTimeout(() => toast.remove(), 2000);
     }
 
-    function createFloatButton(id, top, html, onClick) {
-        if (document.getElementById(id)) return;
+    function dockSwitch(on) {
         const el = document.createElement('div');
-        el.id = id;
-        el.style.cssText = FLOAT_STYLE + `top:${top}px;`;
-        el.innerHTML = html;
-        el.addEventListener('click', (e) => {
-            e.stopPropagation();
-            onClick();
-        });
-        document.body.appendChild(el);
+        el.style.cssText = `width:40px;height:22px;border-radius:11px;position:relative;flex-shrink:0;background:${on ? '#4CAF50' : '#555'};`;
+        const knob = document.createElement('div');
+        knob.style.cssText = `width:18px;height:18px;background:#fff;border-radius:50%;position:absolute;top:2px;left:${on ? '20px' : '2px'};transition:left .2s;`;
+        el.append(knob);
+        el.paint = (v) => {
+            el.style.background = v ? '#4CAF50' : '#555';
+            knob.style.left = v ? '20px' : '2px';
+        };
+        return el;
     }
 
-    function createToggleSwitch() {
-        if (document.getElementById('knock-auto-click-toggle')) return;
+    function dockRow(labelHtml, extra) {
+        const row = document.createElement(extra && extra.button ? 'button' : 'div');
+        if (extra && extra.button) row.type = 'button';
+        row.style.cssText = DOCK_ROW;
+        row.innerHTML = labelHtml;
+        return row;
+    }
 
-        const toggleContainer = document.createElement('div');
-        toggleContainer.id = 'knock-auto-click-toggle';
-        toggleContainer.style.cssText = FLOAT_STYLE + 'top:20px; gap:10px;';
+    function createDock() {
+        if (document.getElementById('knock-dock')) return;
+        OLD_FLOAT_IDS.forEach(id => document.getElementById(id)?.remove());
 
-        const label = document.createElement('span');
-        label.textContent = '自動開啟新對話';
-        label.style.whiteSpace = 'nowrap';
+        let open = localStorage.getItem(DOCK_OPEN_KEY) === 'true';
+        const dock = document.createElement('div');
+        dock.id = 'knock-dock';
+        dock.style.cssText = `position:fixed;right:16px;top:16px;z-index:10000;font-family:${FONT};color:#fff;user-select:none;`;
 
-        const toggleSwitch = document.createElement('div');
-        toggleSwitch.style.cssText = `
-            width: 50px; height: 26px; border-radius: 13px; position: relative;
-            background: ${autoClickEnabled ? '#4CAF50' : '#ccc'}; transition: background 0.3s ease;
-        `;
-        const toggleSlider = document.createElement('div');
-        toggleSlider.style.cssText = `
-            width: 22px; height: 22px; background: #fff; border-radius: 50%;
-            position: absolute; top: 2px; left: ${autoClickEnabled ? '26px' : '2px'};
-            transition: left 0.3s ease; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
-        `;
-        toggleSwitch.append(toggleSlider);
-        toggleContainer.append(label, toggleSwitch);
+        const header = document.createElement('button');
+        header.type = 'button';
+        header.id = 'knock-dock-header';
+        header.style.cssText = DOCK_PANEL + 'display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;box-sizing:border-box;padding:10px 12px;border:none;color:#fff;font:inherit;font-size:14px;cursor:pointer;';
+        header.innerHTML = '<span>Knock</span><span id="knock-dock-chevron"></span>';
 
-        toggleContainer.addEventListener('click', (e) => {
+        const body = document.createElement('div');
+        body.id = 'knock-dock-body';
+        body.style.cssText = DOCK_PANEL + 'margin-top:8px;padding:8px;display:none;flex-direction:column;gap:6px;width:220px;box-sizing:border-box;';
+
+        const autoRow = dockRow('<span>自動開啟新對話</span>');
+        const autoSw = dockSwitch(autoClickEnabled);
+        autoRow.append(autoSw);
+        autoRow.addEventListener('click', (e) => {
             e.stopPropagation();
             autoClickEnabled = !autoClickEnabled;
             localStorage.setItem('knockAutoClickEnabled', String(autoClickEnabled));
-            toggleSwitch.style.background = autoClickEnabled ? '#4CAF50' : '#ccc';
-            toggleSlider.style.left = autoClickEnabled ? '26px' : '2px';
+            autoSw.paint(autoClickEnabled);
             requestNotifyPermission();
         });
 
-        document.body.appendChild(toggleContainer);
+        const keepRow = dockRow('<span>持續連線</span>');
+        const keepSw = dockSwitch(keepAliveEnabled);
+        keepRow.append(keepSw);
+        keepRow.addEventListener('click', (e) => {
+            e.stopPropagation();
+            keepAliveEnabled = !keepAliveEnabled;
+            localStorage.setItem(KEEP_ALIVE_ENABLED_KEY, String(keepAliveEnabled));
+            keepSw.paint(keepAliveEnabled);
+            if (keepAliveEnabled && !getKeepAliveText()) showToast('請先輸入避免斷線的句子');
+        });
+
+        const keepInput = document.createElement('input');
+        keepInput.type = 'text';
+        keepInput.placeholder = '四小時沒說話就送這句';
+        keepInput.value = getKeepAliveText();
+        keepInput.style.cssText = 'width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #444;border-radius:8px;background:#1a1a1a;color:#fff;font:inherit;font-size:13px;';
+        keepInput.addEventListener('click', (e) => e.stopPropagation());
+        keepInput.addEventListener('input', () => localStorage.setItem(KEEP_ALIVE_TEXT_KEY, keepInput.value));
+
+        const convBtn = dockRow('<span>對話記錄</span>', { button: true });
+        convBtn.addEventListener('click', (e) => { e.stopPropagation(); createConversationManager(); });
+
+        const filterBtn = dockRow(
+            `<span>發語詞過濾</span><span id="knock-filter-count" style="background:#ff9800;border-radius:10px;padding:0 6px;font-size:12px;min-width:1.2em;text-align:center;">${getNormalizedFilters().length}</span>`,
+            { button: true }
+        );
+        filterBtn.addEventListener('click', (e) => { e.stopPropagation(); createFirstFilterManager(); });
+
+        const ntfyBtn = dockRow('<span>手機通知</span>', { button: true });
+        ntfyBtn.addEventListener('click', (e) => { e.stopPropagation(); createNtfySettings(); });
+
+        body.append(autoRow, keepRow, keepInput, convBtn, filterBtn, ntfyBtn);
+
+        const paintOpen = () => {
+            body.style.display = open ? 'flex' : 'none';
+            dock.style.width = open ? '220px' : 'auto';
+            header.style.width = open ? '220px' : 'auto';
+            document.getElementById('knock-dock-chevron').textContent = open ? '收合' : '選單';
+        };
+        header.addEventListener('click', (e) => {
+            e.stopPropagation();
+            open = !open;
+            localStorage.setItem(DOCK_OPEN_KEY, String(open));
+            paintOpen();
+        });
+
+        dock.append(header, body);
+        document.body.appendChild(dock);
+        paintOpen();
+    }
+
+    function getKeepAliveText() {
+        return (localStorage.getItem(KEEP_ALIVE_TEXT_KEY) || '').trim();
+    }
+
+    function noteActivity() {
+        lastActivityAt = Date.now();
+        if (!currentConversation.id) return;
+        sessionStorage.setItem(KEEP_ALIVE_AT_KEY, JSON.stringify({
+            id: currentConversation.id,
+            at: lastActivityAt
+        }));
+    }
+
+    function activityAt() {
+        try {
+            const raw = JSON.parse(sessionStorage.getItem(KEEP_ALIVE_AT_KEY) || 'null');
+            if (raw && raw.id === currentConversation.id && raw.at > lastActivityAt) {
+                lastActivityAt = raw.at;
+            }
+        } catch (e) {}
+        return lastActivityAt;
+    }
+
+    function fillReactInput(el, value) {
+        el.focus();
+        const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+        setter.call(el, value);
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    function sendChatMessage(text) {
+        const wrap = document.querySelector('[data-test="input-message"]');
+        const send = document.querySelector('button[data-test="send"]');
+        if (!wrap || !send) return false;
+        const box = Array.from(wrap.querySelectorAll('textarea')).find(t =>
+            t.getAttribute('aria-hidden') !== 'true' && t.style.visibility !== 'hidden'
+        );
+        if (!box) return false;
+        fillReactInput(box, text);
+        const clickSend = () => {
+            if (box.value !== text) return;
+            if (send.disabled) send.removeAttribute('disabled');
+            simulateMouseClick(send);
+        };
+        clickSend();
+        setTimeout(clickSend, 80);
+        return true;
+    }
+
+    function tryKeepAlive() {
+        if (!keepAliveEnabled) return;
+        const text = getKeepAliveText();
+        if (!text) return;
+        if (!currentConversation.id || !currentConversation.messages.length) return;
+        if (pendingForcedLeave || isSavePromptVisible) return;
+        if (findButtons().some(b => isRematchButton(b) || isConfirmExitButton(b))) return;
+        const at = activityAt();
+        if (!at || Date.now() - at < KEEP_ALIVE_AFTER_MS) return;
+        if (Date.now() - lastKeepAliveTryAt < 60000) return;
+        lastKeepAliveTryAt = Date.now();
+        if (!sendChatMessage(text)) return;
+        noteActivity();
+        console.log('持續連線：已送出避免斷線訊息');
     }
 
     function dismissSavePrompt(prompt, save) {
@@ -1466,23 +1595,8 @@
 
     function mountChrome() {
         if (!document.body) return;
-        createToggleSwitch();
-        document.getElementById('knock-manual-save-button')?.remove();
-        createFloatButton('knock-manager-button', 70, '<span>📚</span><span>對話記錄</span>', createConversationManager);
-        const filterBtn = document.getElementById('knock-filter-manager-button');
-        if (filterBtn) filterBtn.style.top = '120px';
-        createFloatButton(
-            'knock-filter-manager-button',
-            120,
-            `<span>🚫</span><span>發語詞過濾</span><span id="knock-filter-count" style="background:#ff9800;border-radius:10px;padding:0 6px;font-size:12px;min-width:1.2em;text-align:center;">${getNormalizedFilters().length}</span>`,
-            createFirstFilterManager
-        );
-        createFloatButton(
-            'knock-ntfy-button',
-            170,
-            `<span>📱</span><span>手機通知</span>`,
-            createNtfySettings
-        );
+        OLD_FLOAT_IDS.forEach(id => document.getElementById(id)?.remove());
+        createDock();
     }
 
     if (document.body) mountChrome();
@@ -1499,6 +1613,7 @@
     setInterval(() => {
         maybeLeaveOnFirstMessageFilter();
         tryForcedLeave();
+        tryKeepAlive();
         checkForButtonAndClick();
         checkConversationEnd();
     }, 200);
