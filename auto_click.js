@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.13
+// @version      1.4.20
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -35,7 +35,11 @@
     const KEEP_ALIVE_ENABLED_KEY = 'knockKeepAliveEnabled';
     const KEEP_ALIVE_TEXT_KEY = 'knockKeepAliveText';
     const KEEP_ALIVE_AT_KEY = 'knockKeepAliveAt';
-    const KEEP_ALIVE_AFTER_MS = 4 * 60 * 60 * 1000;
+    const KEEP_ALIVE_MIN_H_KEY = 'knockKeepAliveMinHours';
+    const KEEP_ALIVE_MAX_H_KEY = 'knockKeepAliveMaxHours';
+    const KEEP_ALIVE_WAIT_KEY = 'knockKeepAliveWait';
+    const KEEP_ALIVE_MIN_H_DEFAULT = 1.5;
+    const KEEP_ALIVE_MAX_H_DEFAULT = 2.5;
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
@@ -101,6 +105,8 @@
     let keepAliveEnabled = localStorage.getItem(KEEP_ALIVE_ENABLED_KEY) === 'true';
     let lastActivityAt = 0;
     let lastKeepAliveTryAt = 0;
+    let lastKeepAliveSentAt = 0;
+    let keepAliveWaitMs = 0;
 
     const checkedMessages = new Set();
     let myAvatarUrl = null;
@@ -174,7 +180,10 @@
         hideCooldown();
         lastActivityAt = 0;
         lastKeepAliveTryAt = 0;
+        lastKeepAliveSentAt = 0;
+        keepAliveWaitMs = 0;
         sessionStorage.removeItem(KEEP_ALIVE_AT_KEY);
+        sessionStorage.removeItem(KEEP_ALIVE_WAIT_KEY);
         console.log('初始化新對話:', currentConversation.id);
     }
 
@@ -345,20 +354,100 @@
         return '';
     }
 
-    function collectMessage(messageLi) {
+    function ymd(d) {
+        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    }
+
+    function shiftYmd(days, from = new Date()) {
+        const d = new Date(from);
+        d.setHours(0, 0, 0, 0);
+        d.setDate(d.getDate() + days);
+        return ymd(d);
+    }
+
+    function clockMinutesOnly(timeStr) {
+        if (!timeStr) return null;
+        const m = /(\d{1,2}):(\d{2})/.exec(timeStr);
+        return m ? Number(m[1]) * 60 + Number(m[2]) : null;
+    }
+
+    function dateFromKnockLabel(timeStr, now = new Date()) {
+        const d = new Date(now);
+        d.setHours(0, 0, 0, 0);
+        if (timeStr && timeStr.includes('前天')) d.setDate(d.getDate() - 2);
+        else if (timeStr && timeStr.includes('昨天')) d.setDate(d.getDate() - 1);
+        return ymd(d);
+    }
+
+    function labelDayOffset(timeStr) {
+        if (!timeStr) return null;
+        if (timeStr.includes('前天')) return 2;
+        if (timeStr.includes('昨天')) return 1;
+        return null;
+    }
+
+    // 由新到舊：最新一則鐘點比現在還晚（23:20 vs 00:20）先當昨天；再遇到往回跳過 12 小時再跨一日
+    function dayOffsetsFromNewest(rows, now = new Date()) {
+        const nowClock = now.getHours() * 60 + now.getMinutes();
+        const newest = rows[rows.length - 1];
+        let dayOffset = newest && newest.labeled == null && newest.clock > nowClock ? 1 : 0;
+        let lastClock = null;
+        const out = new Array(rows.length);
+        for (let i = rows.length - 1; i >= 0; i--) {
+            const row = rows[i];
+            if (row.labeled != null) dayOffset = row.labeled;
+            else if (lastClock != null && row.clock > lastClock + 12 * 60) dayOffset += 1;
+            out[i] = dayOffset;
+            lastClock = row.clock;
+        }
+        return out;
+    }
+
+    function listMessageDates(list) {
+        const rows = [];
+        for (const li of list.querySelectorAll('li.message-li')) {
+            const timeEl = li.querySelector('span[data-test="date"]');
+            const timeStr = timeEl ? timeEl.textContent.trim() : '';
+            const clock = clockMinutesOnly(timeStr);
+            if (clock == null) continue;
+            rows.push({ li, clock, labeled: labelDayOffset(timeStr) });
+        }
+        const offsets = dayOffsetsFromNewest(rows);
+        const dates = new Map();
+        rows.forEach((row, i) => dates.set(row.li, shiftYmd(-offsets[i])));
+        return dates;
+    }
+
+    function messageDate(msg, startTime) {
+        if (msg.date) return msg.date;
+        if (/昨天|前天/.test(msg.timestamp || '')) return dateFromKnockLabel(msg.timestamp);
+        if (startTime) return ymd(new Date(startTime));
+        return dateFromKnockLabel(msg.timestamp);
+    }
+
+    function collectMessage(messageLi, date) {
         const messageDiv = messageLi.querySelector('div[data-test="message"]');
         if (!messageDiv) return;
 
         const isMyMessage = isMyMessageLi(messageLi);
         const timeElement = messageDiv.querySelector('span[data-test="date"]');
         const timestamp = timeElement ? timeElement.textContent.trim() : null;
+        date = date || '';
         const messageText = getMessageText(messageDiv);
         const imageUrls = getMessageImages(messageDiv);
         if (TYPING_RE.test(messageText)) return;
         if (!messageText && !imageUrls.length) return;
 
-        const messageHash = hashString(`${messageText}|${imageUrls.join(',')}|${isMyMessage}|${timestamp || ''}`);
-        if (currentConversation.messages.some(m => m.id === messageHash)) return;
+        const clock = clockMinutesOnly(timestamp);
+        const messageHash = hashString(`${messageText}|${imageUrls.join(',')}|${isMyMessage}|${clock ?? ''}`);
+        const existing = currentConversation.messages.find(m => m.id === messageHash);
+        if (existing) {
+            if (date && existing.date !== date) {
+                existing.date = date;
+                persistLiveConversationSoon();
+            }
+            return;
+        }
 
         currentConversation.messages.push({
             id: messageHash,
@@ -367,6 +456,7 @@
             isMyMessage,
             avatarUrl: getAvatarUrl(messageLi),
             timestamp,
+            date,
             seq: currentConversation.messages.length,
             collectedAt: new Date().toISOString()
         });
@@ -394,7 +484,7 @@
         const list = storageGet(key, []);
         const snap = {
             ...conversation,
-            messages: sortMessages(conversation.messages.slice()),
+            messages: sortMessages(conversation.messages.slice(), conversation.startTime),
             endTime: conversation.endTime || new Date().toISOString()
         };
         const i = list.findIndex(c => c.id === conversation.id);
@@ -800,6 +890,7 @@
         const messagesList = document.querySelector('ul[data-test="messages"]');
         if (!messagesList) return;
 
+        const dateByLi = listMessageDates(messagesList);
         const messageElements = messagesList.querySelectorAll('li.message-li');
         if (!currentConversation.id || (currentConversation.saved && currentConversation.messages.length === 0)) {
             if (messageElements.length === 0) return;
@@ -811,7 +902,7 @@
 
         for (const messageLi of messageElements) {
             const messageId = messageLi.className;
-            collectMessage(messageLi);
+            collectMessage(messageLi, dateByLi.get(messageLi) || '');
             if (checkedMessages.has(messageId)) continue;
             checkedMessages.add(messageId);
 
@@ -946,11 +1037,41 @@
 
         const keepInput = document.createElement('input');
         keepInput.type = 'text';
-        keepInput.placeholder = '四小時沒說話就送這句';
+        keepInput.placeholder = '沒說話就送這句';
         keepInput.value = getKeepAliveText();
         keepInput.style.cssText = 'width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #444;border-radius:8px;background:#1a1a1a;color:#fff;font:inherit;font-size:13px;';
         keepInput.addEventListener('click', (e) => e.stopPropagation());
         keepInput.addEventListener('input', () => localStorage.setItem(KEEP_ALIVE_TEXT_KEY, keepInput.value));
+
+        const hoursInp = (value) => {
+            const inp = document.createElement('input');
+            inp.type = 'number';
+            inp.min = '0.1';
+            inp.step = '0.1';
+            inp.value = String(value);
+            inp.style.cssText = 'width:52px;box-sizing:border-box;padding:6px 4px;border:1px solid #444;border-radius:6px;background:#1a1a1a;color:#fff;font:inherit;font-size:12px;';
+            inp.addEventListener('click', (e) => e.stopPropagation());
+            return inp;
+        };
+        const range = keepAliveHoursRange();
+        const minInp = hoursInp(range.min);
+        const maxInp = hoursInp(range.max);
+        const saveRange = () => {
+            setKeepAliveHoursRange(minInp.value, maxInp.value);
+            const next = keepAliveHoursRange();
+            minInp.value = String(next.min);
+            maxInp.value = String(next.max);
+            rollKeepAliveWaitMs();
+        };
+        minInp.addEventListener('change', saveRange);
+        maxInp.addEventListener('change', saveRange);
+        const rangeRow = document.createElement('div');
+        rangeRow.style.cssText = 'display:flex;align-items:center;gap:4px;font-size:12px;color:#aaa;';
+        const tilde = document.createElement('span');
+        tilde.textContent = '～';
+        const unit = document.createElement('span');
+        unit.textContent = '小時';
+        rangeRow.append(minInp, tilde, maxInp, unit);
 
         const convBtn = dockRow('<span>對話記錄</span>', { button: true });
         convBtn.addEventListener('click', (e) => { e.stopPropagation(); createConversationManager(); });
@@ -964,7 +1085,7 @@
         const ntfyBtn = dockRow('<span>手機通知</span>', { button: true });
         ntfyBtn.addEventListener('click', (e) => { e.stopPropagation(); createNtfySettings(); });
 
-        body.append(autoRow, keepRow, keepInput, convBtn, filterBtn, ntfyBtn);
+        body.append(autoRow, keepRow, keepInput, rangeRow, convBtn, filterBtn, ntfyBtn);
 
         const paintOpen = () => {
             body.style.display = open ? 'flex' : 'none';
@@ -988,6 +1109,50 @@
         return (localStorage.getItem(KEEP_ALIVE_TEXT_KEY) || '').trim();
     }
 
+    function keepAliveHoursRange() {
+        let min = Number(localStorage.getItem(KEEP_ALIVE_MIN_H_KEY));
+        let max = Number(localStorage.getItem(KEEP_ALIVE_MAX_H_KEY));
+        if (!Number.isFinite(min) || min < 0.1) min = KEEP_ALIVE_MIN_H_DEFAULT;
+        if (!Number.isFinite(max) || max < 0.1) max = KEEP_ALIVE_MAX_H_DEFAULT;
+        if (max < min) [min, max] = [max, min];
+        return { min, max };
+    }
+
+    function setKeepAliveHoursRange(minVal, maxVal) {
+        let min = Number(minVal);
+        let max = Number(maxVal);
+        if (!Number.isFinite(min) || min < 0.1) min = KEEP_ALIVE_MIN_H_DEFAULT;
+        if (!Number.isFinite(max) || max < 0.1) max = KEEP_ALIVE_MAX_H_DEFAULT;
+        if (max < min) [min, max] = [max, min];
+        localStorage.setItem(KEEP_ALIVE_MIN_H_KEY, String(min));
+        localStorage.setItem(KEEP_ALIVE_MAX_H_KEY, String(max));
+        return { min, max };
+    }
+
+    function rollKeepAliveWaitMs() {
+        const { min, max } = keepAliveHoursRange();
+        keepAliveWaitMs = (min + Math.random() * (max - min)) * 3600000;
+        if (currentConversation.id) {
+            sessionStorage.setItem(KEEP_ALIVE_WAIT_KEY, JSON.stringify({
+                id: currentConversation.id,
+                ms: keepAliveWaitMs
+            }));
+        }
+        return keepAliveWaitMs;
+    }
+
+    function currentKeepAliveWaitMs() {
+        try {
+            const raw = JSON.parse(sessionStorage.getItem(KEEP_ALIVE_WAIT_KEY) || 'null');
+            if (raw && raw.id === currentConversation.id && raw.ms > 0) {
+                keepAliveWaitMs = raw.ms;
+                return keepAliveWaitMs;
+            }
+        } catch (e) {}
+        if (keepAliveWaitMs > 0) return keepAliveWaitMs;
+        return rollKeepAliveWaitMs();
+    }
+
     function noteActivity() {
         lastActivityAt = Date.now();
         if (!currentConversation.id) return;
@@ -997,14 +1162,23 @@
         }));
     }
 
-    function activityAt() {
-        try {
-            const raw = JSON.parse(sessionStorage.getItem(KEEP_ALIVE_AT_KEY) || 'null');
-            if (raw && raw.id === currentConversation.id && raw.at > lastActivityAt) {
-                lastActivityAt = raw.at;
+    function lastChatAt() {
+        let latest = lastKeepAliveSentAt;
+        const consider = (msg) => {
+            const d = timestampToDate(msg, currentConversation.startTime);
+            if (d) latest = Math.max(latest, d.getTime());
+        };
+        currentConversation.messages.forEach(consider);
+        const list = document.querySelector('ul[data-test="messages"]');
+        if (list) {
+            const dates = listMessageDates(list);
+            for (const li of list.querySelectorAll('li.message-li')) {
+                const timeEl = li.querySelector('span[data-test="date"]');
+                if (!timeEl) continue;
+                consider({ timestamp: timeEl.textContent.trim(), date: dates.get(li) });
             }
-        } catch (e) {}
-        return lastActivityAt;
+        }
+        return latest;
     }
 
     function fillReactInput(el, value) {
@@ -1015,22 +1189,40 @@
         el.dispatchEvent(new Event('change', { bubbles: true }));
     }
 
-    function sendChatMessage(text) {
+    function pressEnter(el) {
+        const opts = { bubbles: true, cancelable: true, key: 'Enter', code: 'Enter', keyCode: 13, which: 13 };
+        for (const type of ['keydown', 'keypress', 'keyup']) {
+            try { el.dispatchEvent(new KeyboardEvent(type, opts)); } catch (e) {}
+        }
+    }
+
+    function sendChatMessage(text, onSent) {
         const wrap = document.querySelector('[data-test="input-message"]');
-        const send = document.querySelector('button[data-test="send"]');
-        if (!wrap || !send) return false;
+        if (!wrap) return false;
         const box = Array.from(wrap.querySelectorAll('textarea')).find(t =>
             t.getAttribute('aria-hidden') !== 'true' && t.style.visibility !== 'hidden'
         );
         if (!box) return false;
         fillReactInput(box, text);
-        const clickSend = () => {
-            if (box.value !== text) return;
-            if (send.disabled) send.removeAttribute('disabled');
-            simulateMouseClick(send);
+        pressEnter(box);
+        let tries = 0;
+        const cleared = () => !box.value.trim();
+        const tick = () => {
+            if (cleared()) {
+                if (onSent) onSent();
+                return;
+            }
+            if (box.value !== text) fillReactInput(box, text);
+            const send = document.querySelector('button[data-test="send"]');
+            if (send && !send.disabled) {
+                send.click();
+                simulateMouseClick(send);
+            } else {
+                pressEnter(box);
+            }
+            if (++tries < 15) setTimeout(tick, 80);
         };
-        clickSend();
-        setTimeout(clickSend, 80);
+        setTimeout(tick, 50);
         return true;
     }
 
@@ -1041,13 +1233,17 @@
         if (!currentConversation.id || !currentConversation.messages.length) return;
         if (pendingForcedLeave || isSavePromptVisible) return;
         if (findButtons().some(b => isRematchButton(b) || isConfirmExitButton(b))) return;
-        const at = activityAt();
-        if (!at || Date.now() - at < KEEP_ALIVE_AFTER_MS) return;
+        const at = lastChatAt();
+        const wait = currentKeepAliveWaitMs();
+        if (!at || Date.now() - at < wait) return;
         if (Date.now() - lastKeepAliveTryAt < 60000) return;
         lastKeepAliveTryAt = Date.now();
-        if (!sendChatMessage(text)) return;
-        noteActivity();
-        console.log('持續連線：已送出避免斷線訊息');
+        sendChatMessage(text, () => {
+            lastKeepAliveSentAt = Date.now();
+            noteActivity();
+            rollKeepAliveWaitMs();
+            console.log('持續連線：已送出，下次約', (keepAliveWaitMs / 3600000).toFixed(2), '小時後');
+        });
     }
 
     function dismissSavePrompt(prompt, save) {
@@ -1104,32 +1300,22 @@
         };
     }
 
-    // 支援「15:52」「昨天 15:52」「前天 15:52」；沒時間回傳 null（開頭訊息）
-    function parseClockMinutes(timeStr) {
-        if (!timeStr) return null;
-        const m = /(\d{1,2}):(\d{2})/.exec(timeStr);
-        if (!m) return null;
-        let minutes = Number(m[1]) * 60 + Number(m[2]);
-        if (timeStr.includes('前天')) minutes -= 2880;
-        else if (timeStr.includes('昨天')) minutes -= 1440;
-        return minutes;
-    }
-
-    function timestampToDate(timeStr, baseDate) {
-        const minutes = parseClockMinutes(timeStr);
+    function timestampToDate(msg, startTime, now = new Date()) {
+        const minutes = clockMinutesOnly(msg.timestamp);
         if (minutes == null) return null;
-        const date = new Date(baseDate);
+        const [y, mo, d] = messageDate(msg, startTime).split('-').map(Number);
+        const date = new Date(y, mo - 1, d);
         date.setHours(0, 0, 0, 0);
         date.setMinutes(minutes);
+        if (date.getTime() > now.getTime() + 60000) date.setDate(date.getDate() - 1);
         return date;
     }
 
     function getMessageTime(conversation, isOldest = true) {
         const start = conversation.startTime ? new Date(conversation.startTime) : new Date();
         const end = conversation.endTime ? new Date(conversation.endTime) : null;
-        const base = isOldest ? start : (end || start);
         const dates = (conversation.messages || [])
-            .map(m => timestampToDate(m.timestamp, base))
+            .map(m => timestampToDate(m, conversation.startTime))
             .filter(Boolean);
         if (dates.length === 0) return isOldest ? start : end;
         return new Date(isOldest ? Math.min(...dates) : Math.max(...dates));
@@ -1144,24 +1330,27 @@
         return rem > 0 ? `${min} 分鐘 ${rem} 秒` : `${min} 分鐘`;
     }
 
-    // 沒時間的是開頭，放最前；其餘依「昨天／今天」+ 鐘點
-    function sortMessages(messages) {
+    // 沒時間的是開頭；其餘依收集時寫入的日期 + 鐘點
+    function sortMessages(messages, startTime) {
         return messages
             .map((msg, index) => ({ msg, index }))
             .sort((a, b) => {
-                const ta = parseClockMinutes(a.msg.timestamp);
-                const tb = parseClockMinutes(b.msg.timestamp);
-                if (ta == null && tb == null) return a.index - b.index;
-                if (ta == null) return -1;
-                if (tb == null) return 1;
-                if (ta !== tb) return ta - tb;
+                const ca = clockMinutesOnly(a.msg.timestamp);
+                const cb = clockMinutesOnly(b.msg.timestamp);
+                if (ca == null && cb == null) return a.index - b.index;
+                if (ca == null) return -1;
+                if (cb == null) return 1;
+                const da = messageDate(a.msg, startTime);
+                const db = messageDate(b.msg, startTime);
+                if (da !== db) return da < db ? -1 : 1;
+                if (ca !== cb) return ca - cb;
                 return a.index - b.index;
             })
             .map(x => x.msg);
     }
 
     function formatConversationForCopy(conversation) {
-        return sortMessages(conversation.messages).map(msg => {
+        return sortMessages(conversation.messages, conversation.startTime).map(msg => {
             const speaker = msg.isMyMessage ? '我　' : '對方';
             const content = [msg.text, ...(msg.imageUrls || [])].filter(Boolean).join(' ') || '[圖片]';
             return `${speaker}：${content} （${msg.timestamp || '未知時間'}）`;
@@ -1198,7 +1387,7 @@
         const startDate = getMessageTime(conversation, true);
         const endDate = getMessageTime(conversation, false);
         const durationText = formatDuration(startDate, endDate);
-        const preview = sortMessages(conversation.messages).slice(0, 3).map(msg => {
+        const preview = sortMessages(conversation.messages, conversation.startTime).slice(0, 3).map(msg => {
             const text = messagePreviewText(msg);
             return (msg.isMyMessage ? '我: ' : '對方: ') + text.substring(0, 50) + (text.length > 50 ? '...' : '');
         }).join('<br>');
@@ -1456,7 +1645,7 @@
         const startDate = getMessageTime(conversation, true);
         const endDate = getMessageTime(conversation, false);
         const durationText = formatDuration(startDate, endDate);
-        const sorted = sortMessages(conversation.messages);
+        const sorted = sortMessages(conversation.messages, conversation.startTime);
         const firstOther = sorted.find(m => !m.isMyMessage);
         el('knock-conversation-detail')?.remove();
         const detail = makeOverlay('knock-conversation-detail', 800, `
@@ -1478,7 +1667,7 @@
                     const filterKey = msg.text || (msg.imageUrls && msg.imageUrls[0]) || '';
                     const showRemember = msg === firstOther && filterKey;
                     return `
-                    <div style="display:flex;align-items:flex-start;gap:8px;flex-direction:${msg.isMyMessage ? 'row-reverse' : 'row'};margin-bottom:12px;">
+                    <div data-knock-date="${escapeHtml(msg.date || messageDate(msg, conversation.startTime))}" style="display:flex;align-items:flex-start;gap:8px;flex-direction:${msg.isMyMessage ? 'row-reverse' : 'row'};margin-bottom:12px;">
                         <div style="width:40px;height:40px;border-radius:50%;flex-shrink:0;background:#333;display:flex;align-items:center;justify-content:center;overflow:hidden;">
                             ${msg.avatarUrl
                                 ? `<img src="${msg.avatarUrl}" style="width:100%;height:100%;object-fit:cover;" alt="avatar">`
@@ -1493,7 +1682,7 @@
                                     </a>`).join('')}
                                 ${!msg.text && !(msg.imageUrls || []).length ? `<div style="color:#888;font-size:13px;">（空訊息）</div>` : ''}
                             </div>
-                            ${msg.timestamp ? `<div style="font-size:11px;color:rgba(255,255,255,0.5);flex-shrink:0;white-space:nowrap;">${msg.timestamp}</div>` : ''}
+                            ${msg.timestamp ? `<div style="font-size:11px;color:rgba(255,255,255,0.5);flex-shrink:0;white-space:nowrap;">${msg.date ? `${msg.date.slice(5).replace('-', '/')} ` : ''}${msg.timestamp}</div>` : ''}
                             ${showRemember ? `<button type="button" class="knock-remember-first-saved" data-filter-text="${encodeURIComponent(filterKey)}" data-filter-avatar="${encodeURIComponent(avatarHashOf(msg.avatarUrl))}"></button>` : ''}
                         </div>
                     </div>`;
@@ -1577,6 +1766,22 @@
         checkForButtonAndClick();
         checkConversationEnd();
     }, 200);
+
+    {
+        const times = ['23:59', '00:00'];
+        const offsets = dayOffsetsFromNewest(times.map(t => ({
+            clock: clockMinutesOnly(t),
+            labeled: labelDayOffset(t)
+        })));
+        const dates = offsets.map(o => shiftYmd(-o));
+        const out = sortMessages(times.map((timestamp, i) => ({ timestamp, date: dates[i] }))).map(m => m.timestamp);
+        const afterMidnight = new Date();
+        afterMidnight.setHours(0, 20, 0, 0);
+        const onlyNight = dayOffsetsFromNewest([{ clock: 23 * 60 + 20, labeled: null }], afterMidnight);
+        if (offsets[0] !== 1 || offsets[1] !== 0 || dates[0] !== shiftYmd(-1) || dates[1] !== shiftYmd(0) || out.join() !== '23:59,00:00' || onlyNight[0] !== 1) {
+            console.error('knock: 由最新往回推日期檢查失敗', offsets, dates, out, onlyNight);
+        }
+    }
 
     if (isPendingStartChat()) console.log('重整後繼續：等待「開始聊天」按鈕...');
     requestNotifyPermission();
