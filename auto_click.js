@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.20
+// @version      1.4.21
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -839,6 +839,14 @@
         return t;
     }
 
+    let lastNtfyAt = 0;
+    let ntfyBackoffUntil = 0;
+
+    function ntfyStatusDetail(status) {
+        if (status === 429) return 'HTTP 429：ntfy.sh 公開伺服器限流，請隔一分鐘再試';
+        return `HTTP ${status}`;
+    }
+
     function sendNtfy(body, title) {
         return new Promise((resolve) => {
             const topic = getNtfyTopic();
@@ -846,12 +854,20 @@
                 resolve({ ok: false, detail: '尚未設定主題' });
                 return;
             }
+            if (Date.now() < ntfyBackoffUntil) {
+                resolve({ ok: false, detail: 'HTTP 429：還在冷卻，請稍候再送' });
+                return;
+            }
             const data = JSON.stringify({
                 topic,
                 title: title || getNtfyTitle(),
                 message: body || '你有一則新訊息'
             });
-            const finish = (ok, detail) => resolve({ ok, detail });
+            const finish = (ok, detail, status) => {
+                if (status === 429) ntfyBackoffUntil = Date.now() + 60000;
+                if (ok) lastNtfyAt = Date.now();
+                resolve({ ok, detail });
+            };
             const xhr = (typeof GM !== 'undefined' && GM.xmlHttpRequest)
                 || (typeof GM_xmlhttpRequest === 'function' && GM_xmlhttpRequest);
             if (xhr) {
@@ -860,7 +876,7 @@
                     url: `${NTFY_SERVER}/`,
                     headers: { 'Content-Type': 'application/json' },
                     data,
-                    onload: (r) => finish(r.status >= 200 && r.status < 300, `HTTP ${r.status}`),
+                    onload: (r) => finish(r.status >= 200 && r.status < 300, ntfyStatusDetail(r.status), r.status),
                     onerror: () => finish(false, '連線失敗：請允許腳本存取 ntfy.sh')
                 });
                 return;
@@ -869,7 +885,7 @@
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: data
-            }).then((r) => finish(r.ok, `HTTP ${r.status}`))
+            }).then((r) => finish(r.ok, ntfyStatusDetail(r.status), r.status))
                 .catch((e) => finish(false, e.message || 'fetch 被網頁擋住'));
         });
     }
@@ -877,7 +893,7 @@
     function notifyNewMessage(text) {
         if (!notificationsArmed || (document.hasFocus() && !document.hidden)) return;
         const body = (text || '你有一則新訊息').replace(/\s+/g, ' ').trim().slice(0, 80) || '你有一則新訊息';
-        sendNtfy(body);
+        if (Date.now() - lastNtfyAt > 15000) sendNtfy(body);
         if (!('Notification' in window) || Notification.permission !== 'granted') return;
         const notification = new Notification('Knock 新訊息', { body, tag: 'knock-new-message' });
         notification.onclick = () => {
@@ -1476,10 +1492,14 @@
             }
             status.textContent = '傳送中…';
             const result = await sendNtfy('這是測試通知');
-            status.textContent = result.ok
-                ? `已送到 ntfy（${result.detail}）。手機沒響的話，確認 App 訂閱的主題與伺服器是 ntfy.sh。`
-                : `沒送出：${result.detail}。請依上方步驟允許 ntfy.sh。`;
-            showToast(result.ok ? '測試已送到 ntfy' : '測試失敗，看設定頁說明');
+            if (result.ok) {
+                status.textContent = `已送到 ntfy（${result.detail}）。手機沒響的話，確認 App 訂閱的主題與伺服器是 ntfy.sh。`;
+            } else if (/429/.test(result.detail)) {
+                status.textContent = `沒送出：${result.detail}`;
+            } else {
+                status.textContent = `沒送出：${result.detail}。若是連線被擋，請依上方步驟允許 ntfy.sh。`;
+            }
+            showToast(result.ok ? '測試已送到 ntfy' : (/429/.test(result.detail) ? 'ntfy 限流，稍後再試' : '測試失敗，看設定頁說明'));
         };
         el('knock-ntfy-clear').onclick = () => {
             setNtfyTopic('');
