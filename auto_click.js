@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.21
+// @version      1.4.22
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -28,6 +28,7 @@
     const FIRST_MSG_FILTER_KEY = 'knockFirstMessageFilters';
     const SAVED_CONV_KEY = 'knockSavedConversations';
     const AUTO_CONV_KEY = 'knockAutoConversations';
+    const AUTO_CONV_MIN_MS = 50 * 1000;
     const NTFY_TOPIC_KEY = 'knockNtfyTopic';
     const NTFY_TITLE_KEY = 'knockNtfyTitle';
     const NTFY_TITLE_DEFAULT = 'Knock 新訊息';
@@ -494,6 +495,13 @@
         return storageSet(key, list);
     }
 
+    function conversationDurationMs(conversation) {
+        const start = conversation.startTime ? Date.parse(conversation.startTime) : NaN;
+        if (!Number.isFinite(start)) return 0;
+        const end = conversation.endTime ? Date.parse(conversation.endTime) : Date.now();
+        return Math.max(0, end - start);
+    }
+
     function persistLiveConversation() {
         if (!currentConversation.id || !currentConversation.messages.length) return;
         if (currentConversation.pinned) {
@@ -501,6 +509,7 @@
             storageSet(AUTO_CONV_KEY, getAutoConversations().filter(c => c.id !== currentConversation.id));
             return;
         }
+        if (conversationDurationMs(currentConversation) < AUTO_CONV_MIN_MS) return;
         upsertConversationList(AUTO_CONV_KEY, currentConversation, 200);
     }
 
