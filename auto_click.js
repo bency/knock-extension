@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.22
+// @version      1.4.24
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=knock.tw
+// @updateURL    https://raw.githubusercontent.com/bency/knock-extension/main/auto_click.js
+// @downloadURL  https://raw.githubusercontent.com/bency/knock-extension/main/auto_click.js
 // @grant        GM.xmlHttpRequest
 // @grant        GM_xmlhttpRequest
 // @connect      ntfy.sh
@@ -42,6 +44,7 @@
     const KEEP_ALIVE_MIN_H_DEFAULT = 1.5;
     const KEEP_ALIVE_MAX_H_DEFAULT = 2.5;
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.23';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -502,15 +505,71 @@
         return Math.max(0, end - start);
     }
 
+    function messageIdSet(messages) {
+        return new Set((messages || []).map(m => m.id).filter(Boolean));
+    }
+
+    function hashOverlapCount(conv, ids) {
+        let n = 0;
+        for (const m of conv.messages || []) {
+            if (ids.has(m.id)) n++;
+        }
+        return n;
+    }
+
+    function findConversationByHashes(messages) {
+        const ids = messageIdSet(messages);
+        if (!ids.size) return null;
+        let best = null;
+        let bestN = 0;
+        for (const conv of [...getSavedConversations(), ...getAutoConversations()]) {
+            const n = hashOverlapCount(conv, ids);
+            if (n > bestN) {
+                bestN = n;
+                best = conv;
+            }
+        }
+        return bestN > 0 ? best : null;
+    }
+
+    function mergeMessagesByHash(a, b) {
+        const map = new Map();
+        for (const m of [...(a || []), ...(b || [])]) {
+            if (m && m.id && !map.has(m.id)) map.set(m.id, m);
+        }
+        return Array.from(map.values());
+    }
+
+    function adoptOverlappingConversation() {
+        const found = findConversationByHashes(currentConversation.messages);
+        if (!found || found.id === currentConversation.id) return;
+        const inSaved = getSavedConversations().some(c => c.id === found.id);
+        currentConversation.id = found.id;
+        currentConversation.pinned = currentConversation.pinned || found.pinned || inSaved;
+        if (found.startTime && (!currentConversation.startTime || found.startTime < currentConversation.startTime)) {
+            currentConversation.startTime = found.startTime;
+        }
+        currentConversation.messages = mergeMessagesByHash(found.messages, currentConversation.messages);
+        console.log('同一對話（訊息 hash 重疊），合併到', found.id);
+    }
+
+    function dropOverlappingAutoDuplicates() {
+        const ids = messageIdSet(currentConversation.messages);
+        const keep = currentConversation.id;
+        storageSet(AUTO_CONV_KEY, getAutoConversations().filter(c => c.id === keep || hashOverlapCount(c, ids) === 0));
+    }
+
     function persistLiveConversation() {
         if (!currentConversation.id || !currentConversation.messages.length) return;
+        adoptOverlappingConversation();
         if (currentConversation.pinned) {
             upsertConversationList(SAVED_CONV_KEY, currentConversation, 100);
-            storageSet(AUTO_CONV_KEY, getAutoConversations().filter(c => c.id !== currentConversation.id));
+            dropOverlappingAutoDuplicates();
             return;
         }
         if (conversationDurationMs(currentConversation) < AUTO_CONV_MIN_MS) return;
         upsertConversationList(AUTO_CONV_KEY, currentConversation, 200);
+        dropOverlappingAutoDuplicates();
     }
 
     function persistLiveConversationSoon() {
@@ -1116,7 +1175,9 @@
             body.style.display = open ? 'flex' : 'none';
             dock.style.width = open ? '220px' : 'auto';
             header.style.width = open ? '220px' : 'auto';
-            el('knock-dock-chevron').textContent = open ? '收合' : '選單';
+            const chevron = el('knock-dock-chevron');
+            chevron.textContent = open ? '收合' : SCRIPT_VERSION;
+            chevron.style.cssText = open ? '' : 'font-size:12px;opacity:.7;';
         };
         header.addEventListener('click', (e) => {
             e.stopPropagation();
