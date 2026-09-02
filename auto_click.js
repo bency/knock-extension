@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.27
+// @version      1.4.29
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -10,6 +10,7 @@
 // @downloadURL  https://raw.githubusercontent.com/bency/knock-extension/main/auto_click.js
 // @grant        GM.xmlHttpRequest
 // @grant        GM_xmlhttpRequest
+// @grant        GM_notification
 // @connect      ntfy.sh
 // ==/UserScript==
 
@@ -887,6 +888,55 @@
         Notification.requestPermission().catch(() => {});
     }
 
+    function showBrowserNotification(body) {
+        const title = 'Knock 新訊息';
+        const text = (body || '你有一則新訊息').replace(/\s+/g, ' ').trim().slice(0, 80) || '你有一則新訊息';
+        const details = {
+            title,
+            text,
+            timeout: 8000,
+            onclick: () => { try { window.focus(); } catch (e) {} }
+        };
+        // ponytail: TM 沙箱的 new Notification() 常沒畫面；GM_notification 走擴充功能權限
+        try {
+            if (typeof GM_notification === 'function') {
+                GM_notification(details);
+                return true;
+            }
+            if (typeof GM !== 'undefined' && typeof GM.notification === 'function') {
+                GM.notification(details);
+                return true;
+            }
+        } catch (e) {}
+        if (!('Notification' in window) || Notification.permission !== 'granted') return false;
+        try {
+            const notification = new Notification(title, { body: text, tag: 'knock-new-message' });
+            notification.onclick = () => {
+                window.focus();
+                notification.close();
+            };
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    async function testBrowserNotification() {
+        if (showBrowserNotification('這是測試通知')) {
+            showToast('已送出。沒看到的話，檢查系統通知裡的 Chrome／Tampermonkey');
+            return;
+        }
+        if ('Notification' in window && Notification.permission === 'default') {
+            try { await Notification.requestPermission(); } catch (e) {}
+            if (showBrowserNotification('這是測試通知')) {
+                showToast('已送出瀏覽器通知');
+                return;
+            }
+        }
+        const perm = ('Notification' in window) ? Notification.permission : '無 API';
+        showToast(`送不出通知（${perm}）。請允許 Tampermonkey 與 Chrome 的通知權限`);
+    }
+
     function getNtfyTopic() {
         return (localStorage.getItem(NTFY_TOPIC_KEY) || '').trim();
     }
@@ -971,12 +1021,7 @@
         if (!notificationsArmed || (document.hasFocus() && !document.hidden)) return;
         const body = (text || '你有一則新訊息').replace(/\s+/g, ' ').trim().slice(0, 80) || '你有一則新訊息';
         if (Date.now() - lastNtfyAt > 15000) sendNtfy(body);
-        if (!('Notification' in window) || Notification.permission !== 'granted') return;
-        const notification = new Notification('Knock 新訊息', { body, tag: 'knock-new-message' });
-        notification.onclick = () => {
-            window.focus();
-            notification.close();
-        };
+        showBrowserNotification(body);
     }
 
     function checkNewMessages() {
@@ -1183,7 +1228,10 @@
         const ntfyBtn = dockRow('<span>手機通知</span>', { button: true });
         ntfyBtn.addEventListener('click', (e) => { e.stopPropagation(); createNtfySettings(); });
 
-        body.append(autoRow, keepRow, keepInput, rangeRow, convBtn, filterBtn, ntfyBtn);
+        const notifyTestBtn = dockRow('<span>測試瀏覽器通知</span>', { button: true });
+        notifyTestBtn.addEventListener('click', (e) => { e.stopPropagation(); testBrowserNotification(); });
+
+        body.append(autoRow, keepRow, keepInput, rangeRow, convBtn, filterBtn, ntfyBtn, notifyTestBtn);
 
         const paintOpen = () => {
             body.style.display = open ? 'flex' : 'none';
