@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.26
+// @version      1.4.27
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -119,6 +119,7 @@
     let processedConversationIds = new Set(storageGet('knockProcessedConversationIds', []));
     let notificationsArmed = false;
     let pendingForcedLeave = false;
+    let forceAutoUntilIdle = false;
     let lastExitClickAt = 0;
     let skipFirstFilterFor = null;
     let rematchScheduled = false;
@@ -177,6 +178,7 @@
             startTime: new Date().toISOString()
         };
         pendingForcedLeave = false;
+        forceAutoUntilIdle = false;
         lastExitClickAt = 0;
         skipFirstFilterFor = null;
         rematchScheduled = false;
@@ -635,7 +637,7 @@
         currentConversation.endTime = currentConversation.endTime || new Date().toISOString();
         persistLiveConversation();
 
-        if (autoClickEnabled) {
+        if (isAutoClicking()) {
             markProcessed(currentConversation);
             markPendingStartChat(findButtons().some(isRematchButton) ? 'otherLeft' : pendingForcedLeave ? undefined : 'selfLeft');
             console.log('自動開啟新對話啟用中，略過儲存提示:', currentConversation.id);
@@ -644,7 +646,7 @@
 
         currentConversation.promptShown = true;
         setTimeout(() => {
-            if (autoClickEnabled) {
+            if (isAutoClicking()) {
                 markProcessed(currentConversation);
                 return;
             }
@@ -745,7 +747,7 @@
     }
 
     function checkForButtonAndClick() {
-        if (!autoClickEnabled || isSavePromptVisible) return;
+        if (!isAutoClicking() || isSavePromptVisible) return;
 
         for (const button of findButtons()) {
             if (isPendingStartChat() && isStartChatButton(button)) {
@@ -755,7 +757,7 @@
                     setTimeout(() => {
                         startChatScheduled = false;
                         hideCooldown();
-                        if (!autoClickEnabled || !isPendingStartChat()) return;
+                        if (!isAutoClicking() || !isPendingStartChat()) return;
                         const btn = findButtons().find(isStartChatButton);
                         if (btn) {
                             console.log('倒數結束，點擊「開始聊天」...');
@@ -806,8 +808,15 @@
         return BLACKLIST_PATTERNS.some(pattern => pattern.test(messageText));
     }
 
+    function isAutoClicking() {
+        // ponytail: 重整／重新配對會清掉記憶體旗標；session 裡的 firstFilter 撐到開始聊天
+        return autoClickEnabled || forceAutoUntilIdle
+            || sessionStorage.getItem(PENDING_START_CHAT_REASON_KEY) === 'firstFilter';
+    }
+
     function requestForcedLeave(reason) {
-        if (!autoClickEnabled) return;
+        if (!autoClickEnabled && reason !== 'firstFilter') return;
+        if (reason === 'firstFilter') forceAutoUntilIdle = true;
         if (!pendingForcedLeave) {
             pendingForcedLeave = true;
             markPendingStartChat(reason);
@@ -817,7 +826,7 @@
     }
 
     function tryForcedLeave() {
-        if (!pendingForcedLeave || !autoClickEnabled || isSavePromptVisible) return false;
+        if (!pendingForcedLeave || !isAutoClicking() || isSavePromptVisible) return false;
         if (findButtons().some(isConfirmExitButton)) {
             checkForButtonAndClick();
             return true;
@@ -861,7 +870,7 @@
     }
 
     function maybeLeaveOnFirstMessageFilter() {
-        if (!autoClickEnabled || isSavePromptVisible) return false;
+        if (isSavePromptVisible) return false;
         const first = findFirstOtherMessage();
         if (!first) return false;
         if (skipFirstFilterFor && skipFirstFilterFor === pairingIdOf(first)) return false;
