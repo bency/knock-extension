@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.25
+// @version      1.4.26
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -849,7 +849,7 @@
         for (const li of list.querySelectorAll('li.message-li')) {
             if (isMyMessageLi(li)) continue;
             const messageDiv = li.querySelector('div[data-test="message"]');
-            if (!messageDiv) continue;
+            if (!messageDiv || messageDiv.querySelector('span[data-test="date"]')) continue;
             const text = getMessageText(messageDiv);
             const imageUrls = getMessageImages(messageDiv);
             const filterKey = text || imageUrls[0] || '';
@@ -1741,7 +1741,7 @@
         const endDate = getMessageTime(conversation, false);
         const durationText = formatDuration(startDate, endDate);
         const sorted = sortMessages(conversation.messages, conversation.startTime);
-        const firstOther = sorted.find(m => !m.isMyMessage);
+        const firstOther = sorted.find(m => !m.isMyMessage && !m.timestamp);
         el('knock-conversation-detail')?.remove();
         const detail = makeOverlay('knock-conversation-detail', 800, `
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;gap:12px;flex-wrap:wrap;">
