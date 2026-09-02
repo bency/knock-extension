@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.24
+// @version      1.4.25
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -984,8 +984,12 @@
 
         if (maybeLeaveOnFirstMessageFilter() || tryForcedLeave()) return;
 
+        // ponytail: 重整／往上捲時 DOM 會一次塞進舊訊息；第一次看到列表先標已讀，之後只推最新一則
+        const catchUp = !notificationsArmed;
+        const lastLi = messageElements[messageElements.length - 1];
         for (const messageLi of messageElements) {
-            const messageId = messageLi.className;
+            const unique = String(messageLi.className || '').match(/message-li-(\S+)/);
+            const messageId = unique ? unique[1] : messageLi.className;
             collectMessage(messageLi, dateByLi.get(messageLi) || '');
             if (checkedMessages.has(messageId)) continue;
             checkedMessages.add(messageId);
@@ -998,13 +1002,14 @@
             if (TYPING_RE.test(messageText)) continue;
 
             const notifyText = messageText || (imageUrls.length ? '[圖片]' : '');
-            if (notifyText) notifyNewMessage(notifyText);
+            if (notifyText && !catchUp && messageLi === lastLi) notifyNewMessage(notifyText);
 
             if (checkAvatarMatch(messageLi) || checkMessageAgainstBlacklist(messageDiv)) {
                 activelyLeaveConversation(messageId);
                 return;
             }
         }
+        if (messageElements.length) notificationsArmed = true;
 
         decorateOtherMessages();
         checkConversationEnd();
@@ -1877,6 +1882,5 @@
     requestNotifyPermission();
     checkForButtonAndClick();
     checkNewMessages();
-    notificationsArmed = true;
     checkConversationEnd();
 })();
