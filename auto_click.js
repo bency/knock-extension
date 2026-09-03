@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.29
+// @version      1.4.33
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -61,11 +61,16 @@
         return document.getElementById(id);
     }
 
-    function makeOverlay(id, maxWidth, html, z) {
+    function makeOverlay(id, maxWidth, html, z, pinChrome) {
         const node = document.createElement('div');
         node.id = id;
-        node.style.cssText = `position:fixed;inset:0;z-index:${z || 10002};background:rgba(0,0,0,0.9);font-family:${FONT};color:#fff;overflow-y:auto;`;
-        node.innerHTML = `<div style="max-width:${maxWidth}px;margin:0 auto;padding:24px;">${html}</div>`;
+        node.style.cssText = pinChrome
+            ? `position:fixed;inset:0;z-index:${z || 10002};background:rgba(0,0,0,0.9);font-family:${FONT};color:#fff;overflow:hidden;display:flex;`
+            : `position:fixed;inset:0;z-index:${z || 10002};background:rgba(0,0,0,0.9);font-family:${FONT};color:#fff;overflow-y:auto;`;
+        const inner = pinChrome
+            ? `max-width:${maxWidth}px;width:100%;margin:0 auto;padding:24px;box-sizing:border-box;height:100%;display:flex;flex-direction:column;min-height:0;overflow:hidden;`
+            : `max-width:${maxWidth}px;margin:0 auto;padding:24px;`;
+        node.innerHTML = `<div style="${inner}">${html}</div>`;
         document.body.appendChild(node);
         node.addEventListener('click', (e) => { if (e.target === node) node.remove(); });
         return node;
@@ -509,7 +514,8 @@
     }
 
     function messageIdSet(messages) {
-        return new Set((messages || []).map(m => m.id).filter(Boolean));
+        // ponytail: 開場句沒時間且常重複；拿來重疊會合併錯人，還會清掉其他自動儲存
+        return new Set((messages || []).filter(m => m.id && m.timestamp).map(m => m.id));
     }
 
     function hashOverlapCount(conv, ids) {
@@ -520,19 +526,35 @@
         return n;
     }
 
+    function timedOverlap(aMessages, bMessages) {
+        const a = messageIdSet(aMessages);
+        const b = messageIdSet(bMessages);
+        let n = 0;
+        for (const id of a) if (b.has(id)) n++;
+        return { n, a: a.size, b: b.size };
+    }
+
+    function isSameConversation(curMessages, otherMessages, otherIsSaved) {
+        const { n, a, b } = timedOverlap(curMessages, otherMessages);
+        if (!a || !b) return false;
+        // 已儲存那包被併過之後很大，一句「你好」對上就會再寫進去
+        if (otherIsSaved) return n >= 5 && n === a;
+        return n >= Math.max(2, Math.ceil(Math.min(a, b) * 2 / 3));
+    }
+
     function findConversationByHashes(messages) {
-        const ids = messageIdSet(messages);
-        if (!ids.size) return null;
+        const savedIds = new Set(getSavedConversations().map(c => c.id));
         let best = null;
         let bestN = 0;
         for (const conv of [...getSavedConversations(), ...getAutoConversations()]) {
-            const n = hashOverlapCount(conv, ids);
+            if (!isSameConversation(messages, conv.messages, savedIds.has(conv.id))) continue;
+            const n = timedOverlap(messages, conv.messages).n;
             if (n > bestN) {
                 bestN = n;
                 best = conv;
             }
         }
-        return bestN > 0 ? best : null;
+        return best;
     }
 
     function mergeMessagesByHash(a, b) {
@@ -557,9 +579,10 @@
     }
 
     function dropOverlappingAutoDuplicates() {
-        const ids = messageIdSet(currentConversation.messages);
         const keep = currentConversation.id;
-        storageSet(AUTO_CONV_KEY, getAutoConversations().filter(c => c.id === keep || hashOverlapCount(c, ids) === 0));
+        storageSet(AUTO_CONV_KEY, getAutoConversations().filter(c =>
+            c.id === keep || !isSameConversation(currentConversation.messages, c.messages, false)
+        ));
     }
 
     function persistLiveConversation() {
@@ -1531,6 +1554,30 @@
         }
     }
 
+    function conversationPhotos(conversation) {
+        const seen = new Set();
+        const out = [];
+        for (const msg of conversation.messages || []) {
+            for (const src of msg.imageUrls || []) {
+                if (!src || seen.has(src)) continue;
+                seen.add(src);
+                out.push(src);
+            }
+        }
+        return out;
+    }
+
+    function createDetailPhotos(conversation) {
+        const photos = conversationPhotos(conversation);
+        if (!photos.length) return '';
+        return `<div style="display:flex;gap:8px;overflow-x:auto;padding-bottom:12px;margin-bottom:16px;">
+            ${photos.map(src => `
+                <a href="${escapeHtml(src)}" target="_blank" rel="noreferrer" style="flex-shrink:0;">
+                    <img src="${escapeHtml(src)}" alt="" style="width:88px;height:88px;object-fit:cover;border-radius:8px;display:block;">
+                </a>`).join('')}
+        </div>`;
+    }
+
     function createConversationCard(conversation) {
         const startDate = getMessageTime(conversation, true);
         const endDate = getMessageTime(conversation, false);
@@ -1733,24 +1780,24 @@
         const manager = toggleOverlay('knock-conversation-manager', () => {
             persistLiveConversation();
             return makeOverlay('knock-conversation-manager', 900, `
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;flex-wrap:wrap;">
+            <div style="flex-shrink:0;display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;flex-wrap:wrap;">
                 <h2 style="margin:0;font-size:24px;">對話記錄</h2>
                 <button id="knock-manager-close" style="${cssBtn('#444')}">關閉</button>
             </div>
-            <div style="display:flex;gap:8px;margin-bottom:16px;">
+            <div style="flex-shrink:0;display:flex;gap:8px;margin-bottom:16px;">
                 <button type="button" id="knock-tab-saved"></button>
                 <button type="button" id="knock-tab-auto"></button>
             </div>
-            <div style="display:flex;gap:8px;align-items:center;margin-bottom:16px;flex-wrap:wrap;">
+            <div style="flex-shrink:0;display:flex;gap:8px;align-items:center;margin-bottom:16px;flex-wrap:wrap;">
                 <label style="display:flex;align-items:center;gap:6px;font-size:14px;color:#ccc;cursor:pointer;">
                     <input type="checkbox" id="knock-conv-select-all" style="width:16px;height:16px;">全選
                 </label>
                 <button id="knock-conv-delete-selected" style="${cssBtn('#d32f2f', 'padding:6px 12px;border-radius:4px;font-size:13px;')}">刪除所選</button>
             </div>
-            <div style="margin-bottom:20px;">
+            <div style="flex-shrink:0;margin-bottom:16px;">
                 <input type="text" id="knock-search-input" placeholder="搜尋對話內容..." style="${CSS_INP}">
             </div>
-            <div id="knock-conversations-list" style="display:flex;flex-direction:column;gap:12px;"></div>`);
+            <div id="knock-conversations-list" style="flex:1;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:12px;"></div>`, 10002, true);
         });
         if (!manager) return;
         renderConversationList();
@@ -1801,13 +1848,17 @@
         const firstOther = sorted.find(m => !m.isMyMessage && !m.timestamp);
         el('knock-conversation-detail')?.remove();
         const detail = makeOverlay('knock-conversation-detail', 800, `
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;gap:12px;flex-wrap:wrap;">
+            <div style="flex-shrink:0;display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;flex-wrap:wrap;">
                 <h2 style="margin:0;font-size:20px;">${isAuto ? '自動儲存' : '已儲存'}對話</h2>
-                <div style="display:flex;gap:8px;">
+                <div style="display:flex;gap:8px;flex-wrap:wrap;">
                     ${isAuto ? `<button id="knock-detail-pin" style="${cssBtn('#4CAF50')}">移到已儲存</button>` : ''}
+                    <button id="knock-detail-copy" style="${cssBtn('#2196F3')}">複製</button>
+                    <button id="knock-detail-delete" style="${cssBtn('#d32f2f')}">刪除</button>
                     <button id="knock-detail-close" style="${cssBtn('#444')}">關閉</button>
                 </div>
             </div>
+            <div style="flex:1;min-height:0;overflow-y:auto;">
+            ${createDetailPhotos(conversation)}
             <div style="background:#222;border-radius:8px;padding:16px;margin-bottom:20px;font-size:13px;color:#888;">
                 <div>開始時間: ${startDate.toLocaleString('zh-TW')}</div>
                 ${endDate ? `<div>結束時間: ${endDate.toLocaleString('zh-TW')}</div>` : ''}
@@ -1839,9 +1890,18 @@
                         </div>
                     </div>`;
                 }).join('')}
-            </div>`, 10003);
+            </div>
+            </div>`, 10003, true);
         syncRememberButtons();
         el('knock-detail-close').onclick = () => detail.remove();
+        el('knock-detail-copy').onclick = () => copyConversation(conversationId);
+        el('knock-detail-delete').onclick = () => {
+            if (confirm('確定刪除這則對話？') && deleteConversations([conversationId])) {
+                detail.remove();
+                renderConversationList();
+                showToast('已刪除');
+            }
+        };
         el('knock-detail-pin')?.addEventListener('click', () => {
             if (pinConversation(conversationId)) {
                 showToast('已移到已儲存');
@@ -1880,16 +1940,17 @@
             return;
         }
 
-        const convId = e.target.getAttribute?.('data-conv-id');
+        const hit = e.target.closest?.('[data-conv-id]');
+        const convId = hit?.getAttribute('data-conv-id');
         if (!convId) return;
-        if (e.target.classList.contains('knock-pin-btn')) {
+        if (hit.classList.contains('knock-pin-btn')) {
             if (pinConversation(convId)) {
                 showToast('已移到已儲存');
                 renderConversationList();
             }
-        } else if (e.target.classList.contains('knock-copy-btn')) {
+        } else if (hit.classList.contains('knock-copy-btn')) {
             copyConversation(convId);
-        } else if (e.target.classList.contains('knock-view-btn')) {
+        } else if (hit.classList.contains('knock-view-btn')) {
             showConversationDetail(convId);
         }
     });
@@ -1932,6 +1993,15 @@
         const onlyNight = dayOffsetsFromNewest([{ clock: 23 * 60 + 20, labeled: null }], afterMidnight);
         if (offsets[0] !== 1 || offsets[1] !== 0 || dates[0] !== shiftYmd(-1) || dates[1] !== shiftYmd(0) || out.join() !== '23:59,00:00' || onlyNight[0] !== 1) {
             console.error('knock: 由最新往回推日期檢查失敗', offsets, dates, out, onlyNight);
+        }
+        const sameBio = messageIdSet([{ id: 'bio', timestamp: null }, { id: 't1', timestamp: '14:08' }]);
+        if (sameBio.has('bio') || hashOverlapCount({ messages: [{ id: 'bio', timestamp: null }, { id: 't2', timestamp: '14:09' }] }, sameBio) !== 0) {
+            console.error('knock: 開場句不應當成同一對話');
+        }
+        const hello = [{ id: 'hi', timestamp: '14:08' }];
+        const mega = [{ id: 'hi', timestamp: '14:08' }, { id: 'a', timestamp: '14:09' }, { id: 'b', timestamp: '14:10' }];
+        if (isSameConversation(hello, mega, true)) {
+            console.error('knock: 一句對上不該併進已儲存');
         }
     }
 
