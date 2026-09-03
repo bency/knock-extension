@@ -320,7 +320,7 @@
             skipFirstFilterFor = first ? pairingIdOf(first) : t;
             pendingForcedLeave = false;
             syncRememberButtons();
-            showToast('已記住發語詞與頭像，同一人相同開頭才會離開');
+            showToast('已加入過濾');
             return true;
         }
         return false;
