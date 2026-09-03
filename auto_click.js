@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.33
+// @version      1.4.34
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -121,7 +121,6 @@
     const checkedMessages = new Set();
     let myAvatarUrl = null;
     let currentConversation = emptyConversation();
-    let isSavePromptVisible = false;
     let processedConversationIds = new Set(storageGet('knockProcessedConversationIds', []));
     let notificationsArmed = false;
     let pendingForcedLeave = false;
@@ -660,23 +659,10 @@
 
         currentConversation.endTime = currentConversation.endTime || new Date().toISOString();
         persistLiveConversation();
-
+        markProcessed(currentConversation);
         if (isAutoClicking()) {
-            markProcessed(currentConversation);
             markPendingStartChat(findButtons().some(isRematchButton) ? 'otherLeft' : pendingForcedLeave ? undefined : 'selfLeft');
-            console.log('自動開啟新對話啟用中，略過儲存提示:', currentConversation.id);
-            return;
         }
-
-        currentConversation.promptShown = true;
-        setTimeout(() => {
-            if (isAutoClicking()) {
-                markProcessed(currentConversation);
-                return;
-            }
-            if (!isConversationProcessed(currentConversation.id)) showSavePrompt();
-            else currentConversation.saved = true;
-        }, 1000);
     }
 
     function getMyAvatarUrl() {
@@ -771,7 +757,7 @@
     }
 
     function checkForButtonAndClick() {
-        if (!isAutoClicking() || isSavePromptVisible) return;
+        if (!isAutoClicking()) return;
 
         for (const button of findButtons()) {
             if (isPendingStartChat() && isStartChatButton(button)) {
@@ -798,13 +784,13 @@
             if (isRematchButton(button)) {
                 markPendingStartChat('otherLeft');
                 checkConversationEnd();
-                if (!isSavePromptVisible && !rematchScheduled) {
+                if (!rematchScheduled) {
                     rematchScheduled = true;
                     showCooldown('重新配對', 3000);
                     setTimeout(() => {
                         rematchScheduled = false;
                         hideCooldown();
-                        if (isSavePromptVisible) return;
+                        if (!isAutoClicking()) return;
                         const btn = findButtons().find(isRematchButton);
                         if (btn) {
                             simulateMouseClick(btn);
@@ -817,11 +803,9 @@
 
             if (isConfirmExitButton(button)) {
                 checkConversationEnd();
-                if (!isSavePromptVisible) {
-                    markPendingStartChat(pendingForcedLeave ? undefined : 'selfLeft');
-                    simulateMouseClick(button);
-                    console.log('已記下「開始聊天」，等待頁面重整...');
-                }
+                markPendingStartChat(pendingForcedLeave ? undefined : 'selfLeft');
+                simulateMouseClick(button);
+                console.log('已記下「開始聊天」，等待頁面重整...');
                 return;
             }
         }
@@ -850,7 +834,7 @@
     }
 
     function tryForcedLeave() {
-        if (!pendingForcedLeave || !isAutoClicking() || isSavePromptVisible) return false;
+        if (!pendingForcedLeave || !isAutoClicking()) return false;
         if (findButtons().some(isConfirmExitButton)) {
             checkForButtonAndClick();
             return true;
@@ -894,7 +878,6 @@
     }
 
     function maybeLeaveOnFirstMessageFilter() {
-        if (isSavePromptVisible) return false;
         const first = findFirstOtherMessage();
         if (!first) return false;
         if (skipFirstFilterFor && skipFirstFilterFor === pairingIdOf(first)) return false;
@@ -1402,7 +1385,7 @@
         const text = getKeepAliveText();
         if (!text) return;
         if (!currentConversation.id || !currentConversation.messages.length) return;
-        if (pendingForcedLeave || isSavePromptVisible) return;
+        if (pendingForcedLeave) return;
         if (findButtons().some(b => isRematchButton(b) || isConfirmExitButton(b))) return;
         const at = lastChatAt();
         const wait = currentKeepAliveWaitMs();
@@ -1415,60 +1398,6 @@
             rollKeepAliveWaitMs();
             console.log('持續連線：已送出，下次約', (keepAliveWaitMs / 3600000).toFixed(2), '小時後');
         });
-    }
-
-    function dismissSavePrompt(prompt, save) {
-        prompt.remove();
-        isSavePromptVisible = false;
-        if (save) return;
-        markProcessed(currentConversation);
-        console.log('對話已標記為不儲存:', currentConversation.id);
-    }
-
-    function showSavePrompt() {
-        if (el('knock-save-prompt') || currentConversation.saved) return;
-        if (currentConversation.id && isConversationProcessed(currentConversation.id)) {
-            currentConversation.saved = true;
-            return;
-        }
-
-        isSavePromptVisible = true;
-        const prompt = document.createElement('div');
-        prompt.id = 'knock-save-prompt';
-        prompt.style.cssText = `
-            position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
-            z-index: 10001; background: rgba(0, 0, 0, 0.95); border-radius: 12px;
-            padding: 24px; min-width: 320px; max-width: 90%;
-            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5); font-family: ${FONT}; color: #fff;
-        `;
-        prompt.innerHTML = `
-            <div style="margin-bottom: 16px; font-size: 18px; font-weight: 600;">對話已結束</div>
-            <div style="margin-bottom: 20px; font-size: 14px; color: #ccc;">
-                本次對話共有 ${currentConversation.messages.length} 條訊息，是否要儲存？
-            </div>
-            <div style="display: flex; gap: 12px; justify-content: flex-end;">
-                <button id="knock-save-cancel" style="${cssBtn('#444')}">不儲存</button>
-                <button id="knock-save-confirm" style="${cssBtn('#4CAF50', 'font-weight:600;')}">儲存對話</button>
-            </div>
-        `;
-        document.body.appendChild(prompt);
-
-        el('knock-save-cancel').onclick = () => dismissSavePrompt(prompt, false);
-        prompt.addEventListener('click', (e) => {
-            if (e.target === prompt) dismissSavePrompt(prompt, false);
-        });
-        el('knock-save-confirm').onclick = () => {
-            if (!saveConversation(currentConversation)) {
-                alert('儲存失敗，請重試');
-                return;
-            }
-            prompt.innerHTML = `
-                <div style="text-align: center; padding: 20px;">
-                    <div style="font-size: 18px; margin-bottom: 12px;">✓ 已儲存</div>
-                    <div style="font-size: 14px; color: #ccc;">對話已成功儲存</div>
-                </div>`;
-            setTimeout(() => dismissSavePrompt(prompt, true), 1500);
-        };
     }
 
     function timestampToDate(msg, startTime, now = new Date()) {
