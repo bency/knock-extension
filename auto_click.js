@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.35
+// @version      1.4.36
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -50,7 +50,7 @@
     const KEEP_ALIVE_MIN_H_DEFAULT = 1.5;
     const KEEP_ALIVE_MAX_H_DEFAULT = 2.5;
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.35';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.36';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -699,10 +699,15 @@
         return null;
     }
 
+    function isStockAvatar(url) {
+        return /\/users-common(%2F|\/)avatars(%2F|\/)/i.test(url || '');
+    }
+
     function checkAvatarMatch(otherMessageLi) {
         const myAvatar = getMyAvatarUrl();
         const otherAvatar = getAvatarUrl(otherMessageLi);
-        return !!(myAvatar && otherAvatar && myAvatar === otherAvatar);
+        // ponytail: 預設男女頭像很多人同一張，共同話題配對一回覆就會被當成自己
+        return !!(myAvatar && otherAvatar && myAvatar === otherAvatar && !isStockAvatar(myAvatar));
     }
 
     function simulateMouseClick(element) {
@@ -1987,6 +1992,10 @@
         const mega = [{ id: 'hi', timestamp: '14:08' }, { id: 'a', timestamp: '14:09' }, { id: 'b', timestamp: '14:10' }];
         if (isSameConversation(hello, mega, true)) {
             console.error('knock: 一句對上不該併進已儲存');
+        }
+        const stock = 'https://firebasestorage.googleapis.com/v0/b/knocktalk-prod.appspot.com/o/users-common%2Favatars%2Fmale-user.svg?alt=media';
+        if (!isStockAvatar(stock) || isStockAvatar('https://example.com/custom.png')) {
+            console.error('knock: 預設頭像判斷失敗');
         }
     }
 
