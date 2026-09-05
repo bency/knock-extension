@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.34
+// @version      1.4.35
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -17,6 +17,7 @@
 (function() {
     'use strict';
 
+    // --- 常數 ---
     const BLACKLIST_PATTERNS = [
         /is\.gd\/[a-zA-Z0-9]+/i,
     ];
@@ -28,7 +29,11 @@
         selfLeft: '我主動斷線',
         firstFilter: '發語詞略過而重連'
     };
+    const AUTO_CLICK_ENABLED_KEY = 'knockAutoClickEnabled';
     const FIRST_MSG_FILTER_KEY = 'knockFirstMessageFilters';
+    const FIRST_FILTER_ENABLED_KEY = 'knockFirstFilterEnabled';
+    const BROWSER_NOTIFY_ENABLED_KEY = 'knockBrowserNotifyEnabled';
+    const NTFY_ENABLED_KEY = 'knockNtfyEnabled';
     const SAVED_CONV_KEY = 'knockSavedConversations';
     const AUTO_CONV_KEY = 'knockAutoConversations';
     const AUTO_CONV_MIN_MS = 50 * 1000;
@@ -45,7 +50,7 @@
     const KEEP_ALIVE_MIN_H_DEFAULT = 1.5;
     const KEEP_ALIVE_MAX_H_DEFAULT = 2.5;
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.23';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.35';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -57,6 +62,7 @@
     const CSS_INP = 'width:100%;padding:12px;background:#333;border:1px solid #555;border-radius:6px;color:#fff;font-size:14px;box-sizing:border-box;';
     const cssBtn = (bg, extra = '') => `padding:8px 16px;background:${bg};color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;${extra}`;
 
+    // --- 共用 ---
     function el(id) {
         return document.getElementById(id);
     }
@@ -110,9 +116,21 @@
         }
     }
 
-    const savedAutoClick = localStorage.getItem('knockAutoClickEnabled');
-    let autoClickEnabled = savedAutoClick === null ? true : savedAutoClick === 'true';
-    let keepAliveEnabled = localStorage.getItem(KEEP_ALIVE_ENABLED_KEY) === 'true';
+    function storedOn(key, fallback) {
+        const v = localStorage.getItem(key);
+        return v == null ? fallback : v === 'true';
+    }
+
+    function emptyConversation() {
+        return { id: null, messages: [], startTime: null, endTime: null, saved: false, promptShown: false, pinned: false };
+    }
+
+    // --- 狀態 ---
+    let autoClickEnabled = storedOn(AUTO_CLICK_ENABLED_KEY, true);
+    let keepAliveEnabled = storedOn(KEEP_ALIVE_ENABLED_KEY, false);
+    let firstFilterEnabled = storedOn(FIRST_FILTER_ENABLED_KEY, true);
+    let browserNotifyEnabled = storedOn(BROWSER_NOTIFY_ENABLED_KEY, true);
+    let ntfyEnabled = storedOn(NTFY_ENABLED_KEY, true);
     let lastActivityAt = 0;
     let lastKeepAliveTryAt = 0;
     let lastKeepAliveSentAt = 0;
@@ -135,10 +153,7 @@
     let persistLiveTimer = null;
     let conversationManagerTab = 'auto';
 
-    function emptyConversation() {
-        return { id: null, messages: [], startTime: null, endTime: null, saved: false, promptShown: false, pinned: false };
-    }
-
+    // --- 對話生命週期 ---
     function saveProcessedIds() {
         storageSet('knockProcessedConversationIds', Array.from(processedConversationIds));
     }
@@ -198,6 +213,7 @@
         console.log('初始化新對話:', currentConversation.id);
     }
 
+    // --- 發語詞過濾 ---
     function avatarHashOf(url) {
         return url ? hashString(url) : '';
     }
@@ -331,6 +347,7 @@
         }[c]));
     }
 
+    // --- 訊息與日期 ---
     function isMyMessageLi(messageLi) {
         const container = messageLi.querySelector('div[class*="jss"]');
         if (!container) return false;
@@ -476,6 +493,7 @@
         persistLiveConversationSoon();
     }
 
+    // --- 儲存與合併 ---
     function getSavedConversations() {
         return storageGet(SAVED_CONV_KEY, []);
     }
@@ -631,6 +649,7 @@
             && storageSet(AUTO_CONV_KEY, getAutoConversations().filter(c => !set.has(c.id)));
     }
 
+    // --- 離開與重連 ---
     function findButtons() {
         return Array.from(document.querySelectorAll('button'));
     }
@@ -878,6 +897,7 @@
     }
 
     function maybeLeaveOnFirstMessageFilter() {
+        if (!firstFilterEnabled) return false;
         const first = findFirstOtherMessage();
         if (!first) return false;
         if (skipFirstFilterFor && skipFirstFilterFor === pairingIdOf(first)) return false;
@@ -889,6 +909,7 @@
         return pendingForcedLeave;
     }
 
+    // --- 通知 ---
     function requestNotifyPermission() {
         if (!('Notification' in window) || Notification.permission !== 'default') return;
         Notification.requestPermission().catch(() => {});
@@ -1026,8 +1047,8 @@
     function notifyNewMessage(text) {
         if (!notificationsArmed || (document.hasFocus() && !document.hidden)) return;
         const body = (text || '你有一則新訊息').replace(/\s+/g, ' ').trim().slice(0, 80) || '你有一則新訊息';
-        if (Date.now() - lastNtfyAt > 15000) sendNtfy(body);
-        showBrowserNotification(body);
+        if (ntfyEnabled && Date.now() - lastNtfyAt > 15000) sendNtfy(body);
+        if (browserNotifyEnabled) showBrowserNotification(body);
     }
 
     function checkNewMessages() {
@@ -1109,6 +1130,7 @@
         }
     }
 
+    // --- 選單 ---
     function showToast(message) {
         const toast = document.createElement('div');
         toast.style.cssText = `
@@ -1143,6 +1165,57 @@
         return row;
     }
 
+    function attachDockSwitch(row, isOn, onChange, onlyKnob) {
+        const sw = dockSwitch(isOn);
+        sw.style.cursor = 'pointer';
+        row.append(sw);
+        const toggle = (e) => {
+            e.stopPropagation();
+            isOn = !isOn;
+            onChange(isOn);
+            sw.paint(isOn);
+        };
+        if (onlyKnob) sw.addEventListener('click', toggle);
+        else row.addEventListener('click', toggle);
+        return sw;
+    }
+
+    function getKeepAliveText() {
+        return (localStorage.getItem(KEEP_ALIVE_TEXT_KEY) || '').trim();
+    }
+
+    function keepAliveHoursRange() {
+        let min = Number(localStorage.getItem(KEEP_ALIVE_MIN_H_KEY));
+        let max = Number(localStorage.getItem(KEEP_ALIVE_MAX_H_KEY));
+        if (!Number.isFinite(min) || min < 0.1) min = KEEP_ALIVE_MIN_H_DEFAULT;
+        if (!Number.isFinite(max) || max < 0.1) max = KEEP_ALIVE_MAX_H_DEFAULT;
+        if (max < min) [min, max] = [max, min];
+        return { min, max };
+    }
+
+    function setKeepAliveHoursRange(minVal, maxVal) {
+        let min = Number(minVal);
+        let max = Number(maxVal);
+        if (!Number.isFinite(min) || min < 0.1) min = KEEP_ALIVE_MIN_H_DEFAULT;
+        if (!Number.isFinite(max) || max < 0.1) max = KEEP_ALIVE_MAX_H_DEFAULT;
+        if (max < min) [min, max] = [max, min];
+        localStorage.setItem(KEEP_ALIVE_MIN_H_KEY, String(min));
+        localStorage.setItem(KEEP_ALIVE_MAX_H_KEY, String(max));
+        return { min, max };
+    }
+
+    function rollKeepAliveWaitMs() {
+        const { min, max } = keepAliveHoursRange();
+        keepAliveWaitMs = (min + Math.random() * (max - min)) * 3600000;
+        if (currentConversation.id) {
+            sessionStorage.setItem(KEEP_ALIVE_WAIT_KEY, JSON.stringify({
+                id: currentConversation.id,
+                ms: keepAliveWaitMs
+            }));
+        }
+        return keepAliveWaitMs;
+    }
+
     function createDock() {
         if (el('knock-dock')) return;
         OLD_FLOAT_IDS.forEach(id => el(id)?.remove());
@@ -1163,26 +1236,18 @@
         body.style.cssText = DOCK_PANEL + 'margin-top:8px;padding:8px;display:none;flex-direction:column;gap:6px;width:220px;box-sizing:border-box;';
 
         const autoRow = dockRow('<span>自動開啟新對話</span>');
-        const autoSw = dockSwitch(autoClickEnabled);
-        autoRow.append(autoSw);
-        autoRow.addEventListener('click', (e) => {
-            e.stopPropagation();
-            autoClickEnabled = !autoClickEnabled;
-            localStorage.setItem('knockAutoClickEnabled', String(autoClickEnabled));
-            autoSw.paint(autoClickEnabled);
+        attachDockSwitch(autoRow, autoClickEnabled, (v) => {
+            autoClickEnabled = v;
+            localStorage.setItem(AUTO_CLICK_ENABLED_KEY, String(v));
             requestNotifyPermission();
         });
 
         const keepRow = dockRow('<span>持續連線</span>');
-        const keepSw = dockSwitch(keepAliveEnabled);
-        keepRow.append(keepSw);
-        keepRow.addEventListener('click', (e) => {
-            e.stopPropagation();
-            keepAliveEnabled = !keepAliveEnabled;
-            localStorage.setItem(KEEP_ALIVE_ENABLED_KEY, String(keepAliveEnabled));
-            keepSw.paint(keepAliveEnabled);
-            if (keepAliveEnabled && !getKeepAliveText()) showToast('請先輸入避免斷線的句子');
-        });
+        attachDockSwitch(keepRow, keepAliveEnabled, (v) => {
+            keepAliveEnabled = v;
+            localStorage.setItem(KEEP_ALIVE_ENABLED_KEY, String(v));
+            if (v && !getKeepAliveText()) showToast('請先輸入避免斷線的句子');
+        }, true);
 
         const keepInput = document.createElement('input');
         keepInput.type = 'text';
@@ -1222,22 +1287,46 @@
         unit.textContent = '小時';
         rangeRow.append(minInp, tilde, maxInp, unit);
 
+        const keepExtra = document.createElement('div');
+        keepExtra.style.cssText = 'display:none;flex-direction:column;gap:6px;';
+        keepExtra.append(keepInput, rangeRow);
+        keepRow.addEventListener('click', (e) => {
+            e.stopPropagation();
+            keepExtra.style.display = keepExtra.style.display === 'flex' ? 'none' : 'flex';
+        });
+        const keepWrap = document.createElement('div');
+        keepWrap.style.cssText = 'display:flex;flex-direction:column;gap:6px;';
+        keepWrap.append(keepRow, keepExtra);
+
         const convBtn = dockRow('<span>對話記錄</span>', { button: true });
         convBtn.addEventListener('click', (e) => { e.stopPropagation(); createConversationManager(); });
 
-        const filterBtn = dockRow(
-            `<span>發語詞過濾</span><span id="knock-filter-count" style="background:#ff9800;border-radius:10px;padding:0 6px;font-size:12px;min-width:1.2em;text-align:center;">${getNormalizedFilters().length}</span>`,
-            { button: true }
+        const filterRow = dockRow(
+            `<span>發語詞過濾</span><span id="knock-filter-count" style="background:#ff9800;border-radius:10px;padding:0 6px;font-size:12px;min-width:1.2em;text-align:center;">${getNormalizedFilters().length}</span>`
         );
-        filterBtn.addEventListener('click', (e) => { e.stopPropagation(); createFirstFilterManager(); });
+        attachDockSwitch(filterRow, firstFilterEnabled, (v) => {
+            firstFilterEnabled = v;
+            localStorage.setItem(FIRST_FILTER_ENABLED_KEY, String(v));
+        }, true);
+        filterRow.addEventListener('click', (e) => { e.stopPropagation(); createFirstFilterManager(); });
 
-        const ntfyBtn = dockRow('<span>手機通知</span>', { button: true });
-        ntfyBtn.addEventListener('click', (e) => { e.stopPropagation(); createNtfySettings(); });
+        const browserRow = dockRow('<span>瀏覽器通知</span>');
+        attachDockSwitch(browserRow, browserNotifyEnabled, (v) => {
+            browserNotifyEnabled = v;
+            localStorage.setItem(BROWSER_NOTIFY_ENABLED_KEY, String(v));
+            if (v) requestNotifyPermission();
+        }, true);
+        browserRow.addEventListener('click', (e) => { e.stopPropagation(); testBrowserNotification(); });
 
-        const notifyTestBtn = dockRow('<span>測試瀏覽器通知</span>', { button: true });
-        notifyTestBtn.addEventListener('click', (e) => { e.stopPropagation(); testBrowserNotification(); });
+        const ntfyRow = dockRow('<span>手機通知</span>');
+        attachDockSwitch(ntfyRow, ntfyEnabled, (v) => {
+            ntfyEnabled = v;
+            localStorage.setItem(NTFY_ENABLED_KEY, String(v));
+            if (v && !getNtfyTopic()) showToast('請先設定手機通知主題');
+        }, true);
+        ntfyRow.addEventListener('click', (e) => { e.stopPropagation(); createNtfySettings(); });
 
-        body.append(autoRow, keepRow, keepInput, rangeRow, convBtn, filterBtn, ntfyBtn, notifyTestBtn);
+        body.append(autoRow, keepWrap, filterRow, browserRow, ntfyRow, convBtn);
 
         const paintOpen = () => {
             body.style.display = open ? 'flex' : 'none';
@@ -1259,42 +1348,7 @@
         paintOpen();
     }
 
-    function getKeepAliveText() {
-        return (localStorage.getItem(KEEP_ALIVE_TEXT_KEY) || '').trim();
-    }
-
-    function keepAliveHoursRange() {
-        let min = Number(localStorage.getItem(KEEP_ALIVE_MIN_H_KEY));
-        let max = Number(localStorage.getItem(KEEP_ALIVE_MAX_H_KEY));
-        if (!Number.isFinite(min) || min < 0.1) min = KEEP_ALIVE_MIN_H_DEFAULT;
-        if (!Number.isFinite(max) || max < 0.1) max = KEEP_ALIVE_MAX_H_DEFAULT;
-        if (max < min) [min, max] = [max, min];
-        return { min, max };
-    }
-
-    function setKeepAliveHoursRange(minVal, maxVal) {
-        let min = Number(minVal);
-        let max = Number(maxVal);
-        if (!Number.isFinite(min) || min < 0.1) min = KEEP_ALIVE_MIN_H_DEFAULT;
-        if (!Number.isFinite(max) || max < 0.1) max = KEEP_ALIVE_MAX_H_DEFAULT;
-        if (max < min) [min, max] = [max, min];
-        localStorage.setItem(KEEP_ALIVE_MIN_H_KEY, String(min));
-        localStorage.setItem(KEEP_ALIVE_MAX_H_KEY, String(max));
-        return { min, max };
-    }
-
-    function rollKeepAliveWaitMs() {
-        const { min, max } = keepAliveHoursRange();
-        keepAliveWaitMs = (min + Math.random() * (max - min)) * 3600000;
-        if (currentConversation.id) {
-            sessionStorage.setItem(KEEP_ALIVE_WAIT_KEY, JSON.stringify({
-                id: currentConversation.id,
-                ms: keepAliveWaitMs
-            }));
-        }
-        return keepAliveWaitMs;
-    }
-
+    // --- 持續連線 ---
     function currentKeepAliveWaitMs() {
         try {
             const raw = JSON.parse(sessionStorage.getItem(KEEP_ALIVE_WAIT_KEY) || 'null');
@@ -1400,6 +1454,7 @@
         });
     }
 
+    // --- 對話記錄 ---
     function timestampToDate(msg, startTime, now = new Date()) {
         const minutes = clockMinutesOnly(msg.timestamp);
         if (minutes == null) return null;
@@ -1884,6 +1939,7 @@
         }
     });
 
+    // --- 啟動 ---
     function mountChrome() {
         if (!document.body) return;
         OLD_FLOAT_IDS.forEach(id => el(id)?.remove());
