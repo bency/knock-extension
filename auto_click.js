@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.38
+// @version      1.4.39
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -50,7 +50,11 @@
     const KEEP_ALIVE_MIN_H_DEFAULT = 1.5;
     const KEEP_ALIVE_MAX_H_DEFAULT = 2.5;
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.38';
+    const HINT_WAIT_RE = /等待也想聊聊\s+(.+?)\s+的人上線/;
+    const COMMON_TOPICS = new Set(['時事娛樂', '感情', '工作學業', '同性', '純聊', '生活']);
+    const HINT_CODE_KEY = 'knockHintCode';
+    const HINT_NOTIFIED_KEY = 'knockHintConnectedNotified';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.39';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -667,6 +671,57 @@
         return button.textContent.includes('開始聊天');
     }
 
+    function parseHintWaitText(text) {
+        const m = String(text || '').replace(/\s+/g, ' ').trim().match(HINT_WAIT_RE);
+        return m ? m[1].trim() : '';
+    }
+
+    function isHintCode(code) {
+        return !!(code && !COMMON_TOPICS.has(code));
+    }
+
+    function readWaitCode() {
+        for (const p of document.querySelectorAll('p')) {
+            const code = parseHintWaitText(p.textContent);
+            if (code) return code;
+        }
+        return '';
+    }
+
+    function getRememberedHint() {
+        return (sessionStorage.getItem(HINT_CODE_KEY) || '').trim();
+    }
+
+    function hintInputOnLobby() {
+        return document.querySelector('input[placeholder="輸入自訂暗號配對"]');
+    }
+
+    function rememberHintFromPage() {
+        const waiting = readWaitCode();
+        if (waiting) {
+            if (!isHintCode(waiting)) {
+                sessionStorage.removeItem(HINT_CODE_KEY);
+                sessionStorage.removeItem(HINT_NOTIFIED_KEY);
+                return '';
+            }
+            sessionStorage.setItem(HINT_CODE_KEY, waiting);
+            sessionStorage.removeItem(HINT_NOTIFIED_KEY);
+            return waiting;
+        }
+        const inp = hintInputOnLobby();
+        if (inp) {
+            const typed = inp.value.trim();
+            if (typed && isHintCode(typed)) sessionStorage.setItem(HINT_CODE_KEY, typed);
+            return getRememberedHint();
+        }
+        if (findButtons().some(b => b.value === '暗號')) {
+            sessionStorage.removeItem(HINT_CODE_KEY);
+            sessionStorage.removeItem(HINT_NOTIFIED_KEY);
+            return '';
+        }
+        return getRememberedHint();
+    }
+
     function checkConversationEnd() {
         if (currentConversation.promptShown || currentConversation.saved) return;
         if (currentConversation.id && isConversationProcessed(currentConversation.id)) {
@@ -1054,6 +1109,19 @@
         if (!notificationsArmed || (document.hasFocus() && !document.hidden)) return;
         const body = (text || '你有一則新訊息').replace(/\s+/g, ' ').trim().slice(0, 80) || '你有一則新訊息';
         if (ntfyEnabled && Date.now() - lastNtfyAt > 15000) sendNtfy(body);
+        if (browserNotifyEnabled) showBrowserNotification(body);
+    }
+
+    function maybeNotifyHintConnected() {
+        const hint = rememberHintFromPage();
+        if (!hint || readWaitCode()) return;
+        if (!document.querySelector('ul[data-test="messages"]')) return;
+        if (findButtons().some(isRematchButton)) return;
+        if (sessionStorage.getItem(HINT_NOTIFIED_KEY) === '1') return;
+        sessionStorage.setItem(HINT_NOTIFIED_KEY, '1');
+        const body = '已連線';
+        console.log('暗號已連線');
+        if (ntfyEnabled) sendNtfy(body);
         if (browserNotifyEnabled) showBrowserNotification(body);
     }
 
@@ -1964,6 +2032,7 @@
 
     new MutationObserver(() => {
         mountChrome();
+        maybeNotifyHintConnected();
         checkNewMessages();
         decorateOtherMessages();
         checkForButtonAndClick();
@@ -1971,6 +2040,7 @@
     }).observe(document.documentElement, { childList: true, subtree: true });
 
     setInterval(() => {
+        maybeNotifyHintConnected();
         maybeLeaveOnFirstMessageFilter();
         tryForcedLeave();
         tryKeepAlive();
@@ -2004,6 +2074,11 @@
         const stock = 'https://firebasestorage.googleapis.com/v0/b/knocktalk-prod.appspot.com/o/users-common%2Favatars%2Fmale-user.svg?alt=media';
         if (!isStockAvatar(stock) || isStockAvatar('https://example.com/custom.png')) {
             console.error('knock: 預設頭像判斷失敗');
+        }
+        if (parseHintWaitText('等待也想聊聊 早安 的人上線') !== '早安'
+            || parseHintWaitText('等待也想聊聊 感情 的人上線') !== '感情'
+            || !isHintCode('早安') || isHintCode('感情')) {
+            console.error('knock: 暗號等待判斷失敗');
         }
     }
 
