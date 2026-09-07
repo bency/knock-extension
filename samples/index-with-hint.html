@@ -912,6 +912,319 @@
             height: 100%;
         }
     </style>
+    <style data-jss="" data-meta="MuiInputBase">
+        @-webkit-keyframes mui-auto-fill {}
+
+        @-webkit-keyframes mui-auto-fill-cancel {}
+
+        .MuiInputBase-root {
+            color: #fff;
+            cursor: text;
+            display: inline-flex;
+            position: relative;
+            font-size: 1rem;
+            box-sizing: border-box;
+            align-items: center;
+            font-family: "Roboto", "Helvetica", "Arial", sans-serif;
+            font-weight: 400;
+            line-height: 1.1876em;
+            letter-spacing: 0.00938em;
+        }
+
+        .MuiInputBase-root.Mui-disabled {
+            color: rgba(255, 255, 255, 0.5);
+            cursor: default;
+        }
+
+        .MuiInputBase-multiline {
+            padding: 6px 0 7px;
+        }
+
+        .MuiInputBase-multiline.MuiInputBase-marginDense {
+            padding-top: 3px;
+        }
+
+        .MuiInputBase-fullWidth {
+            width: 100%;
+        }
+
+        .MuiInputBase-input {
+            font: inherit;
+            color: currentColor;
+            width: 100%;
+            border: 0;
+            height: 1.1876em;
+            margin: 0;
+            display: block;
+            padding: 6px 0 7px;
+            min-width: 0;
+            background: none;
+            box-sizing: content-box;
+            animation-name: mui-auto-fill-cancel;
+            letter-spacing: inherit;
+            animation-duration: 10ms;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        .MuiInputBase-input::-webkit-input-placeholder {
+            color: currentColor;
+            opacity: 0.5;
+            transition: opacity 200ms cubic-bezier(0.4, 0, 0.2, 1) 0ms;
+        }
+
+        .MuiInputBase-input::-moz-placeholder {
+            color: currentColor;
+            opacity: 0.5;
+            transition: opacity 200ms cubic-bezier(0.4, 0, 0.2, 1) 0ms;
+        }
+
+        .MuiInputBase-input:-ms-input-placeholder {
+            color: currentColor;
+            opacity: 0.5;
+            transition: opacity 200ms cubic-bezier(0.4, 0, 0.2, 1) 0ms;
+        }
+
+        .MuiInputBase-input::-ms-input-placeholder {
+            color: currentColor;
+            opacity: 0.5;
+            transition: opacity 200ms cubic-bezier(0.4, 0, 0.2, 1) 0ms;
+        }
+
+        .MuiInputBase-input:focus {
+            outline: 0;
+        }
+
+        .MuiInputBase-input:invalid {
+            box-shadow: none;
+        }
+
+        .MuiInputBase-input::-webkit-search-decoration {
+            -webkit-appearance: none;
+        }
+
+        .MuiInputBase-input.Mui-disabled {
+            opacity: 1;
+        }
+
+        .MuiInputBase-input:-webkit-autofill {
+            animation-name: mui-auto-fill;
+            animation-duration: 5000s;
+        }
+
+        label[data-shrink=false]+.MuiInputBase-formControl .MuiInputBase-input::-webkit-input-placeholder {
+            opacity: 0 !important;
+        }
+
+        label[data-shrink=false]+.MuiInputBase-formControl .MuiInputBase-input::-moz-placeholder {
+            opacity: 0 !important;
+        }
+
+        label[data-shrink=false]+.MuiInputBase-formControl .MuiInputBase-input:-ms-input-placeholder {
+            opacity: 0 !important;
+        }
+
+        label[data-shrink=false]+.MuiInputBase-formControl .MuiInputBase-input::-ms-input-placeholder {
+            opacity: 0 !important;
+        }
+
+        label[data-shrink=false]+.MuiInputBase-formControl .MuiInputBase-input:focus::-webkit-input-placeholder {
+            opacity: 0.5;
+        }
+
+        label[data-shrink=false]+.MuiInputBase-formControl .MuiInputBase-input:focus::-moz-placeholder {
+            opacity: 0.5;
+        }
+
+        label[data-shrink=false]+.MuiInputBase-formControl .MuiInputBase-input:focus:-ms-input-placeholder {
+            opacity: 0.5;
+        }
+
+        label[data-shrink=false]+.MuiInputBase-formControl .MuiInputBase-input:focus::-ms-input-placeholder {
+            opacity: 0.5;
+        }
+
+        .MuiInputBase-inputMarginDense {
+            padding-top: 3px;
+        }
+
+        .MuiInputBase-inputMultiline {
+            height: auto;
+            resize: none;
+            padding: 0;
+        }
+
+        .MuiInputBase-inputTypeSearch {
+            -moz-appearance: textfield;
+            -webkit-appearance: textfield;
+        }
+    </style>
+    <style data-jss="" data-meta="PrivateNotchedOutline">
+        .jss175 {
+            top: -5px;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            margin: 0;
+            padding: 0 8px;
+            overflow: hidden;
+            position: absolute;
+            border-style: solid;
+            border-width: 1px;
+            border-radius: inherit;
+            pointer-events: none;
+        }
+
+        .jss176 {
+            padding: 0;
+            text-align: left;
+            transition: width 150ms cubic-bezier(0.0, 0, 0.2, 1) 0ms;
+            line-height: 11px;
+        }
+
+        .jss177 {
+            width: auto;
+            height: 11px;
+            display: block;
+            padding: 0;
+            font-size: 0.75em;
+            max-width: 0.01px;
+            text-align: left;
+            transition: max-width 50ms cubic-bezier(0.0, 0, 0.2, 1) 0ms;
+            visibility: hidden;
+        }
+
+        .jss177>span {
+            display: inline-block;
+            padding-left: 5px;
+            padding-right: 5px;
+        }
+
+        .jss178 {
+            max-width: 1000px;
+            transition: max-width 100ms cubic-bezier(0.0, 0, 0.2, 1) 50ms;
+        }
+    </style>
+    <style data-jss="" data-meta="MuiOutlinedInput">
+        .MuiOutlinedInput-root {
+            position: relative;
+            border-radius: 5px;
+        }
+
+        .MuiOutlinedInput-root:hover .MuiOutlinedInput-notchedOutline {
+            border-color: #fff;
+        }
+
+        @media (hover: none) {
+            .MuiOutlinedInput-root:hover .MuiOutlinedInput-notchedOutline {
+                border-color: rgba(255, 255, 255, 0.23);
+            }
+        }
+
+        .MuiOutlinedInput-root.Mui-focused .MuiOutlinedInput-notchedOutline {
+            border-color: #2b5876;
+            border-width: 2px;
+        }
+
+        .MuiOutlinedInput-root.Mui-error .MuiOutlinedInput-notchedOutline {
+            border-color: #f44336;
+        }
+
+        .MuiOutlinedInput-root.Mui-disabled .MuiOutlinedInput-notchedOutline {
+            border-color: rgba(255, 255, 255, 0.3);
+        }
+
+        .MuiOutlinedInput-colorSecondary.Mui-focused .MuiOutlinedInput-notchedOutline {
+            border-color: #ffb380;
+        }
+
+        .MuiOutlinedInput-adornedStart {
+            padding-left: 14px;
+        }
+
+        .MuiOutlinedInput-adornedEnd {
+            padding-right: 14px;
+        }
+
+        .MuiOutlinedInput-multiline {
+            padding: 18.5px 14px;
+        }
+
+        .MuiOutlinedInput-multiline.MuiOutlinedInput-marginDense {
+            padding-top: 10.5px;
+            padding-bottom: 10.5px;
+        }
+
+        .MuiOutlinedInput-notchedOutline {
+            border-color: #0005;
+        }
+
+        .MuiOutlinedInput-input {
+            padding: 18.5px 14px;
+        }
+
+        .MuiOutlinedInput-input:-webkit-autofill {
+            caret-color: #fff;
+            border-radius: inherit;
+            -webkit-box-shadow: 0 0 0 100px #266798 inset;
+            -webkit-text-fill-color: #fff;
+        }
+
+        .MuiOutlinedInput-inputMarginDense {
+            padding-top: 10.5px;
+            padding-bottom: 10.5px;
+        }
+
+        .MuiOutlinedInput-inputMultiline {
+            padding: 0;
+        }
+
+        .MuiOutlinedInput-inputAdornedStart {
+            padding-left: 0;
+        }
+
+        .MuiOutlinedInput-inputAdornedEnd {
+            padding-right: 0;
+        }
+    </style>
+    <style data-jss="" data-meta="MuiFormControl">
+        .MuiFormControl-root {
+            border: 0;
+            margin: 0;
+            display: inline-flex;
+            padding: 0;
+            position: relative;
+            min-width: 0;
+            flex-direction: column;
+            vertical-align: top;
+        }
+
+        .MuiFormControl-marginNormal {
+            margin-top: 16px;
+            margin-bottom: 8px;
+        }
+
+        .MuiFormControl-marginDense {
+            margin-top: 8px;
+            margin-bottom: 4px;
+        }
+
+        .MuiFormControl-fullWidth {
+            width: 100%;
+        }
+    </style>
+    <style data-jss="" data-meta="MuiTextField">
+        .MuiTextField-root .MuiInputBase-root {
+            background: #0003;
+        }
+
+        .MuiTextField-root input:-webkit-autofill {
+            color: white;
+            box-shadow: 0 0 0 50px #333 inset;
+            border-radius: inherit;
+            background-clip: content-box;
+            -webkit-text-fill-color: white;
+        }
+    </style>
     <style data-jss="" data-meta="MuiDivider">
         .MuiDivider-root {
             border: none;
@@ -1888,9 +2201,27 @@
                                             tabindex="0" type="button" value="感情" aria-pressed="false"><span
                                                 class="MuiToggleButton-label">感情</span></button></div>
                                     <div class="css-pty6ca"><button
-                                            class="MuiButtonBase-root MuiToggleButton-root css-qji04u MuiToggleButton-sizeSmall"
-                                            tabindex="0" type="button" value="暗號" aria-pressed="false"><span
-                                                class="MuiToggleButton-label">輸入暗號...</span></button></div>
+                                            class="MuiButtonBase-root MuiToggleButton-root css-qji04u Mui-selected MuiToggleButton-sizeSmall"
+                                            tabindex="0" type="button" value="暗號" aria-pressed="true"><span
+                                                class="MuiToggleButton-label">暗號</span></button>
+                                        <div class="css-10316qz">
+                                            <div
+                                                class="MuiFormControl-root MuiTextField-root css-15w6zpm MuiFormControl-fullWidth">
+                                                <div
+                                                    class="MuiInputBase-root MuiOutlinedInput-root MuiInputBase-fullWidth Mui-focused Mui-focused MuiInputBase-formControl MuiInputBase-marginDense MuiOutlinedInput-marginDense">
+                                                    <input aria-invalid="false" placeholder="輸入自訂暗號配對" type="text"
+                                                        class="MuiInputBase-input MuiOutlinedInput-input MuiInputBase-inputMarginDense MuiOutlinedInput-inputMarginDense"
+                                                        value="">
+                                                    <fieldset aria-hidden="true"
+                                                        class="jss175 MuiOutlinedInput-notchedOutline"
+                                                        style="padding-left: 8px;">
+                                                        <legend class="jss176" style="width: 0.01px;"><span>​</span>
+                                                        </legend>
+                                                    </fieldset>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
                                 </div>
                             </div><button
                                 class="MuiButtonBase-root MuiButton-root MuiButton-contained jss112 MuiButton-containedPrimary"
