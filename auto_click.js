@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.37
+// @version      1.4.38
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -50,7 +50,7 @@
     const KEEP_ALIVE_MIN_H_DEFAULT = 1.5;
     const KEEP_ALIVE_MAX_H_DEFAULT = 2.5;
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.37';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.38';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -210,6 +210,7 @@
         keepAliveWaitMs = 0;
         sessionStorage.removeItem(KEEP_ALIVE_AT_KEY);
         sessionStorage.removeItem(KEEP_ALIVE_WAIT_KEY);
+        noteActivity();
         console.log('初始化新對話:', currentConversation.id);
     }
 
@@ -1391,6 +1392,12 @@
                 consider({ timestamp: timeEl.textContent.trim(), date: dates.get(li) });
             }
         }
+        // ponytail: 雙方都不說話（或只有沒時間的開場句）時，從配對當下開始算
+        if (!latest) latest = lastActivityAt;
+        if (!latest && currentConversation.startTime) {
+            const start = Date.parse(currentConversation.startTime);
+            if (Number.isFinite(start)) latest = start;
+        }
         return latest;
     }
 
@@ -1443,9 +1450,10 @@
         if (!keepAliveEnabled) return;
         const text = getKeepAliveText();
         if (!text) return;
-        if (!currentConversation.id || !currentConversation.messages.length) return;
         if (pendingForcedLeave) return;
+        if (!document.querySelector('ul[data-test="messages"]')) return;
         if (findButtons().some(b => isRematchButton(b) || isConfirmExitButton(b))) return;
+        if (!currentConversation.id || currentConversation.saved) initNewConversation();
         const at = lastChatAt();
         const wait = currentKeepAliveWaitMs();
         if (!at || Date.now() - at < wait) return;
