@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.39
+// @version      1.4.40
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -54,7 +54,8 @@
     const COMMON_TOPICS = new Set(['時事娛樂', '感情', '工作學業', '同性', '純聊', '生活']);
     const HINT_CODE_KEY = 'knockHintCode';
     const HINT_NOTIFIED_KEY = 'knockHintConnectedNotified';
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.39';
+    const HINT_WAS_WAITING_KEY = 'knockHintWasWaiting';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.40';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -696,17 +697,27 @@
         return document.querySelector('input[placeholder="輸入自訂暗號配對"]');
     }
 
+    function clearHintSession() {
+        sessionStorage.removeItem(HINT_CODE_KEY);
+        sessionStorage.removeItem(HINT_NOTIFIED_KEY);
+        sessionStorage.removeItem(HINT_WAS_WAITING_KEY);
+    }
+
     function rememberHintFromPage() {
         const waiting = readWaitCode();
         if (waiting) {
             if (!isHintCode(waiting)) {
-                sessionStorage.removeItem(HINT_CODE_KEY);
-                sessionStorage.removeItem(HINT_NOTIFIED_KEY);
+                clearHintSession();
                 return '';
             }
             sessionStorage.setItem(HINT_CODE_KEY, waiting);
+            sessionStorage.setItem(HINT_WAS_WAITING_KEY, '1');
             sessionStorage.removeItem(HINT_NOTIFIED_KEY);
             return waiting;
+        }
+        if (document.querySelector('ul[data-test="messages"]')) {
+            sessionStorage.removeItem(HINT_WAS_WAITING_KEY);
+            return getRememberedHint();
         }
         const inp = hintInputOnLobby();
         if (inp) {
@@ -715,11 +726,18 @@
             return getRememberedHint();
         }
         if (findButtons().some(b => b.value === '暗號')) {
-            sessionStorage.removeItem(HINT_CODE_KEY);
-            sessionStorage.removeItem(HINT_NOTIFIED_KEY);
+            clearHintSession();
             return '';
         }
         return getRememberedHint();
+    }
+
+    function shouldAutoStartHint() {
+        return autoClickEnabled
+            && sessionStorage.getItem(HINT_WAS_WAITING_KEY) === '1'
+            && !!hintInputOnLobby()
+            && !readWaitCode()
+            && !document.querySelector('ul[data-test="messages"]');
     }
 
     function checkConversationEnd() {
@@ -840,14 +858,14 @@
         if (!isAutoClicking()) return;
 
         for (const button of findButtons()) {
-            if (isPendingStartChat() && isStartChatButton(button)) {
+            if (isStartChatButton(button) && (isPendingStartChat() || shouldAutoStartHint())) {
                 if (!startChatScheduled) {
                     startChatScheduled = true;
-                    showCooldown(startChatCooldownLabel(), 2000);
+                    showCooldown(isPendingStartChat() ? startChatCooldownLabel() : '開始聊天', 2000);
                     setTimeout(() => {
                         startChatScheduled = false;
                         hideCooldown();
-                        if (!isAutoClicking() || !isPendingStartChat()) return;
+                        if (!isAutoClicking() || !(isPendingStartChat() || shouldAutoStartHint())) return;
                         const btn = findButtons().find(isStartChatButton);
                         if (btn) {
                             console.log('倒數結束，點擊「開始聊天」...');
