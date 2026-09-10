@@ -424,13 +424,17 @@
     }
 
     function paintAvatarFilterButton(btn, on) {
+        const left = btn.style.left;
+        const top = btn.style.top;
+        const useCorner = !left && !top;
         btn.style.cssText = `
-            position:absolute;right:-2px;bottom:-2px;z-index:2;margin:0;padding:0;
+            position:absolute;z-index:2;margin:0;padding:0;
             width:16px;height:16px;box-sizing:border-box;
             border:1.5px solid ${on ? '#4CAF50' : 'rgba(255,255,255,0.75)'};
             border-radius:4px;background:${on ? '#4CAF50' : 'rgba(0,0,0,0.45)'};
             cursor:pointer;display:inline-flex;align-items:center;justify-content:center;
             box-shadow:0 0 0 1px rgba(0,0,0,0.35);
+            ${useCorner ? 'right:-2px;bottom:-2px;left:auto;top:auto;' : `left:${left};top:${top};right:auto;bottom:auto;`}
         `;
         btn.innerHTML = on
             ? '<svg width="10" height="10" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3.5 8.5l3 3 6-6" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>'
@@ -1322,7 +1326,7 @@
     }
 
     function onRememberRowClick(e) {
-        if (e.target.closest('a, [data-test="user-avatar"], .knock-avatar-filter-wrap, .knock-remember-avatar')) return;
+        if (e.target.closest('a, [data-test="user-avatar"], .knock-remember-avatar')) return;
         const first = findFirstOtherMessage();
         if (!first || first.li !== e.currentTarget) return;
         toggleFirstMessageFilter(first.filterKey, first.avatarHash);
@@ -1330,32 +1334,17 @@
 
     function decorateAvatarFilterCheck(first) {
         document.querySelectorAll('.knock-remember-avatar').forEach(btn => {
-            if (!first || !first.li.contains(btn)) {
-                const wrap = btn.closest('.knock-avatar-filter-wrap');
-                if (wrap) {
-                    const avatar = wrap.querySelector('div[data-test="user-avatar"]');
-                    if (avatar && wrap.parentNode) wrap.parentNode.insertBefore(avatar, wrap);
-                    wrap.remove();
-                } else {
-                    btn.remove();
-                }
-            }
+            if (!first || !first.li.contains(btn)) btn.remove();
         });
         if (!first || !first.avatarUrl) return;
 
         const avatarEl = first.li.querySelector('div[data-test="user-avatar"]');
         if (!avatarEl) return;
+        const parent = avatarEl.parentElement || first.li;
+        const pos = window.getComputedStyle(parent).position;
+        if (pos === 'static' || !pos) parent.style.position = 'relative';
 
-        let wrap = avatarEl.closest('.knock-avatar-filter-wrap');
-        if (!wrap) {
-            wrap = document.createElement('div');
-            wrap.className = 'knock-avatar-filter-wrap';
-            wrap.style.cssText = 'position:relative;display:inline-flex;flex-shrink:0;align-self:flex-start;';
-            avatarEl.parentNode.insertBefore(wrap, avatarEl);
-            wrap.appendChild(avatarEl);
-        }
-
-        let btn = wrap.querySelector('.knock-remember-avatar');
+        let btn = first.li.querySelector('.knock-remember-avatar');
         if (!btn) {
             btn = document.createElement('button');
             btn.type = 'button';
@@ -1366,10 +1355,16 @@
                 const url = decodeURIComponent(btn.dataset.avatarUrl || '');
                 toggleAvatarFilter(url);
             });
-            wrap.appendChild(btn);
+            parent.appendChild(btn);
         }
         btn.dataset.avatarUrl = encodeURIComponent(first.avatarUrl);
         paintAvatarFilterButton(btn, isAvatarFiltered(first.avatarUrl));
+        const left = avatarEl.offsetLeft + avatarEl.offsetWidth - 14;
+        const top = avatarEl.offsetTop + avatarEl.offsetHeight - 14;
+        btn.style.left = `${Math.max(0, left)}px`;
+        btn.style.top = `${Math.max(0, top)}px`;
+        btn.style.right = 'auto';
+        btn.style.bottom = 'auto';
     }
 
     function decorateOtherMessages() {
