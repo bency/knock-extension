@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.40
+// @version      1.4.41
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -32,6 +32,8 @@
     const AUTO_CLICK_ENABLED_KEY = 'knockAutoClickEnabled';
     const FIRST_MSG_FILTER_KEY = 'knockFirstMessageFilters';
     const FIRST_FILTER_ENABLED_KEY = 'knockFirstFilterEnabled';
+    const AVATAR_FILTER_KEY = 'knockAvatarFilters';
+    const AVATAR_FILTER_ENABLED_KEY = 'knockAvatarFilterEnabled';
     const BROWSER_NOTIFY_ENABLED_KEY = 'knockBrowserNotifyEnabled';
     const NTFY_ENABLED_KEY = 'knockNtfyEnabled';
     const SAVED_CONV_KEY = 'knockSavedConversations';
@@ -55,7 +57,7 @@
     const HINT_CODE_KEY = 'knockHintCode';
     const HINT_NOTIFIED_KEY = 'knockHintConnectedNotified';
     const HINT_WAS_WAITING_KEY = 'knockHintWasWaiting';
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.40';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.41';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -134,6 +136,7 @@
     let autoClickEnabled = storedOn(AUTO_CLICK_ENABLED_KEY, true);
     let keepAliveEnabled = storedOn(KEEP_ALIVE_ENABLED_KEY, false);
     let firstFilterEnabled = storedOn(FIRST_FILTER_ENABLED_KEY, true);
+    let avatarFilterEnabled = storedOn(AVATAR_FILTER_ENABLED_KEY, true);
     let browserNotifyEnabled = storedOn(BROWSER_NOTIFY_ENABLED_KEY, true);
     let ntfyEnabled = storedOn(NTFY_ENABLED_KEY, true);
     let lastActivityAt = 0;
@@ -342,6 +345,120 @@
             pendingForcedLeave = false;
             syncRememberButtons();
             showToast('已加入過濾');
+            return true;
+        }
+        return false;
+    }
+
+    // --- 大頭貼過濾（只記網址；勾選疊在頭像上，不包頭像） ---
+    function normalizeAvatarFilter(item) {
+        const u = String(item && typeof item === 'object' ? (item.u ?? item.url ?? '') : item || '').trim();
+        return u || null;
+    }
+
+    function getAvatarFilters() {
+        return storageGet(AVATAR_FILTER_KEY, []).map(normalizeAvatarFilter).filter(Boolean);
+    }
+
+    function isAvatarFiltered(url) {
+        const u = (url || '').trim();
+        return !!u && getAvatarFilters().includes(u);
+    }
+
+    function addAvatarFilter(url) {
+        const u = (url || '').trim();
+        if (!u) return false;
+        const list = getAvatarFilters();
+        if (list.includes(u)) return false;
+        list.push(u);
+        return storageSet(AVATAR_FILTER_KEY, list);
+    }
+
+    function removeAvatarFilter(url) {
+        const u = (url || '').trim();
+        return storageSet(AVATAR_FILTER_KEY, getAvatarFilters().filter(x => x !== u));
+    }
+
+    function clearAvatarFilters() {
+        return storageSet(AVATAR_FILTER_KEY, []);
+    }
+
+    function exportAvatarFilters() {
+        const list = getAvatarFilters();
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob([JSON.stringify(list, null, 2)], { type: 'application/json' }));
+        a.download = `knock-大頭貼過濾-${new Date().toISOString().slice(0, 10)}.json`;
+        a.click();
+        URL.revokeObjectURL(a.href);
+        return list.length;
+    }
+
+    function parseImportedAvatarFilters(raw) {
+        const data = JSON.parse(raw);
+        const list = Array.isArray(data) ? data : data && data.filters;
+        if (!Array.isArray(list)) throw new Error('格式不對');
+        return list.map(normalizeAvatarFilter).filter(Boolean);
+    }
+
+    function importAvatarFilters(incoming) {
+        const list = getAvatarFilters();
+        const seen = new Set(list);
+        let added = 0;
+        for (const item of incoming) {
+            const u = normalizeAvatarFilter(item);
+            if (!u || seen.has(u)) continue;
+            seen.add(u);
+            list.push(u);
+            added++;
+        }
+        if (added) storageSet(AVATAR_FILTER_KEY, list);
+        return added;
+    }
+
+    function paintAvatarFilterButton(btn, on) {
+        const left = btn.style.left;
+        const top = btn.style.top;
+        const onAvatar = !btn.classList.contains('knock-remember-avatar-saved') && left && top;
+        btn.style.cssText = `
+            position:absolute;z-index:2;margin:0;padding:0;
+            width:16px;height:16px;box-sizing:border-box;
+            border:1.5px solid ${on ? '#4CAF50' : 'rgba(255,255,255,0.85)'};
+            border-radius:4px;background:${on ? '#4CAF50' : 'rgba(0,0,0,0.45)'};
+            cursor:pointer;display:inline-flex;align-items:center;justify-content:center;
+            ${onAvatar ? `left:${left};top:${top};right:auto;bottom:auto;` : 'right:0;bottom:0;'}
+        `;
+        btn.innerHTML = on
+            ? '<svg width="10" height="10" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3.5 8.5l3 3 6-6" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+            : '';
+        btn.setAttribute('role', 'checkbox');
+        btn.setAttribute('aria-checked', on ? 'true' : 'false');
+        btn.title = on ? '已記住大頭貼，再點取消' : '記住大頭貼';
+    }
+
+    function syncAvatarFilterButtons() {
+        document.querySelectorAll('.knock-remember-avatar, .knock-remember-avatar-saved').forEach(btn => {
+            const url = decodeURIComponent(btn.dataset.avatarUrl || '');
+            paintAvatarFilterButton(btn, !!(url && isAvatarFiltered(url)));
+        });
+        const badge = el('knock-avatar-filter-count');
+        if (badge) badge.textContent = String(getAvatarFilters().length);
+    }
+
+    function toggleAvatarFilter(url) {
+        const u = (url || '').trim();
+        if (!u) return false;
+        if (isAvatarFiltered(u)) {
+            removeAvatarFilter(u);
+            syncAvatarFilterButtons();
+            showToast('已從大頭貼過濾移除');
+            return false;
+        }
+        if (addAvatarFilter(u)) {
+            const first = findFirstOtherMessage();
+            skipFirstFilterFor = first ? pairingIdOf(first) : u;
+            pendingForcedLeave = false;
+            syncAvatarFilterButtons();
+            showToast('已加入大頭貼過濾');
             return true;
         }
         return false;
@@ -988,6 +1105,17 @@
         return pendingForcedLeave;
     }
 
+    function maybeLeaveOnAvatarFilter() {
+        if (!avatarFilterEnabled) return false;
+        const first = findFirstOtherMessage();
+        if (!first || !first.avatarUrl) return false;
+        if (skipFirstFilterFor && skipFirstFilterFor === pairingIdOf(first)) return false;
+        if (!isAvatarFiltered(first.avatarUrl)) return false;
+        console.log('大頭貼命中過濾，準備重連:', first.avatarUrl);
+        requestForcedLeave('firstFilter');
+        return pendingForcedLeave;
+    }
+
     // --- 通知 ---
     function requestNotifyPermission() {
         if (!('Notification' in window) || Notification.permission !== 'default') return;
@@ -1155,7 +1283,7 @@
             initNewConversation();
         }
 
-        if (maybeLeaveOnFirstMessageFilter() || tryForcedLeave()) return;
+        if (maybeLeaveOnFirstMessageFilter() || maybeLeaveOnAvatarFilter() || tryForcedLeave()) return;
 
         // ponytail: 重整／往上捲時 DOM 會一次塞進舊訊息；第一次看到列表先標已讀，之後只推最新一則
         const catchUp = !notificationsArmed;
@@ -1189,7 +1317,7 @@
     }
 
     function onRememberRowClick(e) {
-        if (e.target.closest('a, [data-test="user-avatar"]')) return;
+        if (e.target.closest('a, [data-test="user-avatar"], .knock-remember-avatar')) return;
         const first = findFirstOtherMessage();
         if (!first || first.li !== e.currentTarget) return;
         toggleFirstMessageFilter(first.filterKey, first.avatarHash);
@@ -1200,20 +1328,44 @@
         if (!list) return;
 
         const first = findFirstOtherMessage();
-        list.querySelectorAll('.knock-remember-first').forEach(btn => {
+        list.querySelectorAll('.knock-remember-first, .knock-remember-avatar').forEach(btn => {
             if (!first || !first.li.contains(btn)) btn.remove();
         });
         if (!first) return;
-        if (first.li.querySelector('.knock-remember-first')) return;
 
-        const btn = document.createElement('button');
-        btn.type = 'button';
-        btn.className = 'knock-remember-first';
-        btn.dataset.filterText = encodeURIComponent(first.filterKey);
-        btn.dataset.filterAvatar = encodeURIComponent(first.avatarHash);
-        paintRememberButton(btn, isFirstMessageFiltered(first.filterKey, first.avatarHash));
-        const row = first.li.firstElementChild;
-        (row || first.li).appendChild(btn);
+        const row = first.li.firstElementChild || first.li;
+        if (!first.li.querySelector('.knock-remember-first')) {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'knock-remember-first';
+            btn.dataset.filterText = encodeURIComponent(first.filterKey);
+            btn.dataset.filterAvatar = encodeURIComponent(first.avatarHash);
+            paintRememberButton(btn, isFirstMessageFiltered(first.filterKey, first.avatarHash));
+            row.appendChild(btn);
+        }
+        if (first.avatarUrl && !first.li.querySelector('.knock-remember-avatar')) {
+            const avatarEl = first.li.querySelector('div[data-test="user-avatar"]');
+            if (avatarEl) {
+                // ponytail: 掛在列上用座標疊到頭像，不包頭像、不每輪改 DOM
+                if (!row.dataset.knockRowPos) {
+                    if (getComputedStyle(row).position === 'static') row.style.position = 'relative';
+                    row.dataset.knockRowPos = '1';
+                }
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'knock-remember-avatar';
+                btn.dataset.avatarUrl = encodeURIComponent(first.avatarUrl);
+                btn.style.left = `${Math.max(0, avatarEl.offsetLeft + avatarEl.offsetWidth - 14)}px`;
+                btn.style.top = `${Math.max(0, avatarEl.offsetTop + avatarEl.offsetHeight - 14)}px`;
+                paintAvatarFilterButton(btn, isAvatarFiltered(first.avatarUrl));
+                btn.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    toggleAvatarFilter(decodeURIComponent(btn.dataset.avatarUrl || ''));
+                });
+                row.appendChild(btn);
+            }
+        }
 
         if (!first.li.dataset.knockRememberRow) {
             first.li.dataset.knockRememberRow = '1';
@@ -1402,6 +1554,15 @@
         }, true);
         filterRow.addEventListener('click', (e) => { e.stopPropagation(); createFirstFilterManager(); });
 
+        const avatarRow = dockRow(
+            `<span>大頭貼過濾</span><span id="knock-avatar-filter-count" style="background:#ff9800;border-radius:10px;padding:0 6px;font-size:12px;min-width:1.2em;text-align:center;">${getAvatarFilters().length}</span>`
+        );
+        attachDockSwitch(avatarRow, avatarFilterEnabled, (v) => {
+            avatarFilterEnabled = v;
+            localStorage.setItem(AVATAR_FILTER_ENABLED_KEY, String(v));
+        }, true);
+        avatarRow.addEventListener('click', (e) => { e.stopPropagation(); createAvatarFilterManager(); });
+
         const browserRow = dockRow('<span>瀏覽器通知</span>');
         attachDockSwitch(browserRow, browserNotifyEnabled, (v) => {
             browserNotifyEnabled = v;
@@ -1418,7 +1579,7 @@
         }, true);
         ntfyRow.addEventListener('click', (e) => { e.stopPropagation(); createNtfySettings(); });
 
-        body.append(autoRow, keepWrap, filterRow, browserRow, ntfyRow, convBtn);
+        body.append(autoRow, keepWrap, filterRow, avatarRow, browserRow, ntfyRow, convBtn);
 
         const paintOpen = () => {
             body.style.display = open ? 'flex' : 'none';
@@ -1830,6 +1991,69 @@
         });
     }
 
+    function refreshAvatarFilterManager() {
+        const panel = el('knock-avatar-filter-manager');
+        if (!panel) return;
+        panel.remove();
+        createAvatarFilterManager();
+    }
+
+    function createAvatarFilterManager() {
+        const filters = getAvatarFilters();
+        const panel = toggleOverlay('knock-avatar-filter-manager', () => makeOverlay('knock-avatar-filter-manager', 720, `
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;flex-wrap:wrap;">
+                <h2 style="margin:0;font-size:24px;">大頭貼過濾（${filters.length}）</h2>
+                <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                    <button id="knock-export-avatar-filters" style="${cssBtn('#2d5a3d')}" ${filters.length ? '' : 'disabled'}>匯出</button>
+                    <button id="knock-import-avatar-filters" style="${cssBtn('#2d4a6d')}">匯入</button>
+                    <button id="knock-clear-avatar-filters" style="${cssBtn('#d32f2f')}" ${filters.length ? '' : 'disabled'}>全部清空</button>
+                    <button id="knock-avatar-filter-manager-close" style="${cssBtn('#444')}">關閉</button>
+                </div>
+                <input type="file" id="knock-import-avatar-filters-file" accept="application/json,.json" hidden>
+            </div>
+            <div style="font-size:13px;color:#888;margin-bottom:16px;">對方發語詞的大頭貼網址相同就會自動離開。預設頭像也可以勾，用來略過沒換頭像的人。</div>
+            <input type="text" id="knock-avatar-filter-search" placeholder="搜尋大頭貼網址..." style="${CSS_INP}margin-bottom:16px;">
+            <div id="knock-avatar-filter-list" style="display:flex;flex-direction:column;gap:8px;">
+                ${filters.length === 0
+                    ? '<div style="text-align:center;padding:40px;color:#888;">尚未封鎖任何大頭貼</div>'
+                    : filters.map(url => `
+                        <div class="knock-avatar-filter-card" data-search="${escapeHtml(url.toLowerCase())}" style="display:flex;gap:12px;align-items:center;background:#222;border:1px solid #444;border-radius:8px;padding:12px;">
+                            <div style="width:48px;height:48px;border-radius:50%;flex-shrink:0;background:#333;overflow:hidden;">
+                                <img src="${escapeHtml(url)}" alt="" style="width:100%;height:100%;object-fit:cover;" referrerpolicy="no-referrer">
+                            </div>
+                            <div style="flex:1;min-width:0;font-size:12px;color:#aaa;word-break:break-all;">${escapeHtml(url)}</div>
+                            <button class="knock-remove-avatar-filter" data-avatar-url="${encodeURIComponent(url)}" style="${cssBtn('#d32f2f', 'padding:6px 10px;border-radius:4px;font-size:12px;flex-shrink:0;')}">刪除</button>
+                        </div>`).join('')}
+            </div>`));
+        if (!panel) return;
+        el('knock-avatar-filter-manager-close').onclick = () => panel.remove();
+        el('knock-export-avatar-filters').onclick = () => {
+            const n = exportAvatarFilters();
+            showToast(n ? `已匯出 ${n} 則` : '沒有可匯出的大頭貼');
+        };
+        el('knock-import-avatar-filters').onclick = () => el('knock-import-avatar-filters-file').click();
+        el('knock-import-avatar-filters-file').addEventListener('change', async (e) => {
+            const file = e.target.files && e.target.files[0];
+            e.target.value = '';
+            if (!file) return;
+            try {
+                const added = importAvatarFilters(parseImportedAvatarFilters(await file.text()));
+                syncAvatarFilterButtons();
+                refreshAvatarFilterManager();
+                showToast(added ? `已匯入 ${added} 則` : '沒有新增（皆已存在或檔案為空）');
+            } catch (err) {
+                alert('匯入失敗：請使用本功能匯出的 JSON');
+            }
+        });
+        el('knock-avatar-filter-search').addEventListener('input', (e) => {
+            const term = e.target.value.toLowerCase();
+            document.querySelectorAll('.knock-avatar-filter-card').forEach(card => {
+                const hay = card.getAttribute('data-search') || '';
+                card.style.display = !term || hay.includes(term) ? 'flex' : 'none';
+            });
+        });
+    }
+
     function paintConvTabs() {
         const savedBtn = el('knock-tab-saved');
         const autoBtn = el('knock-tab-auto');
@@ -1952,12 +2176,14 @@
                 ${sorted.map(msg => {
                     const filterKey = msg.text || (msg.imageUrls && msg.imageUrls[0]) || '';
                     const showRemember = msg === firstOther && filterKey;
+                    const showAvatarRemember = msg === firstOther && msg.avatarUrl;
                     return `
                     <div data-knock-date="${escapeHtml(msg.date || messageDate(msg, conversation.startTime))}" style="display:flex;align-items:flex-start;gap:8px;flex-direction:${msg.isMyMessage ? 'row-reverse' : 'row'};margin-bottom:12px;">
-                        <div style="width:40px;height:40px;border-radius:50%;flex-shrink:0;background:#333;display:flex;align-items:center;justify-content:center;overflow:hidden;">
+                        <div style="width:40px;height:40px;border-radius:50%;flex-shrink:0;background:#333;display:flex;align-items:center;justify-content:center;overflow:visible;position:relative;">
                             ${msg.avatarUrl
-                                ? `<img src="${msg.avatarUrl}" style="width:100%;height:100%;object-fit:cover;" alt="avatar">`
+                                ? `<img src="${msg.avatarUrl}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;" alt="avatar">`
                                 : `<div style="color:#888;font-size:18px;">${msg.isMyMessage ? '我' : '對'}</div>`}
+                            ${showAvatarRemember ? `<button type="button" class="knock-remember-avatar-saved" data-avatar-url="${encodeURIComponent(msg.avatarUrl)}"></button>` : ''}
                         </div>
                         <div style="background:${msg.isMyMessage ? '#2d5a3d' : '#2d2d3d'};border-radius:8px;padding:8px 10px;max-width:70%;display:flex;align-items:flex-start;gap:8px;">
                             <div style="flex:1;min-width:0;">
@@ -1976,6 +2202,7 @@
             </div>
             </div>`, 10003, true);
         syncRememberButtons();
+        syncAvatarFilterButtons();
         el('knock-detail-close').onclick = () => detail.remove();
         el('knock-detail-copy').onclick = () => copyConversation(conversationId);
         el('knock-detail-delete').onclick = () => {
@@ -2012,6 +2239,28 @@
                 decodeURIComponent(rememberBtn.dataset.filterText || ''),
                 decodeURIComponent(rememberBtn.dataset.filterAvatar || '')
             );
+            return;
+        }
+        if (e.target.classList.contains('knock-remove-avatar-filter')) {
+            const url = decodeURIComponent(e.target.dataset.avatarUrl || '');
+            if (url) {
+                removeAvatarFilter(url);
+                syncAvatarFilterButtons();
+                refreshAvatarFilterManager();
+            }
+            return;
+        }
+        const avatarRememberBtn = e.target.closest?.('.knock-remember-avatar-saved');
+        if (avatarRememberBtn) {
+            toggleAvatarFilter(decodeURIComponent(avatarRememberBtn.dataset.avatarUrl || ''));
+            return;
+        }
+        if (e.target.id === 'knock-clear-avatar-filters') {
+            if (getAvatarFilters().length && confirm('確定清空全部大頭貼過濾？')) {
+                clearAvatarFilters();
+                syncAvatarFilterButtons();
+                refreshAvatarFilterManager();
+            }
             return;
         }
         if (e.target.id === 'knock-clear-first-filters') {
@@ -2060,6 +2309,7 @@
     setInterval(() => {
         maybeNotifyHintConnected();
         maybeLeaveOnFirstMessageFilter();
+        maybeLeaveOnAvatarFilter();
         tryForcedLeave();
         tryKeepAlive();
         checkForButtonAndClick();
@@ -2097,6 +2347,11 @@
             || parseHintWaitText('等待也想聊聊 感情 的人上線') !== '感情'
             || !isHintCode('早安') || isHintCode('感情')) {
             console.error('knock: 暗號等待判斷失敗');
+        }
+        if (normalizeAvatarFilter(' https://a/b.png ') !== 'https://a/b.png'
+            || normalizeAvatarFilter({ url: 'https://a/b.png' }) !== 'https://a/b.png'
+            || normalizeAvatarFilter('')) {
+            console.error('knock: 大頭貼過濾判斷失敗');
         }
     }
 
