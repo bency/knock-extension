@@ -1,13 +1,15 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.41
+// @version      1.4.51
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
+// @run-at       document-start
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=knock.tw
 // @updateURL    https://raw.githubusercontent.com/bency/knock-extension/main/auto_click.js
 // @downloadURL  https://raw.githubusercontent.com/bency/knock-extension/main/auto_click.js
+// @grant        unsafeWindow
 // @grant        GM.xmlHttpRequest
 // @grant        GM_xmlhttpRequest
 // @grant        GM_notification
@@ -36,6 +38,7 @@
     const AVATAR_FILTER_ENABLED_KEY = 'knockAvatarFilterEnabled';
     const BROWSER_NOTIFY_ENABLED_KEY = 'knockBrowserNotifyEnabled';
     const NTFY_ENABLED_KEY = 'knockNtfyEnabled';
+    const PARTNER_LABEL_KEY = 'knockPartnerLabels';
     const SAVED_CONV_KEY = 'knockSavedConversations';
     const AUTO_CONV_KEY = 'knockAutoConversations';
     const AUTO_CONV_MIN_MS = 50 * 1000;
@@ -57,7 +60,7 @@
     const HINT_CODE_KEY = 'knockHintCode';
     const HINT_NOTIFIED_KEY = 'knockHintConnectedNotified';
     const HINT_WAS_WAITING_KEY = 'knockHintWasWaiting';
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.41';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.51';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -129,7 +132,7 @@
     }
 
     function emptyConversation() {
-        return { id: null, messages: [], startTime: null, endTime: null, saved: false, promptShown: false, pinned: false };
+        return { id: null, messages: [], startTime: null, endTime: null, saved: false, promptShown: false, pinned: false, keepOrder: false, skipAdopt: false, partnerUid: null, label: '' };
     }
 
     // --- 狀態 ---
@@ -160,6 +163,8 @@
     let cooldownTick = null;
     let persistLiveTimer = null;
     let conversationManagerTab = 'auto';
+    let openFolderKeys = new Set();
+    let lastBoundAt = 0;
 
     // --- 對話生命週期 ---
     function saveProcessedIds() {
@@ -195,14 +200,92 @@
         return Math.abs(hash).toString(36);
     }
 
+    function newConvId() {
+        return 'conv_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+    }
+
+    function isChannelId(id) {
+        return !!id && !String(id).startsWith('conv_');
+    }
+
+    // ponytail: 只從頁面自己的 Listen 偷看 parent，用來當對話 id；不另開連線、不撈歷史
+    function extractChannelId(text) {
+        if (text == null) return null;
+        let raw = String(text);
+        try { raw = decodeURIComponent(raw); } catch (e) { /* 原文繼續掃 */ }
+        const re = /documents\/channels\/([A-Za-z0-9]+)/g;
+        let id = null, m;
+        while ((m = re.exec(raw))) id = m[1];
+        return id;
+    }
+
+    function bindChannel(id) {
+        if (!id || currentConversation.id === id) return;
+        if (isChannelId(currentConversation.id)) {
+            if (currentConversation.messages.length) persistLiveConversation();
+            initNewConversation();
+        }
+        const oldId = currentConversation.id;
+        currentConversation.id = id;
+        if (!currentConversation.startTime) currentConversation.startTime = new Date().toISOString();
+        const stored = findStoredConversation(id);
+        if (stored) {
+            currentConversation.pinned = currentConversation.pinned || stored.pinned
+                || getSavedConversations().some(c => c.id === id);
+            if (stored.startTime && stored.startTime < currentConversation.startTime) {
+                currentConversation.startTime = stored.startTime;
+            }
+            currentConversation.messages = mergeMessagesByHash(stored.messages, currentConversation.messages);
+            currentConversation.keepOrder = currentConversation.keepOrder || stored.keepOrder;
+            if (stored.partnerUid) currentConversation.partnerUid = stored.partnerUid;
+            if (stored.label) currentConversation.label = stored.label;
+            if (currentConversation.partnerUid && currentConversation.label) {
+                setPartnerLabel(currentConversation.partnerUid, currentConversation.label);
+            }
+        }
+        syncPastPartnerButton();
+        if (oldId && oldId.startsWith('conv_')) {
+            storageSet(AUTO_CONV_KEY, getAutoConversations().filter(c => c.id !== oldId));
+        }
+        lastBoundAt = Date.now();
+        persistLiveConversationSoon();
+        console.log('對話 channel:', id);
+    }
+
+    function hookFirestoreChannel() {
+        const xhr = (typeof unsafeWindow !== 'undefined' && unsafeWindow.XMLHttpRequest) || XMLHttpRequest;
+        const proto = xhr.prototype;
+        if (proto.__knockChannelHook) return;
+        proto.__knockChannelHook = true;
+        const origOpen = proto.open;
+        const origSend = proto.send;
+        proto.open = function (method, url) {
+            try { this.__knockUrl = String(url || ''); } catch (e) { /* 略 */ }
+            return origOpen.apply(this, arguments);
+        };
+        proto.send = function (body) {
+            try {
+                if (/firestore\.googleapis\.com/.test(this.__knockUrl || '')) {
+                    const id = extractChannelId(body);
+                    if (id) bindChannel(id);
+                }
+            } catch (e) { /* 略 */ }
+            return origSend.apply(this, arguments);
+        };
+    }
+
     function initNewConversation() {
+        if (Date.now() - lastBoundAt < 3000 && isChannelId(currentConversation.id)) {
+            console.log('沿用剛綁定的 channel:', currentConversation.id);
+            return;
+        }
         if (currentConversation.id && currentConversation.messages.length) {
             currentConversation.endTime = currentConversation.endTime || new Date().toISOString();
             persistLiveConversation();
         }
         currentConversation = {
             ...emptyConversation(),
-            id: 'conv_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9),
+            id: newConvId(),
             startTime: new Date().toISOString()
         };
         pendingForcedLeave = false;
@@ -219,6 +302,7 @@
         sessionStorage.removeItem(KEEP_ALIVE_AT_KEY);
         sessionStorage.removeItem(KEEP_ALIVE_WAIT_KEY);
         noteActivity();
+        syncPastPartnerButton();
         console.log('初始化新對話:', currentConversation.id);
     }
 
@@ -484,6 +568,93 @@
         return img ? img.src : null;
     }
 
+    // ponytail: 只讀頁面 MessageList 已帶的 sentBy。舊對話沒記過 uid 的對不到，要這次之後再遇到才會出現按鈕
+    function messageSentBy(messageLi) {
+        const key = Object.keys(messageLi).find(k => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance'));
+        const id = (String(messageLi.className || '').match(/message-li-(\S+)/) || [])[1];
+        let fiber = key ? messageLi[key] : null;
+        for (let n = 0; fiber && n < 16; n++, fiber = fiber.return) {
+            const msgs = fiber.memoizedProps && fiber.memoizedProps.messages;
+            if (!Array.isArray(msgs)) continue;
+            const msg = id ? msgs.find(m => m && m.id === id) : null;
+            if (msg && msg.sentBy) return String(msg.sentBy);
+        }
+        return '';
+    }
+
+    function notePartnerFromList() {
+        if (currentConversation.partnerUid) return;
+        const list = document.querySelector('ul[data-test="messages"]');
+        if (!list) return;
+        for (const li of list.querySelectorAll('li.message-li')) {
+            if (isMyMessageLi(li)) continue;
+            const uid = messageSentBy(li);
+            if (!uid) continue;
+            currentConversation.partnerUid = uid;
+            if (currentConversation.label) setPartnerLabel(uid, currentConversation.label);
+            syncPastPartnerButton();
+            paintPartnerCaption();
+            return;
+        }
+    }
+
+    function getPartnerLabels() {
+        const raw = storageGet(PARTNER_LABEL_KEY, {});
+        return raw && typeof raw === 'object' ? raw : {};
+    }
+
+    function partnerLabel(uid) {
+        if (!uid) return '';
+        return String(getPartnerLabels()[uid] || '').trim();
+    }
+
+    function setPartnerLabel(uid, name) {
+        if (!uid) return;
+        const labels = getPartnerLabels();
+        const n = String(name || '').trim().slice(0, 40);
+        if (!n) delete labels[uid];
+        else labels[uid] = n;
+        storageSet(PARTNER_LABEL_KEY, labels);
+    }
+
+    function currentPartnerName() {
+        return partnerLabel(currentConversation.partnerUid) || String(currentConversation.label || '').trim();
+    }
+
+    function paintPartnerCaption() {
+        const name = currentPartnerName();
+        const list = document.querySelector('ul[data-test="messages"]');
+        if (!list) return;
+        for (const li of list.querySelectorAll('li.message-li')) {
+            if (isMyMessageLi(li)) continue;
+            const avatar = li.querySelector('[data-test="user-avatar"]');
+            if (!avatar) continue;
+            const col = avatar.closest('.knock-avatar-col');
+            if (!name) {
+                if (!col) continue;
+                col.before(avatar);
+                col.remove();
+                continue;
+            }
+            let host = col;
+            if (!host) {
+                host = document.createElement('div');
+                host.className = 'knock-avatar-col';
+                host.style.cssText = 'display:flex;flex-direction:column;align-items:center;flex:0 0 auto;width:3em;max-width:4.2em;';
+                avatar.before(host);
+                host.appendChild(avatar);
+            }
+            let tag = host.querySelector('.knock-partner-name');
+            if (!tag) {
+                tag = document.createElement('div');
+                tag.className = 'knock-partner-name';
+                tag.style.cssText = 'margin-top:2px;font-size:10px;line-height:1.2;color:#ffb74d;text-align:center;word-break:break-all;max-width:4.2em;';
+                host.appendChild(tag);
+            }
+            if (tag.textContent !== name) tag.textContent = name;
+        }
+    }
+
     function getMessageText(messageDiv) {
         const timeEl = messageDiv.querySelector('span[data-test="date"]');
         if (!timeEl) return messageDiv.textContent.trim();
@@ -522,12 +693,29 @@
         return m ? Number(m[1]) * 60 + Number(m[2]) : null;
     }
 
+    function parseKnockDateLabel(timeStr, now = new Date()) {
+        if (!timeStr) return '';
+        if (timeStr.includes('前天')) return shiftYmd(-2, now);
+        if (timeStr.includes('昨天')) return shiftYmd(-1, now);
+        let m = /(\d{4})[/\-.](\d{1,2})[/\-.](\d{1,2})/.exec(timeStr);
+        if (m) return ymd(new Date(+m[1], +m[2] - 1, +m[3]));
+        m = /(\d{1,2})月(\d{1,2})日/.exec(timeStr);
+        if (m) {
+            const d = new Date(now.getFullYear(), +m[1] - 1, +m[2]);
+            if (d > now) d.setFullYear(d.getFullYear() - 1);
+            return ymd(d);
+        }
+        m = /(\d{1,2})\/(\d{1,2})/.exec(timeStr);
+        if (m && clockMinutesOnly(timeStr) == null) {
+            const d = new Date(now.getFullYear(), +m[1] - 1, +m[2]);
+            if (d > now) d.setFullYear(d.getFullYear() - 1);
+            return ymd(d);
+        }
+        return '';
+    }
+
     function dateFromKnockLabel(timeStr, now = new Date()) {
-        const d = new Date(now);
-        d.setHours(0, 0, 0, 0);
-        if (timeStr && timeStr.includes('前天')) d.setDate(d.getDate() - 2);
-        else if (timeStr && timeStr.includes('昨天')) d.setDate(d.getDate() - 1);
-        return ymd(d);
+        return parseKnockDateLabel(timeStr, now) || ymd(now);
     }
 
     function labelDayOffset(timeStr) {
@@ -559,21 +747,39 @@
         for (const li of list.querySelectorAll('li.message-li')) {
             const timeEl = li.querySelector('span[data-test="date"]');
             const timeStr = timeEl ? timeEl.textContent.trim() : '';
-            const clock = clockMinutesOnly(timeStr);
-            if (clock == null) continue;
-            rows.push({ li, clock, labeled: labelDayOffset(timeStr) });
+            if (!timeStr) continue;
+            rows.push({
+                li,
+                clock: clockMinutesOnly(timeStr),
+                labeled: labelDayOffset(timeStr),
+                parsedDate: parseKnockDateLabel(timeStr)
+            });
         }
-        const offsets = dayOffsetsFromNewest(rows);
+        const clocked = rows.filter(r => r.clock != null);
+        const offsets = dayOffsetsFromNewest(clocked.map(r => ({ clock: r.clock, labeled: r.labeled })));
         const dates = new Map();
-        rows.forEach((row, i) => dates.set(row.li, shiftYmd(-offsets[i])));
+        let i = 0;
+        for (const row of rows) {
+            if (row.clock != null) dates.set(row.li, shiftYmd(-offsets[i++]));
+            else if (row.parsedDate) dates.set(row.li, row.parsedDate);
+        }
         return dates;
     }
 
     function messageDate(msg, startTime) {
         if (msg.date) return msg.date;
-        if (/昨天|前天/.test(msg.timestamp || '')) return dateFromKnockLabel(msg.timestamp);
+        const parsed = parseKnockDateLabel(msg.timestamp);
+        if (parsed) return parsed;
         if (startTime) return ymd(new Date(startTime));
         return dateFromKnockLabel(msg.timestamp);
+    }
+
+    function messageContentKey(msg) {
+        return `${msg.text || ''}|${(msg.imageUrls || []).join(',')}|${!!msg.isMyMessage}`;
+    }
+
+    function hashMessage(text, imageUrls, isMyMessage, clockOrDate) {
+        return hashString(`${text || ''}|${(imageUrls || []).join(',')}|${!!isMyMessage}|${clockOrDate ?? ''}`);
     }
 
     function collectMessage(messageLi, date) {
@@ -583,14 +789,27 @@
         const isMyMessage = isMyMessageLi(messageLi);
         const timeElement = messageDiv.querySelector('span[data-test="date"]');
         const timestamp = timeElement ? timeElement.textContent.trim() : null;
-        date = date || '';
+        date = date || parseKnockDateLabel(timestamp) || '';
         const messageText = getMessageText(messageDiv);
         const imageUrls = getMessageImages(messageDiv);
         if (TYPING_RE.test(messageText)) return;
         if (!messageText && !imageUrls.length) return;
 
         const clock = clockMinutesOnly(timestamp);
-        const messageHash = hashString(`${messageText}|${imageUrls.join(',')}|${isMyMessage}|${clock ?? ''}`);
+        const content = `${messageText}|${imageUrls.join(',')}|${isMyMessage}`;
+        if (clock == null && timestamp) {
+            const existingByContent = currentConversation.messages.find(m =>
+                m.timestamp && `${m.text || ''}|${(m.imageUrls || []).join(',')}|${!!m.isMyMessage}` === content
+            );
+            if (existingByContent) {
+                if (date && existingByContent.date !== date) {
+                    existingByContent.date = date;
+                    persistLiveConversationSoon();
+                }
+                return;
+            }
+        }
+        const messageHash = hashMessage(messageText, imageUrls, isMyMessage, clock ?? date);
         const existing = currentConversation.messages.find(m => m.id === messageHash);
         if (existing) {
             if (date && existing.date !== date) {
@@ -636,7 +855,7 @@
         const list = storageGet(key, []);
         const snap = {
             ...conversation,
-            messages: sortMessages(conversation.messages.slice(), conversation.startTime),
+            messages: sortMessages(conversation.messages.slice(), conversation.startTime, conversation.keepOrder),
             endTime: conversation.endTime || new Date().toISOString()
         };
         const i = list.findIndex(c => c.id === conversation.id);
@@ -705,6 +924,62 @@
         return Array.from(map.values());
     }
 
+    function collectOnScreenMessages() {
+        const list = document.querySelector('ul[data-test="messages"]');
+        if (!list) return [];
+        const dateByLi = listMessageDates(list);
+        const messages = [];
+        for (const li of list.querySelectorAll('li.message-li')) {
+            const messageDiv = li.querySelector('div[data-test="message"]');
+            if (!messageDiv) continue;
+            const text = getMessageText(messageDiv);
+            const imageUrls = getMessageImages(messageDiv);
+            if (TYPING_RE.test(text) || (!text && !imageUrls.length)) continue;
+            const timeEl = messageDiv.querySelector('span[data-test="date"]');
+            const timestamp = timeEl ? timeEl.textContent.trim() : null;
+            const date = dateByLi.get(li) || parseKnockDateLabel(timestamp) || '';
+            const clock = clockMinutesOnly(timestamp);
+            const isMy = isMyMessageLi(li);
+            messages.push({
+                id: hashMessage(text, imageUrls, isMy, clock ?? date ?? `seq${messages.length}`),
+                text,
+                imageUrls,
+                isMyMessage: isMy,
+                avatarUrl: getAvatarUrl(li),
+                timestamp,
+                date,
+                seq: messages.length,
+                collectedAt: new Date().toISOString()
+            });
+        }
+        return messages;
+    }
+
+    function snapshotOnScreenConversation() {
+        const messages = collectOnScreenMessages();
+        if (!messages.length) {
+            showToast('畫面上沒有對話');
+            return false;
+        }
+        const id = isChannelId(currentConversation.id) ? currentConversation.id : newConvId();
+        const startTime = (id === currentConversation.id && currentConversation.startTime)
+            ? currentConversation.startTime
+            : new Date().toISOString();
+        currentConversation = {
+            ...emptyConversation(),
+            id,
+            startTime,
+            messages,
+            keepOrder: true,
+            skipAdopt: true
+        };
+        notePartnerFromList();
+        upsertConversationList(AUTO_CONV_KEY, currentConversation, 200);
+        console.log('依畫面順序重建對話:', currentConversation.id, messages.length);
+        showToast(`已依畫面順序重建 ${messages.length} 則訊息`);
+        return true;
+    }
+
     function adoptOverlappingConversation() {
         const found = findConversationByHashes(currentConversation.messages);
         if (!found || found.id === currentConversation.id) return;
@@ -715,6 +990,7 @@
             currentConversation.startTime = found.startTime;
         }
         currentConversation.messages = mergeMessagesByHash(found.messages, currentConversation.messages);
+        if (!currentConversation.partnerUid && found.partnerUid) currentConversation.partnerUid = found.partnerUid;
         console.log('同一對話（訊息 hash 重疊），合併到', found.id);
     }
 
@@ -727,15 +1003,16 @@
 
     function persistLiveConversation() {
         if (!currentConversation.id || !currentConversation.messages.length) return;
-        adoptOverlappingConversation();
+        const byChannel = isChannelId(currentConversation.id);
+        if (!currentConversation.skipAdopt && !byChannel) adoptOverlappingConversation();
         if (currentConversation.pinned) {
             upsertConversationList(SAVED_CONV_KEY, currentConversation, 100);
-            dropOverlappingAutoDuplicates();
+            if (!currentConversation.skipAdopt && !byChannel) dropOverlappingAutoDuplicates();
             return;
         }
         if (conversationDurationMs(currentConversation) < AUTO_CONV_MIN_MS) return;
         upsertConversationList(AUTO_CONV_KEY, currentConversation, 200);
-        dropOverlappingAutoDuplicates();
+        if (!currentConversation.skipAdopt && !byChannel) dropOverlappingAutoDuplicates();
     }
 
     function persistLiveConversationSoon() {
@@ -1312,6 +1589,8 @@
         }
         if (messageElements.length) notificationsArmed = true;
 
+        notePartnerFromList();
+        paintPartnerCaption();
         decorateOtherMessages();
         checkConversationEnd();
     }
@@ -1460,6 +1739,81 @@
         return keepAliveWaitMs;
     }
 
+    function pastTalks(conversations, uid, currentId) {
+        if (!uid) return [];
+        return conversations
+            .filter(c => c && c.partnerUid === uid && c.id !== currentId && (c.messages || []).length)
+            .sort((a, b) => String(b.endTime || b.startTime || '').localeCompare(String(a.endTime || a.startTime || '')));
+    }
+
+    function pastPartnerConversations() {
+        const seen = new Set();
+        const all = [];
+        for (const c of [...getSavedConversations(), ...getAutoConversations()]) {
+            if (!c || seen.has(c.id)) continue;
+            seen.add(c.id);
+            all.push(c);
+        }
+        return pastTalks(all, currentConversation.partnerUid, currentConversation.id);
+    }
+
+    function syncPastPartnerButton() {
+        const btn = el('knock-past-partner');
+        if (!btn) return;
+        const uid = currentConversation.partnerUid || '';
+        const key = `${currentConversation.id || ''}|${uid}`;
+        if (btn.dataset.pastKey === key) return;
+        btn.dataset.pastKey = key;
+        const past = pastPartnerConversations();
+        btn.style.display = past.length ? 'flex' : 'none';
+        const label = btn.querySelector('span');
+        if (label) label.textContent = past.length > 1 ? `之前的對話（${past.length}）` : '之前的對話';
+    }
+
+    function pastMessageBubbles(conversation) {
+        const sorted = sortMessages(conversation.messages, conversation.startTime, conversation.keepOrder);
+        return sorted.map(msg => `
+            <div style="display:flex;align-items:flex-start;gap:8px;flex-direction:${msg.isMyMessage ? 'row-reverse' : 'row'};margin-bottom:12px;">
+                <div style="width:40px;height:40px;border-radius:50%;flex-shrink:0;background:#333;overflow:hidden;display:flex;align-items:center;justify-content:center;">
+                    ${msg.avatarUrl
+                        ? `<img src="${escapeHtml(msg.avatarUrl)}" alt="" style="width:100%;height:100%;object-fit:cover;">`
+                        : `<div style="color:#888;font-size:18px;">${msg.isMyMessage ? '我' : '對'}</div>`}
+                </div>
+                <div style="background:${msg.isMyMessage ? '#2d5a3d' : '#2d2d3d'};border-radius:8px;padding:8px 10px;max-width:70%;">
+                    ${msg.text ? `<div style="font-size:14px;line-height:1.4;word-wrap:break-word;">${escapeHtml(msg.text)}</div>` : ''}
+                    ${(msg.imageUrls || []).map(src => `
+                        <a href="${escapeHtml(src)}" target="_blank" rel="noreferrer">
+                            <img src="${escapeHtml(src)}" alt="圖片" style="max-width:180px;max-height:240px;border-radius:6px;display:block;margin-top:6px;">
+                        </a>`).join('')}
+                    ${msg.timestamp ? `<div style="font-size:11px;color:rgba(255,255,255,0.5);margin-top:4px;">${escapeHtml(formatMessageStamp(msg))}</div>` : ''}
+                </div>
+            </div>`).join('');
+    }
+
+    function showPastPartnerConversations() {
+        const past = pastPartnerConversations();
+        if (!past.length) {
+            showToast('沒有這位的舊對話');
+            return;
+        }
+        const panel = toggleOverlay('knock-past-partner-view', () => makeOverlay('knock-past-partner-view', 800, `
+            <div style="flex-shrink:0;display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;">
+                <h2 style="margin:0;font-size:20px;">之前的對話${past.length > 1 ? `（${past.length}）` : ''}</h2>
+                <button id="knock-past-close" style="${cssBtn('#444')}">關閉</button>
+            </div>
+            <div style="flex:1;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:20px;">
+                ${past.map(conversation => {
+                    const startDate = getMessageTime(conversation, true);
+                    return `<section>
+                        <div style="font-size:13px;color:#888;margin-bottom:12px;">${startDate.toLocaleString('zh-TW')} · ${conversation.messages.length} 條訊息</div>
+                        ${pastMessageBubbles(conversation)}
+                    </section>`;
+                }).join('')}
+            </div>`, 10004, true));
+        if (!panel) return;
+        el('knock-past-close').onclick = () => panel.remove();
+    }
+
     function createDock() {
         if (el('knock-dock')) return;
         OLD_FLOAT_IDS.forEach(id => el(id)?.remove());
@@ -1545,6 +1899,14 @@
         const convBtn = dockRow('<span>對話記錄</span>', { button: true });
         convBtn.addEventListener('click', (e) => { e.stopPropagation(); createConversationManager(); });
 
+        const rebuildBtn = dockRow('<span>重建此對話</span>', { button: true });
+        rebuildBtn.addEventListener('click', (e) => { e.stopPropagation(); snapshotOnScreenConversation(); });
+
+        const pastBtn = dockRow('<span>之前的對話</span>', { button: true });
+        pastBtn.id = 'knock-past-partner';
+        pastBtn.style.display = 'none';
+        pastBtn.addEventListener('click', (e) => { e.stopPropagation(); showPastPartnerConversations(); });
+
         const filterRow = dockRow(
             `<span>發語詞過濾</span><span id="knock-filter-count" style="background:#ff9800;border-radius:10px;padding:0 6px;font-size:12px;min-width:1.2em;text-align:center;">${getNormalizedFilters().length}</span>`
         );
@@ -1579,7 +1941,7 @@
         }, true);
         ntfyRow.addEventListener('click', (e) => { e.stopPropagation(); createNtfySettings(); });
 
-        body.append(autoRow, keepWrap, filterRow, avatarRow, browserRow, ntfyRow, convBtn);
+        body.append(autoRow, keepWrap, filterRow, avatarRow, browserRow, ntfyRow, convBtn, rebuildBtn, pastBtn);
 
         const paintOpen = () => {
             body.style.display = open ? 'flex' : 'none';
@@ -1599,6 +1961,7 @@
         dock.append(header, body);
         document.body.appendChild(dock);
         paintOpen();
+        syncPastPartnerButton();
     }
 
     // --- 持續連線 ---
@@ -1745,27 +2108,39 @@
         return rem > 0 ? `${min} 分鐘 ${rem} 秒` : `${min} 分鐘`;
     }
 
-    // 沒時間的是開頭；其餘依收集時寫入的日期 + 鐘點
-    function sortMessages(messages, startTime) {
+    // 沒時間的是開頭；其餘依收集時寫入的日期 + 鐘點。keepOrder 則照畫面 seq
+    function sortMessages(messages, startTime, keepOrder) {
+        if (keepOrder) {
+            return (messages || []).slice().sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+        }
         return messages
             .map((msg, index) => ({ msg, index }))
             .sort((a, b) => {
+                const aOpen = !a.msg.timestamp;
+                const bOpen = !b.msg.timestamp;
+                if (aOpen && bOpen) return a.index - b.index;
+                if (aOpen) return -1;
+                if (bOpen) return 1;
                 const ca = clockMinutesOnly(a.msg.timestamp);
                 const cb = clockMinutesOnly(b.msg.timestamp);
-                if (ca == null && cb == null) return a.index - b.index;
-                if (ca == null) return -1;
-                if (cb == null) return 1;
                 const da = messageDate(a.msg, startTime);
                 const db = messageDate(b.msg, startTime);
                 if (da !== db) return da < db ? -1 : 1;
-                if (ca !== cb) return ca - cb;
+                if (ca != null && cb != null && ca !== cb) return ca - cb;
                 return a.index - b.index;
             })
             .map(x => x.msg);
     }
 
+    function formatMessageStamp(msg) {
+        if (!msg.timestamp) return '';
+        if (clockMinutesOnly(msg.timestamp) == null) return msg.timestamp;
+        const day = msg.date ? `${msg.date.slice(5).replace('-', '/')} ` : '';
+        return day + msg.timestamp;
+    }
+
     function formatConversationForCopy(conversation) {
-        return sortMessages(conversation.messages, conversation.startTime).map(msg => {
+        return sortMessages(conversation.messages, conversation.startTime, conversation.keepOrder).map(msg => {
             const speaker = msg.isMyMessage ? '我　' : '對方';
             const content = [msg.text, ...(msg.imageUrls || [])].filter(Boolean).join(' ') || '[圖片]';
             return `${speaker}：${content} （${msg.timestamp || '未知時間'}）`;
@@ -1826,7 +2201,7 @@
         const startDate = getMessageTime(conversation, true);
         const endDate = getMessageTime(conversation, false);
         const durationText = formatDuration(startDate, endDate);
-        const preview = sortMessages(conversation.messages, conversation.startTime).slice(0, 3).map(msg => {
+        const preview = sortMessages(conversation.messages, conversation.startTime, conversation.keepOrder).slice(0, 3).map(msg => {
             const text = messagePreviewText(msg);
             return (msg.isMyMessage ? '我: ' : '對方: ') + text.substring(0, 50) + (text.length > 50 ? '...' : '');
         }).join('<br>');
@@ -1844,7 +2219,8 @@
                                 <div style="font-size:12px;color:#666;">${conversation.messages.length} 條訊息</div>
                             </div>
                             <div style="display:flex;gap:8px;">
-                                ${conversationManagerTab === 'auto' ? `<button class="knock-pin-btn" data-conv-id="${conversation.id}" style="${cssBtn('#4CAF50', 'padding:6px 12px;border-radius:4px;font-size:12px;')}">儲存</button>` : ''}
+                                <button class="knock-name-btn" data-conv-id="${conversation.id}" style="${cssBtn('#ff9800', 'padding:6px 12px;border-radius:4px;font-size:12px;')}">命名</button>
+                                ${!getSavedConversations().some(c => c.id === conversation.id) ? `<button class="knock-pin-btn" data-conv-id="${conversation.id}" style="${cssBtn('#4CAF50', 'padding:6px 12px;border-radius:4px;font-size:12px;')}">儲存</button>` : ''}
                                 <button class="knock-copy-btn" data-conv-id="${conversation.id}" style="${cssBtn('#2196F3', 'padding:6px 12px;border-radius:4px;font-size:12px;')}">複製</button>
                             </div>
                         </div>
@@ -2064,14 +2440,100 @@
         autoBtn.textContent = `自動儲存（${getAutoConversations().length}）`;
     }
 
+    function conversationDisplayName(conv) {
+        if (!conv) return '';
+        return (conv.partnerUid && partnerLabel(conv.partnerUid)) || String(conv.label || '').trim();
+    }
+
+    function folderGroups(conversations, labels) {
+        const order = [];
+        const seen = new Map();
+        for (const conv of conversations || []) {
+            const uid = conv.partnerUid || '';
+            const name = (uid && labels[uid]) || (!uid && conv.label) || '';
+            if (!name) {
+                order.push({ type: 'loose', conv });
+                continue;
+            }
+            const key = uid || `solo:${conv.id}`;
+            let folder = seen.get(key);
+            if (!folder) {
+                folder = { key, name, items: [] };
+                seen.set(key, folder);
+                order.push({ type: 'folder', folder });
+            }
+            folder.items.push(conv);
+        }
+        return order;
+    }
+
+    function createFolderBlock(folder) {
+        const items = folder.items.slice().sort((a, b) =>
+            String(b.endTime || b.startTime || '').localeCompare(String(a.endTime || a.startTime || '')));
+        const open = openFolderKeys.has(folder.key);
+        const key = encodeURIComponent(folder.key);
+        return `<div class="knock-folder" data-folder-key="${key}" style="background:#1a1a1a;border:1px solid #444;border-radius:8px;padding:12px;">
+            <div style="display:flex;align-items:center;gap:8px;">
+                <button type="button" class="knock-folder-toggle" data-folder-key="${key}" style="${cssBtn('#333', 'flex:1;text-align:left;font-size:15px;')}">${open ? '▾' : '▸'} ${escapeHtml(folder.name)}（${items.length}）</button>
+                <button type="button" class="knock-name-btn" data-conv-id="${items[0].id}" style="${cssBtn('#ff9800', 'padding:6px 12px;border-radius:4px;font-size:12px;flex-shrink:0;')}">命名</button>
+            </div>
+            <div class="knock-folder-body" style="display:${open ? 'flex' : 'none'};flex-direction:column;gap:12px;margin-top:12px;">
+                ${items.map(createConversationCard).join('')}
+            </div>
+        </div>`;
+    }
+
+    function writeConversationLabel(conversationId, name) {
+        const apply = (key) => {
+            const list = storageGet(key, []);
+            const i = list.findIndex(c => c && c.id === conversationId);
+            if (i < 0) return;
+            list[i] = { ...list[i], label: name };
+            storageSet(key, list);
+        };
+        apply(SAVED_CONV_KEY);
+        apply(AUTO_CONV_KEY);
+        if (currentConversation.id === conversationId) currentConversation.label = name;
+    }
+
+    function nameConversation(conversationId) {
+        const conv = findStoredConversation(conversationId)
+            || (currentConversation.id === conversationId ? currentConversation : null);
+        if (!conv) {
+            alert('找不到此對話');
+            return;
+        }
+        const uid = conv.partnerUid || (currentConversation.id === conversationId ? currentConversation.partnerUid : '');
+        const current = (uid && partnerLabel(uid)) || conv.label || (currentConversation.id === conversationId ? currentConversation.label : '') || '';
+        const next = prompt('替這位命名。再遇到會收進同一個資料夾；空白表示清除。', current);
+        if (next == null) return;
+        const name = next.trim().slice(0, 40);
+        if (uid) setPartnerLabel(uid, name);
+        writeConversationLabel(conversationId, name);
+        if (currentConversation.id === conversationId || (uid && currentConversation.partnerUid === uid)) {
+            currentConversation.label = name;
+            paintPartnerCaption();
+        }
+        renderConversationList();
+        const title = el('knock-detail-title');
+        if (title && el('knock-conversation-detail')) title.textContent = name || title.dataset.plain || title.textContent;
+        showToast(name ? `已命名為 ${name}` : '已清除命名');
+    }
+
     function renderConversationList() {
         const listEl = el('knock-conversations-list');
         if (!listEl) return;
         const list = conversationManagerTab === 'saved' ? getSavedConversations() : getAutoConversations();
+        const other = conversationManagerTab === 'saved' ? getAutoConversations() : getSavedConversations();
+        const labels = getPartnerLabels();
+        const namedUids = new Set(list.map(c => c.partnerUid).filter(uid => uid && labels[uid]));
+        const seen = new Set(list.map(c => c.id));
+        const merged = list.concat(other.filter(c => c && namedUids.has(c.partnerUid) && !seen.has(c.id)));
         const empty = conversationManagerTab === 'saved' ? '尚無已儲存的對話' : '尚無自動儲存的對話';
+        const order = folderGroups(merged, labels);
         listEl.innerHTML = list.length === 0
             ? `<div style="text-align:center;padding:40px;color:#888;">${empty}</div>`
-            : list.map(createConversationCard).join('');
+            : order.map(item => item.type === 'folder' ? createFolderBlock(item.folder) : createConversationCard(item.conv)).join('');
         paintConvTabs();
         const all = el('knock-conv-select-all');
         if (all) all.checked = false;
@@ -2136,7 +2598,17 @@
             }
         };
         el('knock-search-input').addEventListener('input', (e) => {
-            filterCardsByTerm('#knock-conversations-list .knock-conv-card', e.target.value.toLowerCase(), 'block');
+            const q = e.target.value.toLowerCase();
+            document.querySelectorAll('#knock-conversations-list .knock-folder').forEach(folder => {
+                const body = folder.querySelector('.knock-folder-body');
+                const key = decodeURIComponent(folder.dataset.folderKey || '');
+                const hit = !q || folder.textContent.toLowerCase().includes(q);
+                folder.style.display = hit ? 'block' : 'none';
+                if (body) body.style.display = q ? (hit ? 'flex' : 'none') : (openFolderKeys.has(key) ? 'flex' : 'none');
+            });
+            document.querySelectorAll('#knock-conversations-list > .knock-conv-card').forEach(card => {
+                card.style.display = !q || card.textContent.toLowerCase().includes(q) ? 'block' : 'none';
+            });
         });
     }
 
@@ -2151,14 +2623,15 @@
         const startDate = getMessageTime(conversation, true);
         const endDate = getMessageTime(conversation, false);
         const durationText = formatDuration(startDate, endDate);
-        const sorted = sortMessages(conversation.messages, conversation.startTime);
+        const sorted = sortMessages(conversation.messages, conversation.startTime, conversation.keepOrder);
         const firstOther = sorted.find(m => !m.isMyMessage && !m.timestamp);
         el('knock-conversation-detail')?.remove();
         const detail = makeOverlay('knock-conversation-detail', 800, `
             <div style="flex-shrink:0;display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;flex-wrap:wrap;">
-                <h2 style="margin:0;font-size:20px;">${isAuto ? '自動儲存' : '已儲存'}對話</h2>
+                <h2 id="knock-detail-title" data-plain="${isAuto ? '自動儲存對話' : '已儲存對話'}" style="margin:0;font-size:20px;">${escapeHtml(conversationDisplayName(conversation) || (isAuto ? '自動儲存對話' : '已儲存對話'))}</h2>
                 <div style="display:flex;gap:8px;flex-wrap:wrap;">
                     ${isAuto ? `<button id="knock-detail-pin" style="${cssBtn('#4CAF50')}">移到已儲存</button>` : ''}
+                    <button id="knock-detail-name" style="${cssBtn('#ff9800')}">命名</button>
                     <button id="knock-detail-copy" style="${cssBtn('#2196F3')}">複製</button>
                     <button id="knock-detail-delete" style="${cssBtn('#d32f2f')}">刪除</button>
                     <button id="knock-detail-close" style="${cssBtn('#444')}">關閉</button>
@@ -2194,7 +2667,7 @@
                                     </a>`).join('')}
                                 ${!msg.text && !(msg.imageUrls || []).length ? `<div style="color:#888;font-size:13px;">（空訊息）</div>` : ''}
                             </div>
-                            ${msg.timestamp ? `<div style="font-size:11px;color:rgba(255,255,255,0.5);flex-shrink:0;white-space:nowrap;">${msg.date ? `${msg.date.slice(5).replace('-', '/')} ` : ''}${msg.timestamp}</div>` : ''}
+                            ${msg.timestamp ? `<div style="font-size:11px;color:rgba(255,255,255,0.5);flex-shrink:0;white-space:nowrap;">${escapeHtml(formatMessageStamp(msg))}</div>` : ''}
                             ${showRemember ? `<button type="button" class="knock-remember-first-saved" data-filter-text="${encodeURIComponent(filterKey)}" data-filter-avatar="${encodeURIComponent(avatarHashOf(msg.avatarUrl))}"></button>` : ''}
                         </div>
                     </div>`;
@@ -2204,6 +2677,7 @@
         syncRememberButtons();
         syncAvatarFilterButtons();
         el('knock-detail-close').onclick = () => detail.remove();
+        el('knock-detail-name').onclick = () => nameConversation(conversationId);
         el('knock-detail-copy').onclick = () => copyConversation(conversationId);
         el('knock-detail-delete').onclick = () => {
             if (confirm('確定刪除這則對話？') && deleteConversations([conversationId])) {
@@ -2223,6 +2697,19 @@
     }
 
     document.addEventListener('click', (e) => {
+        const folderBtn = e.target.closest?.('.knock-folder-toggle');
+        if (folderBtn) {
+            const key = decodeURIComponent(folderBtn.dataset.folderKey || '');
+            if (openFolderKeys.has(key)) openFolderKeys.delete(key);
+            else openFolderKeys.add(key);
+            renderConversationList();
+            return;
+        }
+        const nameBtn = e.target.closest?.('.knock-name-btn');
+        if (nameBtn) {
+            nameConversation(nameBtn.getAttribute('data-conv-id'));
+            return;
+        }
         if (e.target.classList.contains('knock-remove-first-filter')) {
             const text = decodeURIComponent(e.target.dataset.filterText || '');
             const avatarHash = decodeURIComponent(e.target.dataset.filterAvatar || '');
@@ -2288,6 +2775,8 @@
     });
 
     // --- 啟動 ---
+    hookFirestoreChannel();
+
     function mountChrome() {
         if (!document.body) return;
         OLD_FLOAT_IDS.forEach(id => el(id)?.remove());
@@ -2352,6 +2841,41 @@
             || normalizeAvatarFilter({ url: 'https://a/b.png' }) !== 'https://a/b.png'
             || normalizeAvatarFilter('')) {
             console.error('knock: 大頭貼過濾判斷失敗');
+        }
+        const dayNow = new Date(2026, 8, 20, 12, 0, 0);
+        if (parseKnockDateLabel('9/19', dayNow) !== '2026-09-19'
+            || parseKnockDateLabel('昨天', dayNow) !== '2026-09-19'
+            || parseKnockDateLabel('9月19日', dayNow) !== '2026-09-19'
+            || clockMinutesOnly('9/19') != null) {
+            console.error('knock: 日期標籤解析失敗');
+        }
+        if (sortMessages([{ seq: 1, text: 'b' }, { seq: 0, text: 'a' }], null, true).map(m => m.text).join() !== 'a,b') {
+            console.error('knock: 畫面順序重建失敗');
+        }
+        const encodedParent = 'req0___data__=%7B%22parent%22%3A%22projects%2Fknocktalk-prod%2Fdatabases%2F(default)%2Fdocuments%2Fchannels%2FekVlFOyWwL9KlwjaDgj6%22%7D';
+        if (extractChannelId(encodedParent) !== 'ekVlFOyWwL9KlwjaDgj6' || isChannelId('conv_1') || !isChannelId('ekVlFOyWwL9KlwjaDgj6')) {
+            console.error('knock: channel id 解析失敗');
+        }
+        const talks = pastTalks([
+            { id: 'a', partnerUid: 'u1', messages: [{}], endTime: '2026-01-01' },
+            { id: 'b', partnerUid: 'u1', messages: [{}], endTime: '2026-02-01' },
+            { id: 'c', partnerUid: 'u2', messages: [{}] },
+            { id: 'd', partnerUid: 'u1', messages: [] }
+        ], 'u1', 'a');
+        if (talks.length !== 1 || talks[0].id !== 'b' || pastTalks(talks, '', 'a').length) {
+            console.error('knock: 舊對象比對失敗');
+        }
+        const grouped = folderGroups([
+            { id: 'a', partnerUid: 'u1', endTime: '2026-02-01' },
+            { id: 'b', partnerUid: 'u1', endTime: '2026-01-01' },
+            { id: 'c', partnerUid: 'u2' },
+            { id: 'd', label: '路人' },
+            { id: 'e' }
+        ], { u1: '阿明' });
+        if (grouped.length !== 4 || grouped[0].type !== 'folder' || grouped[0].folder.items.length !== 2
+            || grouped[0].folder.name !== '阿明' || grouped[1].conv.id !== 'c'
+            || grouped[2].folder.key !== 'solo:d' || grouped[3].conv.id !== 'e') {
+            console.error('knock: 命名資料夾分組失敗');
         }
     }
 
