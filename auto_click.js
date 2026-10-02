@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.51
+// @version      1.4.52
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -14,6 +14,7 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_notification
 // @connect      ntfy.sh
+// @connect      *
 // ==/UserScript==
 
 (function() {
@@ -60,7 +61,7 @@
     const HINT_CODE_KEY = 'knockHintCode';
     const HINT_NOTIFIED_KEY = 'knockHintConnectedNotified';
     const HINT_WAS_WAITING_KEY = 'knockHintWasWaiting';
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.51';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.52';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -165,6 +166,7 @@
     let conversationManagerTab = 'auto';
     let openFolderKeys = new Set();
     let lastBoundAt = 0;
+    const imageEncodeJobs = new Set();
 
     // --- 對話生命週期 ---
     function saveProcessedIds() {
@@ -782,6 +784,116 @@
         return hashString(`${text || ''}|${(imageUrls || []).join(',')}|${!!isMyMessage}|${clockOrDate ?? ''}`);
     }
 
+    function stableImageKey(url) {
+        const s = String(url || '');
+        if (!s || s.startsWith('data:')) return '';
+        return s.split('#')[0].split('?')[0];
+    }
+
+    function imageMessageSig(msg) {
+        const keys = (msg.imageKeys && msg.imageKeys.length)
+            ? msg.imageKeys
+            : (msg.imageUrls || []).map(stableImageKey).filter(Boolean);
+        if (!keys.length) return '';
+        return `${msg.text || ''}|${keys.join(',')}|${!!msg.isMyMessage}|${clockMinutesOnly(msg.timestamp) ?? ''}`;
+    }
+
+    function dropDuplicateImages(messages) {
+        const best = new Map();
+        const out = [];
+        for (const m of messages || []) {
+            const sig = imageMessageSig(m);
+            if (!sig) {
+                out.push(m);
+                continue;
+            }
+            const prev = best.get(sig);
+            if (!prev) {
+                best.set(sig, m);
+                out.push(m);
+                continue;
+            }
+            const prevData = (prev.imageUrls || []).some(u => String(u).startsWith('data:'));
+            const nextData = (m.imageUrls || []).some(u => String(u).startsWith('data:'));
+            if (!prevData && nextData) {
+                out[out.indexOf(prev)] = m;
+                best.set(sig, m);
+            }
+        }
+        return out;
+    }
+
+    function gmRequest(details) {
+        const xhr = typeof GM_xmlhttpRequest === 'function'
+            ? GM_xmlhttpRequest
+            : (typeof GM !== 'undefined' && GM.xmlHttpRequest);
+        if (!xhr) return Promise.reject(new Error('no gm xhr'));
+        return new Promise((resolve, reject) => {
+            xhr({
+                ...details,
+                onload: resolve,
+                onerror: () => reject(new Error('gm xhr')),
+                ontimeout: () => reject(new Error('gm xhr timeout'))
+            });
+        });
+    }
+
+    async function fetchImageBlob(url) {
+        try {
+            const res = await fetch(url, { credentials: 'omit' });
+            if (res.ok) {
+                const blob = await res.blob();
+                if (blob && blob.size) return blob;
+            }
+        } catch (e) { /* 改走 GM，避開圖片 CDN 的 CORS */ }
+        const res = await gmRequest({ method: 'GET', url, responseType: 'blob' });
+        if (!res || res.status !== 200 || !res.response) throw new Error('image');
+        return res.response;
+    }
+
+    async function blobToDataUrl(blob) {
+        // ponytail: 超過約 400KB 才縮成寬 960 的 jpeg，避免 localStorage 寫不進去
+        if (blob.size > 400 * 1024 && typeof createImageBitmap === 'function') {
+            try {
+                const bitmap = await createImageBitmap(blob);
+                const scale = Math.min(1, 960 / bitmap.width);
+                const canvas = document.createElement('canvas');
+                canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+                canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+                canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+                if (bitmap.close) bitmap.close();
+                return canvas.toDataURL('image/jpeg', 0.8);
+            } catch (e) { /* 改存原圖 */ }
+        }
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result);
+            reader.onerror = () => reject(reader.error);
+            reader.readAsDataURL(blob);
+        });
+    }
+
+    function attachImages(message, urls) {
+        const keys = (urls || []).map(stableImageKey).filter(Boolean);
+        if (keys.length) message.imageKeys = keys;
+        const needs = (urls || []).filter(u => u && !String(u).startsWith('data:'));
+        if (!needs.length || !message.id) return;
+        const job = `${message.id}|${keys.join(',')}`;
+        if (imageEncodeJobs.has(job)) return;
+        imageEncodeJobs.add(job);
+        Promise.all(needs.map(async (url) => {
+            try { return await blobToDataUrl(await fetchImageBlob(url)); }
+            catch (e) { return url; }
+        })).then(dataUrls => {
+            imageEncodeJobs.delete(job);
+            if (!dataUrls.some(u => String(u).startsWith('data:'))) return;
+            const msg = currentConversation.messages.find(m => m.id === message.id) || message;
+            msg.imageUrls = dataUrls;
+            msg.imageKeys = keys;
+            persistLiveConversationSoon();
+        });
+    }
+
     function collectMessage(messageLi, date) {
         const messageDiv = messageLi.querySelector('div[data-test="message"]');
         if (!messageDiv) return;
@@ -796,7 +908,28 @@
         if (!messageText && !imageUrls.length) return;
 
         const clock = clockMinutesOnly(timestamp);
-        const content = `${messageText}|${imageUrls.join(',')}|${isMyMessage}`;
+        const domId = (String(messageLi.className || '').match(/message-li-(\S+)/) || [])[1] || '';
+        const imageKeys = imageUrls.map(stableImageKey).filter(Boolean);
+        const imageSig = imageKeys.length
+            ? `${messageText}|${imageKeys.join(',')}|${isMyMessage}|${clock ?? ''}`
+            : '';
+        if (imageSig) {
+            const existingImg = currentConversation.messages.find(m =>
+                (domId && (m.domId === domId || m.id === domId)) || imageMessageSig(m) === imageSig
+            );
+            if (existingImg) {
+                if (domId) existingImg.domId = domId;
+                existingImg.imageKeys = imageKeys;
+                if (date && existingImg.date !== date) existingImg.date = date;
+                currentConversation.messages = dropDuplicateImages(currentConversation.messages);
+                const kept = currentConversation.messages.find(m =>
+                    (domId && (m.domId === domId || m.id === domId)) || imageMessageSig(m) === imageSig
+                ) || existingImg;
+                attachImages(kept, imageUrls);
+                return;
+            }
+        }
+        const content = `${messageText}|${imageKeys.join(',')}|${isMyMessage}`;
         if (clock == null && timestamp) {
             const existingByContent = currentConversation.messages.find(m =>
                 m.timestamp && `${m.text || ''}|${(m.imageUrls || []).join(',')}|${!!m.isMyMessage}` === content
@@ -809,28 +942,37 @@
                 return;
             }
         }
-        const messageHash = hashMessage(messageText, imageUrls, isMyMessage, clock ?? date);
+        const messageHash = imageKeys.length
+            ? (domId || hashMessage(messageText, imageKeys, isMyMessage, clock ?? date))
+            : hashMessage(messageText, [], isMyMessage, clock ?? date);
         const existing = currentConversation.messages.find(m => m.id === messageHash);
         if (existing) {
+            if (domId) existing.domId = domId;
+            if (imageKeys.length) existing.imageKeys = imageKeys;
             if (date && existing.date !== date) {
                 existing.date = date;
                 persistLiveConversationSoon();
             }
+            if (imageKeys.length) attachImages(existing, imageUrls);
             return;
         }
 
-        currentConversation.messages.push({
+        const message = {
             id: messageHash,
             text: messageText,
             imageUrls,
+            imageKeys,
+            domId,
             isMyMessage,
             avatarUrl: getAvatarUrl(messageLi),
             timestamp,
             date,
             seq: currentConversation.messages.length,
             collectedAt: new Date().toISOString()
-        });
-        console.log('收集訊息:', messageText || '[圖片]', imageUrls);
+        };
+        currentConversation.messages.push(message);
+        if (imageKeys.length) attachImages(message, imageUrls);
+        console.log('收集訊息:', messageText || '[圖片]', imageKeys.length);
         noteActivity();
         persistLiveConversationSoon();
     }
@@ -855,7 +997,7 @@
         const list = storageGet(key, []);
         const snap = {
             ...conversation,
-            messages: sortMessages(conversation.messages.slice(), conversation.startTime, conversation.keepOrder),
+            messages: sortMessages(dropDuplicateImages(conversation.messages.slice()), conversation.startTime, conversation.keepOrder),
             endTime: conversation.endTime || new Date().toISOString()
         };
         const i = list.findIndex(c => c.id === conversation.id);
@@ -940,10 +1082,16 @@
             const date = dateByLi.get(li) || parseKnockDateLabel(timestamp) || '';
             const clock = clockMinutesOnly(timestamp);
             const isMy = isMyMessageLi(li);
+            const domId = (String(li.className || '').match(/message-li-(\S+)/) || [])[1] || '';
+            const imageKeys = imageUrls.map(stableImageKey).filter(Boolean);
             messages.push({
-                id: hashMessage(text, imageUrls, isMy, clock ?? date ?? `seq${messages.length}`),
+                id: imageKeys.length
+                    ? (domId || hashMessage(text, imageKeys, isMy, clock ?? date ?? `seq${messages.length}`))
+                    : hashMessage(text, [], isMy, clock ?? date ?? `seq${messages.length}`),
                 text,
                 imageUrls,
+                imageKeys,
+                domId,
                 isMyMessage: isMy,
                 avatarUrl: getAvatarUrl(li),
                 timestamp,
@@ -974,6 +1122,9 @@
             skipAdopt: true
         };
         notePartnerFromList();
+        currentConversation.messages.forEach(m => {
+            if ((m.imageKeys || []).length) attachImages(m, m.imageUrls);
+        });
         upsertConversationList(AUTO_CONV_KEY, currentConversation, 200);
         console.log('依畫面順序重建對話:', currentConversation.id, messages.length);
         showToast(`已依畫面順序重建 ${messages.length} 則訊息`);
@@ -1361,7 +1512,7 @@
             if (!messageDiv || messageDiv.querySelector('span[data-test="date"]')) continue;
             const text = getMessageText(messageDiv);
             const imageUrls = getMessageImages(messageDiv);
-            const filterKey = text || imageUrls[0] || '';
+            const filterKey = text || stableImageKey(imageUrls[0]) || '';
             if (!filterKey || TYPING_RE.test(text)) continue;
             const avatarUrl = getAvatarUrl(li);
             return { li, messageId: li.className, filterKey, imageUrls, messageDiv, avatarUrl, avatarHash: avatarHashOf(avatarUrl) };
@@ -2142,7 +2293,9 @@
     function formatConversationForCopy(conversation) {
         return sortMessages(conversation.messages, conversation.startTime, conversation.keepOrder).map(msg => {
             const speaker = msg.isMyMessage ? '我　' : '對方';
-            const content = [msg.text, ...(msg.imageUrls || [])].filter(Boolean).join(' ') || '[圖片]';
+            const links = (msg.imageUrls || []).filter(src => src && !String(src).startsWith('data:'));
+            const content = [msg.text, ...links].filter(Boolean).join(' ')
+                || ((msg.imageUrls || []).length ? '[圖片]' : '');
             return `${speaker}：${content} （${msg.timestamp || '未知時間'}）`;
         }).join('\n');
     }
@@ -2647,7 +2800,7 @@
             </div>
             <div style="display:flex;flex-direction:column;gap:12px;">
                 ${sorted.map(msg => {
-                    const filterKey = msg.text || (msg.imageUrls && msg.imageUrls[0]) || '';
+                    const filterKey = msg.text || (msg.imageKeys && msg.imageKeys[0]) || stableImageKey(msg.imageUrls && msg.imageUrls[0]) || '';
                     const showRemember = msg === firstOther && filterKey;
                     const showAvatarRemember = msg === firstOther && msg.avatarUrl;
                     return `
@@ -2864,6 +3017,19 @@
         ], 'u1', 'a');
         if (talks.length !== 1 || talks[0].id !== 'b' || pastTalks(talks, '', 'a').length) {
             console.error('knock: 舊對象比對失敗');
+        }
+        const dupImages = dropDuplicateImages([
+            { text: '', imageUrls: ['https://x/a.jpg?token=1'], isMyMessage: false, timestamp: '01:02' },
+            { text: '', imageUrls: ['https://x/a.jpg?token=2'], isMyMessage: false, timestamp: '01:02' },
+            { text: 'hi', imageUrls: [], isMyMessage: true, timestamp: '01:03' },
+            { text: '', imageUrls: ['data:image/jpeg;base64,qq'], imageKeys: ['https://x/a.jpg'], isMyMessage: false, timestamp: '01:02' }
+        ]);
+        if (stableImageKey('https://x/a.jpg?token=1') !== 'https://x/a.jpg'
+            || stableImageKey('data:image/jpeg;base64,qq')
+            || dupImages.length !== 2
+            || !String(dupImages[0].imageUrls[0]).startsWith('data:')
+            || dupImages[1].text !== 'hi') {
+            console.error('knock: 圖片重複紀錄判斷失敗');
         }
         const grouped = folderGroups([
             { id: 'a', partnerUid: 'u1', endTime: '2026-02-01' },
