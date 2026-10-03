@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.53
+// @version      1.4.54
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -61,7 +61,7 @@
     const HINT_CODE_KEY = 'knockHintCode';
     const HINT_NOTIFIED_KEY = 'knockHintConnectedNotified';
     const HINT_WAS_WAITING_KEY = 'knockHintWasWaiting';
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.53';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.54';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -166,6 +166,7 @@
     let conversationManagerTab = 'auto';
     let openFolderKeys = new Set();
     let lastBoundAt = 0;
+    let otherPartySeen = false;
     const imageEncodeJobs = new Set();
 
     // --- 對話生命週期 ---
@@ -304,6 +305,8 @@
         sessionStorage.removeItem(KEEP_ALIVE_AT_KEY);
         sessionStorage.removeItem(KEEP_ALIVE_WAIT_KEY);
         noteActivity();
+        otherPartySeen = false;
+        syncUnnamedChip();
         syncPastPartnerButton();
         console.log('初始化新對話:', currentConversation.id);
     }
@@ -584,20 +587,63 @@
         return '';
     }
 
+    function typingSentBy(messageLi) {
+        const key = Object.keys(messageLi).find(k => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance'));
+        let fiber = key ? messageLi[key] : null;
+        for (let n = 0; fiber && n < 12; n++, fiber = fiber.return) {
+            const props = fiber.memoizedProps;
+            if (!props) continue;
+            if (props.sentBy) return String(props.sentBy);
+            const msgs = props.messages;
+            if (!Array.isArray(msgs)) continue;
+            const hit = msgs.find(m => m && m.sentBy && (m.type === 'typing' || TYPING_RE.test(m.text || '')));
+            if (hit) return String(hit.sentBy);
+        }
+        return '';
+    }
+
     function notePartnerFromList() {
-        if (currentConversation.partnerUid) return;
         const list = document.querySelector('ul[data-test="messages"]');
-        if (!list) return;
+        if (!list) {
+            syncUnnamedChip();
+            return;
+        }
         for (const li of list.querySelectorAll('li.message-li')) {
             if (isMyMessageLi(li)) continue;
-            const uid = messageSentBy(li);
+            otherPartySeen = true;
+            if (currentConversation.partnerUid) break;
+            const messageDiv = li.querySelector('div[data-test="message"]');
+            const text = messageDiv ? getMessageText(messageDiv) : '';
+            const uid = TYPING_RE.test(text) ? (typingSentBy(li) || messageSentBy(li)) : messageSentBy(li);
             if (!uid) continue;
             currentConversation.partnerUid = uid;
             if (currentConversation.label) setPartnerLabel(uid, currentConversation.label);
             syncPastPartnerButton();
-            paintPartnerCaption();
+            break;
+        }
+        syncUnnamedChip();
+    }
+
+    function syncUnnamedChip() {
+        const show = otherPartySeen && !currentPartnerName() && document.querySelector('ul[data-test="messages"]');
+        let chip = el('knock-unnamed-chip');
+        if (!show) {
+            chip?.remove();
             return;
         }
+        if (chip) return;
+        chip = document.createElement('button');
+        chip.id = 'knock-unnamed-chip';
+        chip.type = 'button';
+        chip.textContent = '未命名';
+        chip.style.cssText = `position:fixed;bottom:120px;left:50%;transform:translateX(-50%);z-index:10001;font-family:${FONT};font-size:14px;color:#ffb74d;background:rgba(0,0,0,0.82);border:none;border-radius:16px;padding:8px 16px;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,0.35);`;
+        chip.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (!currentConversation.id) return;
+            nameConversation(currentConversation.id);
+        });
+        document.body.appendChild(chip);
     }
 
     function getPartnerLabels() {
@@ -655,6 +701,7 @@
             }
             if (tag.textContent !== shown) tag.textContent = shown;
         }
+        syncUnnamedChip();
     }
 
     function getMessageText(messageDiv) {
@@ -1701,7 +1748,10 @@
 
     function checkNewMessages() {
         const messagesList = document.querySelector('ul[data-test="messages"]');
-        if (!messagesList) return;
+        if (!messagesList) {
+            syncUnnamedChip();
+            return;
+        }
 
         const dateByLi = listMessageDates(messagesList);
         const messageElements = messagesList.querySelectorAll('li.message-li');
