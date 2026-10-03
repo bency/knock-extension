@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.54
+// @version      1.4.55
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -61,7 +61,7 @@
     const HINT_CODE_KEY = 'knockHintCode';
     const HINT_NOTIFIED_KEY = 'knockHintConnectedNotified';
     const HINT_WAS_WAITING_KEY = 'knockHintWasWaiting';
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.54';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.55';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -311,46 +311,80 @@
         console.log('初始化新對話:', currentConversation.id);
     }
 
-    // --- 發語詞過濾 ---
+    // --- 發語詞過濾：比對使用者 id。發語詞只當備註。沒有 id 的舊項目仍比對文字與頭像 ---
     function avatarHashOf(url) {
         return url ? hashString(url) : '';
     }
 
     function normalizeFilter(item) {
         if (item && typeof item === 'object') {
+            const u = String(item.u ?? item.uid ?? '').trim();
             const t = String(item.t ?? item.text ?? '').trim();
             const a = String(item.a ?? item.avatarHash ?? '');
-            return t ? { t, a } : null;
+            return (u || t) ? { u, t, a } : null;
         }
         const t = String(item ?? '').trim();
-        return t ? { t, a: '' } : null;
+        return t ? { u: '', t, a: '' } : null;
     }
 
     function getNormalizedFilters() {
         return storageGet(FIRST_MSG_FILTER_KEY, []).map(normalizeFilter).filter(Boolean);
     }
 
-    function isFirstMessageFiltered(text, avatarHash) {
+    function firstFilterHit(filters, uid, text, avatarHash) {
+        const u = (uid || '').trim();
         const t = (text || '').trim();
         const a = avatarHash || '';
-        if (!t) return false;
-        return getNormalizedFilters().some(f => f.t === t && f.a === a);
+        return (filters || []).some(f => (u && f.u === u) || (!f.u && t && f.t === t && f.a === a));
     }
 
-    function addFirstMessageFilter(text, avatarHash) {
+    function isFirstMessageFiltered(uid, text, avatarHash) {
+        return firstFilterHit(getNormalizedFilters(), uid, text, avatarHash);
+    }
+
+    function addFirstMessageFilter(uid, text, avatarHash) {
+        const u = (uid || '').trim();
         const t = (text || '').trim();
         const a = avatarHash || '';
-        if (!t || TYPING_RE.test(t)) return false;
+        if (!u || TYPING_RE.test(t)) return false;
         const list = getNormalizedFilters();
-        if (list.some(f => f.t === t && f.a === a)) return false;
-        list.push({ t, a });
+        if (list.some(f => f.u === u)) return false;
+        const legacy = list.find(f => !f.u && t && f.t === t && f.a === a);
+        if (legacy) legacy.u = u;
+        else list.push({ u, t, a });
         return storageSet(FIRST_MSG_FILTER_KEY, list);
     }
 
-    function removeFirstMessageFilter(text, avatarHash) {
+    function removeFirstMessageFilter(uid, text, avatarHash) {
+        const u = (uid || '').trim();
         const t = (text || '').trim();
         const a = avatarHash || '';
-        return storageSet(FIRST_MSG_FILTER_KEY, getNormalizedFilters().filter(f => !(f.t === t && f.a === a)));
+        return storageSet(FIRST_MSG_FILTER_KEY, getNormalizedFilters().filter(f => {
+            if (u && f.u === u) return false;
+            if (!u && t && !f.u && f.t === t && f.a === a) return false;
+            return true;
+        }));
+    }
+
+    function forgetFirstMessageFilter(uid, text, avatarHash) {
+        const u = (uid || '').trim();
+        const t = (text || '').trim();
+        const a = avatarHash || '';
+        return storageSet(FIRST_MSG_FILTER_KEY, getNormalizedFilters().filter(f => {
+            if (u && f.u === u) return false;
+            if (t && !f.u && f.t === t && f.a === a) return false;
+            return true;
+        }));
+    }
+
+    function stampFilterUid(text, avatarHash, uid) {
+        const u = (uid || '').trim();
+        if (!u || firstFilterHit(getNormalizedFilters(), u, '', '')) return;
+        const list = getNormalizedFilters();
+        const legacy = list.find(f => firstFilterHit([f], '', text, avatarHash));
+        if (!legacy || legacy.u) return;
+        legacy.u = u;
+        storageSet(FIRST_MSG_FILTER_KEY, list);
     }
 
     function clearFirstMessageFilters() {
@@ -377,12 +411,13 @@
 
     function importFirstMessageFilters(incoming) {
         const list = getNormalizedFilters();
-        const seen = new Set(list.map(f => `${f.t}\0${f.a}`));
+        const seen = new Set(list.map(f => f.u ? `u\0${f.u}` : `t\0${f.t}\0${f.a}`));
         let added = 0;
         for (const item of incoming) {
             const f = normalizeFilter(item);
-            if (!f || TYPING_RE.test(f.t)) continue;
-            const key = `${f.t}\0${f.a}`;
+            if (!f || (!f.u && TYPING_RE.test(f.t))) continue;
+            if (f.u && TYPING_RE.test(f.t)) f.t = '';
+            const key = f.u ? `u\0${f.u}` : `t\0${f.t}\0${f.a}`;
             if (seen.has(key)) continue;
             seen.add(key);
             list.push(f);
@@ -405,35 +440,39 @@
             : '';
         btn.setAttribute('role', 'checkbox');
         btn.setAttribute('aria-checked', on ? 'true' : 'false');
-        btn.title = on ? '已記住發語詞，再點取消' : '記住發語詞';
+        btn.title = on ? '已記住這個人，再點取消' : '記住這個人';
     }
 
     function syncRememberButtons() {
         document.querySelectorAll('.knock-remember-first, .knock-remember-first-saved').forEach(btn => {
+            const uid = decodeURIComponent(btn.dataset.filterUid || '');
             const text = decodeURIComponent(btn.dataset.filterText || '');
             const avatarHash = decodeURIComponent(btn.dataset.filterAvatar || '');
-            paintRememberButton(btn, !!(text && isFirstMessageFiltered(text, avatarHash)));
+            paintRememberButton(btn, isFirstMessageFiltered(uid, text, avatarHash));
         });
         const badge = el('knock-filter-count');
         if (badge) badge.textContent = String(getNormalizedFilters().length);
     }
 
-    function toggleFirstMessageFilter(text, avatarHash) {
+    function toggleFirstMessageFilter(uid, text, avatarHash) {
+        const u = (uid || '').trim();
         const t = (text || '').trim();
         const a = avatarHash || '';
-        if (!t) return false;
-        if (isFirstMessageFiltered(t, a)) {
-            removeFirstMessageFilter(t, a);
-            syncRememberButtons();
-            showToast('已從發語詞過濾移除');
+        if (!u) {
+            showToast('讀不到對方 id，無法記住');
             return false;
         }
-        if (addFirstMessageFilter(t, a)) {
-            const first = findFirstOtherMessage();
-            skipFirstFilterFor = first ? pairingIdOf(first) : t;
+        if (isFirstMessageFiltered(u, t, a)) {
+            forgetFirstMessageFilter(u, t, a);
+            syncRememberButtons();
+            showToast('已從過濾移除');
+            return false;
+        }
+        if (addFirstMessageFilter(u, t, a)) {
+            skipFirstFilterFor = u;
             pendingForcedLeave = false;
             syncRememberButtons();
-            showToast('已加入過濾');
+            showToast('已記住這個人');
             return true;
         }
         return false;
@@ -1562,20 +1601,44 @@
             const filterKey = text || stableImageKey(imageUrls[0]) || '';
             if (!filterKey || TYPING_RE.test(text)) continue;
             const avatarUrl = getAvatarUrl(li);
-            return { li, messageId: li.className, filterKey, imageUrls, messageDiv, avatarUrl, avatarHash: avatarHashOf(avatarUrl) };
+            return {
+                li, messageId: li.className, filterKey, imageUrls, messageDiv, avatarUrl,
+                avatarHash: avatarHashOf(avatarUrl),
+                uid: messageSentBy(li)
+            };
         }
         return null;
+    }
+
+    function screenPartnerUid() {
+        const list = document.querySelector('ul[data-test="messages"]');
+        if (!list) return '';
+        for (const li of list.querySelectorAll('li.message-li')) {
+            if (isMyMessageLi(li)) continue;
+            const messageDiv = li.querySelector('div[data-test="message"]');
+            const text = messageDiv ? getMessageText(messageDiv) : '';
+            const uid = TYPING_RE.test(text) ? (typingSentBy(li) || messageSentBy(li)) : messageSentBy(li);
+            if (uid) return uid;
+        }
+        return '';
     }
 
     function maybeLeaveOnFirstMessageFilter() {
         if (!firstFilterEnabled) return false;
         const first = findFirstOtherMessage();
+        const uid = (first && first.uid) || screenPartnerUid();
+        if (skipFirstFilterFor && (skipFirstFilterFor === uid || (first && skipFirstFilterFor === pairingIdOf(first)))) return false;
+        const filters = getNormalizedFilters();
+        if (uid && firstFilterHit(filters, uid, '', '')) {
+            console.log('對方 id 命中過濾，準備重連');
+            requestForcedLeave('firstFilter');
+            return pendingForcedLeave;
+        }
         if (!first) return false;
-        if (skipFirstFilterFor && skipFirstFilterFor === pairingIdOf(first)) return false;
-        const hit = isFirstMessageFiltered(first.filterKey, first.avatarHash)
-            || first.imageUrls.some(url => isFirstMessageFiltered(url, first.avatarHash));
-        if (!hit) return false;
-        console.log('發語詞與頭像命中過濾，準備重連:', first.filterKey, first.avatarHash);
+        const legacyText = [first.filterKey, ...first.imageUrls].find(text => firstFilterHit(filters, '', text, first.avatarHash));
+        if (!legacyText) return false;
+        if (uid) stampFilterUid(legacyText, first.avatarHash, uid);
+        console.log('舊發語詞命中過濾，準備重連:', legacyText);
         requestForcedLeave('firstFilter');
         return pendingForcedLeave;
     }
@@ -1800,7 +1863,7 @@
         if (e.target.closest('a, [data-test="user-avatar"], .knock-remember-avatar, .knock-partner-name')) return;
         const first = findFirstOtherMessage();
         if (!first || first.li !== e.currentTarget) return;
-        toggleFirstMessageFilter(first.filterKey, first.avatarHash);
+        toggleFirstMessageFilter(first.uid, first.filterKey, first.avatarHash);
     }
 
     function decorateOtherMessages() {
@@ -1814,14 +1877,20 @@
         if (!first) return;
 
         const row = first.li.firstElementChild || first.li;
-        if (!first.li.querySelector('.knock-remember-first')) {
-            const btn = document.createElement('button');
-            btn.type = 'button';
-            btn.className = 'knock-remember-first';
-            btn.dataset.filterText = encodeURIComponent(first.filterKey);
-            btn.dataset.filterAvatar = encodeURIComponent(first.avatarHash);
-            paintRememberButton(btn, isFirstMessageFiltered(first.filterKey, first.avatarHash));
-            row.appendChild(btn);
+        let rememberBtn = first.li.querySelector('.knock-remember-first');
+        if (!rememberBtn) {
+            rememberBtn = document.createElement('button');
+            rememberBtn.type = 'button';
+            rememberBtn.className = 'knock-remember-first';
+            row.appendChild(rememberBtn);
+        }
+        const rememberSig = `${first.uid || ''}\0${first.filterKey}\0${first.avatarHash}`;
+        if (rememberBtn.dataset.knockSig !== rememberSig) {
+            rememberBtn.dataset.knockSig = rememberSig;
+            rememberBtn.dataset.filterUid = encodeURIComponent(first.uid || '');
+            rememberBtn.dataset.filterText = encodeURIComponent(first.filterKey);
+            rememberBtn.dataset.filterAvatar = encodeURIComponent(first.avatarHash);
+            paintRememberButton(rememberBtn, isFirstMessageFiltered(first.uid, first.filterKey, first.avatarHash));
         }
         if (first.avatarUrl && !first.li.querySelector('.knock-remember-avatar')) {
             const avatarEl = first.li.querySelector('div[data-test="user-avatar"]');
@@ -2531,19 +2600,24 @@
                 </div>
                 <input type="file" id="knock-import-first-filters-file" accept="application/json,.json" hidden>
             </div>
-            <div style="font-size:13px;color:#888;margin-bottom:16px;">發語詞與對方頭像都相同才會自動離開。舊名單若沒有頭像，請重新勾選一次。</div>
-            <input type="text" id="knock-filter-search" placeholder="搜尋已記住的訊息..." style="${CSS_INP}margin-bottom:16px;">
+            <div style="font-size:13px;color:#888;margin-bottom:16px;">依對方的使用者 id 自動離開，換發語詞也一樣。發語詞只是當時的備註。沒有 id 的舊項目，要發語詞與頭像都相同才會離開，再遇到會補上 id。</div>
+            <input type="text" id="knock-filter-search" placeholder="搜尋已記住的人..." style="${CSS_INP}margin-bottom:16px;">
             <div id="knock-filter-list" style="display:flex;flex-direction:column;gap:8px;">
                 ${filters.length === 0
-                    ? '<div style="text-align:center;padding:40px;color:#888;">尚未封鎖任何發語詞</div>'
-                    : filters.map(f => `
+                    ? '<div style="text-align:center;padding:40px;color:#888;">尚未記住任何人</div>'
+                    : filters.map(f => {
+                        const name = f.u ? partnerLabel(f.u) : '';
+                        return `
                         <div class="knock-filter-card" style="display:flex;gap:8px;align-items:flex-start;background:#222;border:1px solid #444;border-radius:8px;padding:12px;">
                             <div style="flex:1;min-width:0;">
-                                <div style="font-size:14px;color:#ccc;white-space:pre-wrap;word-break:break-word;">${escapeHtml(f.t)}</div>
-                                <div style="font-size:12px;color:#666;margin-top:4px;">${f.a ? `頭像 ${escapeHtml(f.a)}` : '僅發語詞（舊，需重新勾選）'}</div>
+                                <div style="font-size:14px;color:#ccc;white-space:pre-wrap;word-break:break-word;">${escapeHtml(name || f.t || '（沒有發語詞）')}</div>
+                                <div style="font-size:12px;color:#666;margin-top:4px;">${f.u
+                                    ? `${name && f.t ? `${escapeHtml(f.t)} · ` : ''}id ${escapeHtml(f.u)}`
+                                    : '舊資料沒有 id，發語詞與頭像都相同才會離開'}</div>
                             </div>
-                            <button class="knock-remove-first-filter" data-filter-text="${encodeURIComponent(f.t)}" data-filter-avatar="${encodeURIComponent(f.a)}" style="${cssBtn('#d32f2f', 'padding:6px 10px;border-radius:4px;font-size:12px;flex-shrink:0;')}">刪除</button>
-                        </div>`).join('')}
+                            <button class="knock-remove-first-filter" data-filter-uid="${encodeURIComponent(f.u)}" data-filter-text="${encodeURIComponent(f.t)}" data-filter-avatar="${encodeURIComponent(f.a)}" style="${cssBtn('#d32f2f', 'padding:6px 10px;border-radius:4px;font-size:12px;flex-shrink:0;')}">刪除</button>
+                        </div>`;
+                    }).join('')}
             </div>`));
         if (!panel) return;
         el('knock-filter-manager-close').onclick = () => panel.remove();
@@ -2871,7 +2945,7 @@
                                 ${!msg.text && !(msg.imageUrls || []).length ? `<div style="color:#888;font-size:13px;">（空訊息）</div>` : ''}
                             </div>
                             ${msg.timestamp ? `<div style="font-size:11px;color:rgba(255,255,255,0.5);flex-shrink:0;white-space:nowrap;">${escapeHtml(formatMessageStamp(msg))}</div>` : ''}
-                            ${showRemember ? `<button type="button" class="knock-remember-first-saved" data-filter-text="${encodeURIComponent(filterKey)}" data-filter-avatar="${encodeURIComponent(avatarHashOf(msg.avatarUrl))}"></button>` : ''}
+                            ${showRemember ? `<button type="button" class="knock-remember-first-saved" data-filter-uid="${encodeURIComponent(conversation.partnerUid || '')}" data-filter-text="${encodeURIComponent(filterKey)}" data-filter-avatar="${encodeURIComponent(avatarHashOf(msg.avatarUrl))}"></button>` : ''}
                         </div>
                     </div>`;
                 }).join('')}
@@ -2914,10 +2988,11 @@
             return;
         }
         if (e.target.classList.contains('knock-remove-first-filter')) {
+            const uid = decodeURIComponent(e.target.dataset.filterUid || '');
             const text = decodeURIComponent(e.target.dataset.filterText || '');
             const avatarHash = decodeURIComponent(e.target.dataset.filterAvatar || '');
-            if (text) {
-                removeFirstMessageFilter(text, avatarHash);
+            if (uid || text) {
+                removeFirstMessageFilter(uid, text, avatarHash);
                 syncRememberButtons();
                 refreshFirstFilterManager();
             }
@@ -2926,6 +3001,7 @@
         const rememberBtn = e.target.closest?.('.knock-remember-first-saved');
         if (rememberBtn) {
             toggleFirstMessageFilter(
+                decodeURIComponent(rememberBtn.dataset.filterUid || ''),
                 decodeURIComponent(rememberBtn.dataset.filterText || ''),
                 decodeURIComponent(rememberBtn.dataset.filterAvatar || '')
             );
@@ -3092,6 +3168,18 @@
             || grouped[0].folder.name !== '阿明' || grouped[1].conv.id !== 'c'
             || grouped[2].folder.key !== 'solo:d' || grouped[3].conv.id !== 'e') {
             console.error('knock: 命名資料夾分組失敗');
+        }
+        const uidFilters = [
+            normalizeFilter({ u: ' uid1 ', t: ' 早安 ' }),
+            normalizeFilter({ text: '在嗎', avatarHash: 'h2' }),
+            normalizeFilter('舊句')
+        ];
+        if (uidFilters[0].u !== 'uid1' || uidFilters[0].t !== '早安' || uidFilters[1].u || uidFilters[2].t !== '舊句'
+            || !firstFilterHit(uidFilters, 'uid1', '換一句', '')
+            || firstFilterHit(uidFilters, 'uid9', '換一句', '')
+            || !firstFilterHit(uidFilters, '', '在嗎', 'h2')
+            || firstFilterHit(uidFilters, 'uid9', '在嗎', '別的頭像')) {
+            console.error('knock: 發語詞改以使用者 id 過濾失敗');
         }
     }
 
