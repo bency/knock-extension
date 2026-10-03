@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.52
+// @version      1.4.53
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -61,7 +61,7 @@
     const HINT_CODE_KEY = 'knockHintCode';
     const HINT_NOTIFIED_KEY = 'knockHintConnectedNotified';
     const HINT_WAS_WAITING_KEY = 'knockHintWasWaiting';
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.52';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.53';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -625,20 +625,14 @@
 
     function paintPartnerCaption() {
         const name = currentPartnerName();
+        const shown = name || '未命名';
         const list = document.querySelector('ul[data-test="messages"]');
         if (!list) return;
         for (const li of list.querySelectorAll('li.message-li')) {
             if (isMyMessageLi(li)) continue;
             const avatar = li.querySelector('[data-test="user-avatar"]');
             if (!avatar) continue;
-            const col = avatar.closest('.knock-avatar-col');
-            if (!name) {
-                if (!col) continue;
-                col.before(avatar);
-                col.remove();
-                continue;
-            }
-            let host = col;
+            let host = avatar.closest('.knock-avatar-col');
             if (!host) {
                 host = document.createElement('div');
                 host.className = 'knock-avatar-col';
@@ -650,10 +644,16 @@
             if (!tag) {
                 tag = document.createElement('div');
                 tag.className = 'knock-partner-name';
-                tag.style.cssText = 'margin-top:2px;font-size:10px;line-height:1.2;color:#ffb74d;text-align:center;word-break:break-all;max-width:4.2em;';
+                tag.style.cssText = 'margin-top:2px;font-size:10px;line-height:1.2;color:#ffb74d;text-align:center;word-break:break-all;max-width:4.2em;cursor:pointer;';
+                tag.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (!currentConversation.id) return;
+                    nameConversation(currentConversation.id);
+                });
                 host.appendChild(tag);
             }
-            if (tag.textContent !== name) tag.textContent = name;
+            if (tag.textContent !== shown) tag.textContent = shown;
         }
     }
 
@@ -1747,7 +1747,7 @@
     }
 
     function onRememberRowClick(e) {
-        if (e.target.closest('a, [data-test="user-avatar"], .knock-remember-avatar')) return;
+        if (e.target.closest('a, [data-test="user-avatar"], .knock-remember-avatar, .knock-partner-name')) return;
         const first = findFirstOtherMessage();
         if (!first || first.li !== e.currentTarget) return;
         toggleFirstMessageFilter(first.filterKey, first.avatarHash);
