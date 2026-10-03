@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.55
+// @version      1.4.56
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -26,11 +26,12 @@
     ];
     const PENDING_START_CHAT_KEY = 'knockPendingStartChat';
     const PENDING_START_CHAT_REASON_KEY = 'knockPendingStartChatReason';
+    const PENDING_FILTER_NAME_KEY = 'knockPendingFilterName';
     const PENDING_START_CHAT_TTL_MS = 30000;
     const START_CHAT_REASON_LABEL = {
         otherLeft: '對方主動斷線',
         selfLeft: '我主動斷線',
-        firstFilter: '發語詞略過而重連'
+        firstFilter: '使用者過濾而重連'
     };
     const AUTO_CLICK_ENABLED_KEY = 'knockAutoClickEnabled';
     const FIRST_MSG_FILTER_KEY = 'knockFirstMessageFilters';
@@ -61,7 +62,7 @@
     const HINT_CODE_KEY = 'knockHintCode';
     const HINT_NOTIFIED_KEY = 'knockHintConnectedNotified';
     const HINT_WAS_WAITING_KEY = 'knockHintWasWaiting';
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.55';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.56';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -311,7 +312,7 @@
         console.log('初始化新對話:', currentConversation.id);
     }
 
-    // --- 發語詞過濾：比對使用者 id。發語詞只當備註。沒有 id 的舊項目仍比對文字與頭像 ---
+    // --- 使用者過濾：比對使用者 id。勾選時用發語詞當顯示名稱。沒有 id 的舊項目仍比對文字與頭像 ---
     function avatarHashOf(url) {
         return url ? hashString(url) : '';
     }
@@ -396,7 +397,7 @@
         const blob = new Blob([JSON.stringify(list, null, 2)], { type: 'application/json' });
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
-        a.download = `knock-發語詞過濾-${new Date().toISOString().slice(0, 10)}.json`;
+        a.download = `knock-使用者過濾-${new Date().toISOString().slice(0, 10)}.json`;
         a.click();
         URL.revokeObjectURL(a.href);
         return list.length;
@@ -440,7 +441,7 @@
             : '';
         btn.setAttribute('role', 'checkbox');
         btn.setAttribute('aria-checked', on ? 'true' : 'false');
-        btn.title = on ? '已記住這個人，再點取消' : '記住這個人';
+        btn.title = on ? '已過濾這個人，再點取消' : '過濾這個人';
     }
 
     function syncRememberButtons() {
@@ -471,11 +472,65 @@
         if (addFirstMessageFilter(u, t, a)) {
             skipFirstFilterFor = u;
             pendingForcedLeave = false;
+            namePartnerFromOpening(u, t);
             syncRememberButtons();
-            showToast('已記住這個人');
+            if (el('knock-first-filter-manager')) refreshFirstFilterManager();
+            showToast('已加入使用者過濾');
             return true;
         }
         return false;
+    }
+
+    function openingLineName(text, existing) {
+        const name = String(text || '').trim().replace(/\s+/g, ' ').slice(0, 40);
+        if (!name || existing || /^https?:\/\//.test(name)) return '';
+        return name;
+    }
+
+    function applyPartnerDisplayName(uid, name) {
+        setPartnerLabel(uid, name);
+        const apply = (key) => {
+            const list = storageGet(key, []);
+            let changed = false;
+            for (const c of list) {
+                if (!c || c.partnerUid !== uid || c.label === name) continue;
+                c.label = name;
+                changed = true;
+            }
+            if (changed) storageSet(key, list);
+        };
+        apply(SAVED_CONV_KEY);
+        apply(AUTO_CONV_KEY);
+        if (currentConversation.partnerUid === uid) {
+            currentConversation.label = name;
+            paintPartnerCaption();
+        }
+    }
+
+    function namePartnerFromOpening(uid, text) {
+        const name = openingLineName(text, partnerLabel(uid));
+        if (!uid || !name) return;
+        if (!currentConversation.partnerUid) {
+            const first = findFirstOtherMessage();
+            if (first && first.uid === uid) currentConversation.partnerUid = uid;
+        }
+        applyPartnerDisplayName(uid, name);
+        renderConversationList();
+    }
+
+    function renameFilteredUser(uid) {
+        const u = (uid || '').trim();
+        if (!u) return;
+        const note = (getNormalizedFilters().find(f => f.u === u) || {}).t || '';
+        const next = prompt('修改顯示名稱。空白表示清除。', partnerLabel(u) || note);
+        if (next == null) return;
+        const name = next.trim().slice(0, 40);
+        applyPartnerDisplayName(u, name);
+        renderConversationList();
+        refreshFirstFilterManager();
+        const title = el('knock-detail-title');
+        if (title && title.dataset.partnerUid === u) title.textContent = name || note || title.dataset.plain || title.textContent;
+        showToast(name ? '已更新顯示名稱' : '已清除顯示名稱');
     }
 
     // --- 大頭貼過濾（只記網址；勾選疊在頭像上，不包頭像） ---
@@ -1446,11 +1501,30 @@
     function clearPendingStartChat() {
         sessionStorage.removeItem(PENDING_START_CHAT_KEY);
         sessionStorage.removeItem(PENDING_START_CHAT_REASON_KEY);
+        sessionStorage.removeItem(PENDING_FILTER_NAME_KEY);
+    }
+
+    function cooldownReasonText(reasonKey, name) {
+        const reason = START_CHAT_REASON_LABEL[reasonKey];
+        if (!reason) return '開始聊天';
+        const n = String(name || '').trim();
+        if (reasonKey === 'firstFilter' && n) return `開始聊天 · 過濾了 ${n}`;
+        return `開始聊天 · ${reason}`;
     }
 
     function startChatCooldownLabel() {
-        const reason = START_CHAT_REASON_LABEL[sessionStorage.getItem(PENDING_START_CHAT_REASON_KEY)];
-        return reason ? `開始聊天 · ${reason}` : '開始聊天';
+        return cooldownReasonText(
+            sessionStorage.getItem(PENDING_START_CHAT_REASON_KEY),
+            sessionStorage.getItem(PENDING_FILTER_NAME_KEY)
+        );
+    }
+
+    function filterPromptName(uid, text) {
+        const named = (uid && partnerLabel(uid)) || '';
+        const note = uid ? String((getNormalizedFilters().find(f => f.u === uid) || {}).t || '') : '';
+        const raw = (named || note || text || '').trim().replace(/\s+/g, ' ');
+        if (!raw || /^https?:\/\//.test(raw)) return '';
+        return raw.slice(0, 40);
     }
 
     function hideCooldown() {
@@ -1551,13 +1625,19 @@
             || sessionStorage.getItem(PENDING_START_CHAT_REASON_KEY) === 'firstFilter';
     }
 
-    function requestForcedLeave(reason) {
+    function requestForcedLeave(reason, filterName) {
         if (!autoClickEnabled && reason !== 'firstFilter') return;
         if (reason === 'firstFilter') forceAutoUntilIdle = true;
         if (!pendingForcedLeave) {
             pendingForcedLeave = true;
+            const firstMark = reason && !sessionStorage.getItem(PENDING_START_CHAT_REASON_KEY);
+            if (firstMark && reason === 'firstFilter') {
+                const n = String(filterName || '').trim();
+                if (n) sessionStorage.setItem(PENDING_FILTER_NAME_KEY, n);
+                else sessionStorage.removeItem(PENDING_FILTER_NAME_KEY);
+            }
             markPendingStartChat(reason);
-            console.log('已記下要離開，等待退出按鈕:', reason);
+            console.log('已記下要離開，等待退出按鈕:', reason, filterName || '');
         }
         tryForcedLeave();
     }
@@ -1630,16 +1710,18 @@
         if (skipFirstFilterFor && (skipFirstFilterFor === uid || (first && skipFirstFilterFor === pairingIdOf(first)))) return false;
         const filters = getNormalizedFilters();
         if (uid && firstFilterHit(filters, uid, '', '')) {
-            console.log('對方 id 命中過濾，準備重連');
-            requestForcedLeave('firstFilter');
+            const name = filterPromptName(uid, first && first.filterKey);
+            console.log('對方 id 命中過濾，準備重連:', name);
+            requestForcedLeave('firstFilter', name);
             return pendingForcedLeave;
         }
         if (!first) return false;
         const legacyText = [first.filterKey, ...first.imageUrls].find(text => firstFilterHit(filters, '', text, first.avatarHash));
         if (!legacyText) return false;
         if (uid) stampFilterUid(legacyText, first.avatarHash, uid);
-        console.log('舊發語詞命中過濾，準備重連:', legacyText);
-        requestForcedLeave('firstFilter');
+        const name = filterPromptName(uid, legacyText);
+        console.log('舊發語詞命中過濾，準備重連:', name || legacyText);
+        requestForcedLeave('firstFilter', name);
         return pendingForcedLeave;
     }
 
@@ -2178,7 +2260,7 @@
         pastBtn.addEventListener('click', (e) => { e.stopPropagation(); showPastPartnerConversations(); });
 
         const filterRow = dockRow(
-            `<span>發語詞過濾</span><span id="knock-filter-count" style="background:#ff9800;border-radius:10px;padding:0 6px;font-size:12px;min-width:1.2em;text-align:center;">${getNormalizedFilters().length}</span>`
+            `<span>使用者過濾</span><span id="knock-filter-count" style="background:#ff9800;border-radius:10px;padding:0 6px;font-size:12px;min-width:1.2em;text-align:center;">${getNormalizedFilters().length}</span>`
         );
         attachDockSwitch(filterRow, firstFilterEnabled, (v) => {
             firstFilterEnabled = v;
@@ -2591,7 +2673,7 @@
         const filters = getNormalizedFilters();
         const panel = toggleOverlay('knock-first-filter-manager', () => makeOverlay('knock-first-filter-manager', 720, `
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;flex-wrap:wrap;">
-                <h2 style="margin:0;font-size:24px;">發語詞過濾（${filters.length}）</h2>
+                <h2 style="margin:0;font-size:24px;">使用者過濾（${filters.length}）</h2>
                 <div style="display:flex;gap:8px;flex-wrap:wrap;">
                     <button id="knock-export-first-filters" style="${cssBtn('#2d5a3d')}" ${filters.length ? '' : 'disabled'}>匯出</button>
                     <button id="knock-import-first-filters" style="${cssBtn('#2d4a6d')}">匯入</button>
@@ -2600,11 +2682,11 @@
                 </div>
                 <input type="file" id="knock-import-first-filters-file" accept="application/json,.json" hidden>
             </div>
-            <div style="font-size:13px;color:#888;margin-bottom:16px;">依對方的使用者 id 自動離開，換發語詞也一樣。發語詞只是當時的備註。沒有 id 的舊項目，要發語詞與頭像都相同才會離開，再遇到會補上 id。</div>
+            <div style="font-size:13px;color:#888;margin-bottom:16px;">依使用者 id 自動離開。勾選時用當時的發語詞當顯示名稱，可在這裡修改。沒有 id 的舊項目，要發語詞與頭像都相同才會離開。</div>
             <input type="text" id="knock-filter-search" placeholder="搜尋已記住的人..." style="${CSS_INP}margin-bottom:16px;">
             <div id="knock-filter-list" style="display:flex;flex-direction:column;gap:8px;">
                 ${filters.length === 0
-                    ? '<div style="text-align:center;padding:40px;color:#888;">尚未記住任何人</div>'
+                    ? '<div style="text-align:center;padding:40px;color:#888;">尚未過濾任何人</div>'
                     : filters.map(f => {
                         const name = f.u ? partnerLabel(f.u) : '';
                         return `
@@ -2615,7 +2697,8 @@
                                     ? `${name && f.t ? `${escapeHtml(f.t)} · ` : ''}id ${escapeHtml(f.u)}`
                                     : '舊資料沒有 id，發語詞與頭像都相同才會離開'}</div>
                             </div>
-                            <button class="knock-remove-first-filter" data-filter-uid="${encodeURIComponent(f.u)}" data-filter-text="${encodeURIComponent(f.t)}" data-filter-avatar="${encodeURIComponent(f.a)}" style="${cssBtn('#d32f2f', 'padding:6px 10px;border-radius:4px;font-size:12px;flex-shrink:0;')}">刪除</button>
+                            ${f.u ? `<button type="button" class="knock-rename-user" data-filter-uid="${encodeURIComponent(f.u)}" style="${cssBtn('#ff9800', 'padding:6px 10px;border-radius:4px;font-size:12px;flex-shrink:0;')}">改名</button>` : ''}
+                            <button type="button" class="knock-remove-first-filter" data-filter-uid="${encodeURIComponent(f.u)}" data-filter-text="${encodeURIComponent(f.t)}" data-filter-avatar="${encodeURIComponent(f.a)}" style="${cssBtn('#d32f2f', 'padding:6px 10px;border-radius:4px;font-size:12px;flex-shrink:0;')}">刪除</button>
                         </div>`;
                     }).join('')}
             </div>`));
@@ -2623,7 +2706,7 @@
         el('knock-filter-manager-close').onclick = () => panel.remove();
         el('knock-export-first-filters').onclick = () => {
             const n = exportFirstMessageFilters();
-            showToast(n ? `已匯出 ${n} 則` : '沒有可匯出的發語詞');
+            showToast(n ? `已匯出 ${n} 則` : '沒有可匯出的使用者');
         };
         el('knock-import-first-filters').onclick = () => el('knock-import-first-filters-file').click();
         el('knock-import-first-filters-file').addEventListener('change', async (e) => {
@@ -2664,7 +2747,7 @@
                 </div>
                 <input type="file" id="knock-import-avatar-filters-file" accept="application/json,.json" hidden>
             </div>
-            <div style="font-size:13px;color:#888;margin-bottom:16px;">對方發語詞的大頭貼網址相同就會自動離開。預設頭像也可以勾，用來略過沒換頭像的人。</div>
+            <div style="font-size:13px;color:#888;margin-bottom:16px;">對方第一則訊息的大頭貼網址相同就會自動離開。預設頭像也可以勾，用來略過沒換頭像的人。</div>
             <input type="text" id="knock-avatar-filter-search" placeholder="搜尋大頭貼網址..." style="${CSS_INP}margin-bottom:16px;">
             <div id="knock-avatar-filter-list" style="display:flex;flex-direction:column;gap:8px;">
                 ${filters.length === 0
@@ -2905,7 +2988,7 @@
         el('knock-conversation-detail')?.remove();
         const detail = makeOverlay('knock-conversation-detail', 800, `
             <div style="flex-shrink:0;display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;flex-wrap:wrap;">
-                <h2 id="knock-detail-title" data-plain="${isAuto ? '自動儲存對話' : '已儲存對話'}" style="margin:0;font-size:20px;">${escapeHtml(conversationDisplayName(conversation) || (isAuto ? '自動儲存對話' : '已儲存對話'))}</h2>
+                <h2 id="knock-detail-title" data-partner-uid="${escapeHtml(conversation.partnerUid || '')}" data-plain="${isAuto ? '自動儲存對話' : '已儲存對話'}" style="margin:0;font-size:20px;">${escapeHtml(conversationDisplayName(conversation) || (isAuto ? '自動儲存對話' : '已儲存對話'))}</h2>
                 <div style="display:flex;gap:8px;flex-wrap:wrap;">
                     ${isAuto ? `<button id="knock-detail-pin" style="${cssBtn('#4CAF50')}">移到已儲存</button>` : ''}
                     <button id="knock-detail-name" style="${cssBtn('#ff9800')}">命名</button>
@@ -2987,6 +3070,11 @@
             nameConversation(nameBtn.getAttribute('data-conv-id'));
             return;
         }
+        const renameBtn = e.target.closest?.('.knock-rename-user');
+        if (renameBtn) {
+            renameFilteredUser(decodeURIComponent(renameBtn.dataset.filterUid || ''));
+            return;
+        }
         if (e.target.classList.contains('knock-remove-first-filter')) {
             const uid = decodeURIComponent(e.target.dataset.filterUid || '');
             const text = decodeURIComponent(e.target.dataset.filterText || '');
@@ -3030,7 +3118,7 @@
             return;
         }
         if (e.target.id === 'knock-clear-first-filters') {
-            if (getNormalizedFilters().length && confirm('確定清空全部發語詞過濾？')) {
+            if (getNormalizedFilters().length && confirm('確定清空全部使用者過濾？')) {
                 clearFirstMessageFilters();
                 syncRememberButtons();
                 refreshFirstFilterManager();
@@ -3180,6 +3268,17 @@
             || !firstFilterHit(uidFilters, '', '在嗎', 'h2')
             || firstFilterHit(uidFilters, 'uid9', '在嗎', '別的頭像')) {
             console.error('knock: 發語詞改以使用者 id 過濾失敗');
+        }
+        if (openingLineName('  嗨  ', '') !== '嗨'
+            || openingLineName('https://x/a.jpg', '')
+            || openingLineName('新句子', '已命名')
+            || openingLineName('一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十多餘', '').length !== 40) {
+            console.error('knock: 發語詞當顯示名稱失敗');
+        }
+        if (cooldownReasonText('firstFilter', '阿明') !== '開始聊天 · 過濾了 阿明'
+            || cooldownReasonText('firstFilter', '') !== '開始聊天 · 使用者過濾而重連'
+            || cooldownReasonText('selfLeft', '阿明') !== '開始聊天 · 我主動斷線') {
+            console.error('knock: 過濾名稱提示失敗');
         }
     }
 
