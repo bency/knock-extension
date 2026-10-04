@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.56
+// @version      1.4.60
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -14,6 +14,7 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_notification
 // @connect      ntfy.sh
+// @connect      knock.bency.org
 // @connect      *
 // ==/UserScript==
 
@@ -48,6 +49,9 @@
     const NTFY_TITLE_KEY = 'knockNtfyTitle';
     const NTFY_TITLE_DEFAULT = 'Knock 新訊息';
     const NTFY_SERVER = 'https://ntfy.sh';
+    const RELAY_URL = 'https://knock.bency.org';
+    const RELAY_TOKEN_KEY = 'knockRelayToken';
+    const RELAY_TAB_KEY = 'knockRelayTabId';
     const KEEP_ALIVE_ENABLED_KEY = 'knockKeepAliveEnabled';
     const KEEP_ALIVE_TEXT_KEY = 'knockKeepAliveText';
     const KEEP_ALIVE_AT_KEY = 'knockKeepAliveAt';
@@ -62,7 +66,7 @@
     const HINT_CODE_KEY = 'knockHintCode';
     const HINT_NOTIFIED_KEY = 'knockHintConnectedNotified';
     const HINT_WAS_WAITING_KEY = 'knockHintWasWaiting';
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.56';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.60';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -2254,6 +2258,17 @@
         const rebuildBtn = dockRow('<span>重建此對話</span>', { button: true });
         rebuildBtn.addEventListener('click', (e) => { e.stopPropagation(); snapshotOnScreenConversation(); });
 
+        const relayBtn = dockRow('<span>遠端對話</span>', { button: true });
+        relayBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const next = prompt('貼上遠端頁面的權杖。空白表示關閉。頁面是 https://knock.bency.org', relayToken());
+            if (next == null) return;
+            const token = next.trim();
+            if (token) localStorage.setItem(RELAY_TOKEN_KEY, token);
+            else localStorage.removeItem(RELAY_TOKEN_KEY);
+            showToast(token ? '已開啟遠端對話' : '已關閉遠端對話');
+        });
+
         const pastBtn = dockRow('<span>之前的對話</span>', { button: true });
         pastBtn.id = 'knock-past-partner';
         pastBtn.style.display = 'none';
@@ -2293,7 +2308,7 @@
         }, true);
         ntfyRow.addEventListener('click', (e) => { e.stopPropagation(); createNtfySettings(); });
 
-        body.append(autoRow, keepWrap, filterRow, avatarRow, browserRow, ntfyRow, convBtn, rebuildBtn, pastBtn);
+        body.append(autoRow, keepWrap, filterRow, avatarRow, browserRow, ntfyRow, convBtn, rebuildBtn, relayBtn, pastBtn);
 
         const paintOpen = () => {
             body.style.display = open ? 'flex' : 'none';
@@ -2386,14 +2401,8 @@
         );
         if (!box) return false;
         fillReactInput(box, text);
-        pressEnter(box);
-        let tries = 0;
-        const cleared = () => !box.value.trim();
-        const tick = () => {
-            if (cleared()) {
-                if (onSent) onSent();
-                return;
-            }
+        const trySend = () => {
+            if (!box.value.trim()) return true;
             if (box.value !== text) fillReactInput(box, text);
             const send = document.querySelector('button[data-test="send"]');
             if (send && !send.disabled) {
@@ -2402,10 +2411,124 @@
             } else {
                 pressEnter(box);
             }
+            return !box.value.trim();
+        };
+        if (trySend()) {
+            if (onSent) onSent();
+            return true;
+        }
+        let tries = 0;
+        const tick = () => {
+            if (trySend()) {
+                if (onSent) onSent();
+                return;
+            }
             if (++tries < 15) setTimeout(tick, 80);
         };
         setTimeout(tick, 50);
         return true;
+    }
+
+    function relayToken() {
+        return (localStorage.getItem(RELAY_TOKEN_KEY) || '').trim();
+    }
+
+    function relayTabId() {
+        let id = sessionStorage.getItem(RELAY_TAB_KEY) || '';
+        if (!/^[a-z0-9]{8,40}$/.test(id)) {
+            id = (Math.random().toString(36).slice(2) + Date.now().toString(36)).replace(/[^a-z0-9]/g, '').slice(0, 40);
+            if (id.length < 8) id = (id + 'relaytab1').slice(0, 16);
+            sessionStorage.setItem(RELAY_TAB_KEY, id);
+        }
+        return id;
+    }
+
+    function relaySnapshot() {
+        const list = document.querySelector('ul[data-test="messages"]');
+        if (!list) return null;
+        const left = findButtons().some(isRematchButton);
+        const canType = !left && !!document.querySelector('[data-test="input-message"] textarea');
+        const dateByLi = listMessageDates(list);
+        const messages = [];
+        for (const li of list.querySelectorAll('li.message-li')) {
+            const messageDiv = li.querySelector('div[data-test="message"]');
+            if (!messageDiv) continue;
+            const text = getMessageText(messageDiv);
+            if (!text || TYPING_RE.test(text)) continue;
+            const id = (String(li.className || '').match(/message-li-(\S+)/) || [])[1] || '';
+            if (!id) continue;
+            const timeEl = messageDiv.querySelector('span[data-test="date"]');
+            const time = formatMessageStamp({
+                timestamp: timeEl ? timeEl.textContent.trim() : '',
+                date: dateByLi.get(li) || ''
+            });
+            messages.push({ id, text: text.slice(0, 500), mine: isMyMessageLi(li), time });
+        }
+        return {
+            tabId: relayTabId(),
+            channelId: currentConversation.id || '',
+            title: currentPartnerName() || '未命名',
+            canType,
+            status: left ? 'left' : 'live',
+            messages: messages.slice(-40)
+        };
+    }
+
+    const relaySending = new Map();
+    let relayBusy = false;
+
+    async function relayTick() {
+        const token = relayToken();
+        if (!token || relayBusy) return;
+        const snap = relaySnapshot();
+        if (!snap) return;
+        relayBusy = true;
+        try {
+            const res = await gmRequest({
+                method: 'POST',
+                url: `${RELAY_URL}/api/heartbeat?wait=1`,
+                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                data: JSON.stringify(snap),
+                timeout: 8000
+            });
+            if (res && res.status === 200) {
+            const data = JSON.parse(res.responseText || '{}');
+            for (const item of data.outbox || []) {
+                if (!item || !item.id || !item.text || !snap.canType) continue;
+                const started = relaySending.get(item.id) || 0;
+                if (Date.now() - started < 8000) continue;
+                relaySending.set(item.id, Date.now());
+                const sent = sendChatMessage(item.text, () => {
+                    gmRequest({
+                        method: 'POST',
+                        url: `${RELAY_URL}/api/sessions/${snap.tabId}/ack`,
+                        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                        data: JSON.stringify({ id: item.id }),
+                        timeout: 8000
+                    }).catch(() => {}).finally(() => relaySending.delete(item.id));
+                });
+                if (!sent) relaySending.delete(item.id);
+            }
+            }
+        } catch (e) {}
+        relayBusy = false;
+        return true;
+    }
+
+    // 縮小視窗後 setInterval 會被瀏覽器放慢。由伺服器把這次回報留住約兩秒，回來就立刻送下一次。
+    async function relayLoop() {
+        for (;;) {
+            const started = Date.now();
+            const paced = await relayTick();
+            if (!paced || Date.now() - started < 1000) await new Promise(r => setTimeout(r, 2000));
+        }
+    }
+
+    function keepRelayAwake() {
+        try {
+            if (!navigator.locks) return;
+            navigator.locks.request('knock-relay-awake', { mode: 'shared' }, () => new Promise(() => {}));
+        } catch (e) {}
     }
 
     function tryKeepAlive() {
@@ -3171,6 +3294,10 @@
         checkForButtonAndClick();
         checkConversationEnd();
     }, 200);
+
+    keepRelayAwake();
+    relayLoop();
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) relayTick(); });
 
     {
         const times = ['23:59', '00:00'];
