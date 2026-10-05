@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.68
+// @version      1.4.70
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -66,7 +66,7 @@
     const HINT_CODE_KEY = 'knockHintCode';
     const HINT_NOTIFIED_KEY = 'knockHintConnectedNotified';
     const HINT_WAS_WAITING_KEY = 'knockHintWasWaiting';
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.68';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.70';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -2603,13 +2603,106 @@
             status: left ? 'left' : 'live',
             messages: messages.slice(-40),
             openings: relayOpenings(),
-            controls: relayControls()
+            controls: relayControls(),
+            archive: relayArchive()
         };
+    }
+
+    function relayArchiveRow(m) {
+        const key = (m.imageKeys && m.imageKeys[0]) || '';
+        const url = (m.imageUrls && m.imageUrls[0]) || '';
+        const image = key ? relayImageId(key) : (url && !String(url).startsWith('data:') ? relayImageId(url) : '');
+        const text = String(m.text || '').slice(0, 500) || (!m.quote && !image && url ? '圖片' : '');
+        const quote = String(m.quote || '').slice(0, 200);
+        if (!m.id || (!text && !quote && !image)) return null;
+        return {
+            id: String(m.id).slice(0, 80),
+            text,
+            quote,
+            image,
+            mine: !!m.isMyMessage,
+            time: formatMessageStamp(m)
+        };
+    }
+
+    function archiveUidOf(conv) {
+        const uid = String((conv && conv.partnerUid) || '').trim();
+        if (/^[A-Za-z0-9_-]{6,128}$/.test(uid)) return uid;
+        const id = String((conv && conv.id) || '').trim();
+        if (/^[A-Za-z0-9_-]{6,128}$/.test(id)) return id;
+        return '';
+    }
+
+    function archiveTitleOf(conv) {
+        const named = conv && conv.partnerUid ? partnerLabel(conv.partnerUid) : '';
+        return String(named || (conv && conv.label) || '').trim().slice(0, 40) || '未命名';
+    }
+
+    // 同一位使用者的本地紀錄併成一份。沒有使用者 id 的，用該次對話 id。
+    function archiveSources(live, stored, liveTitle) {
+        const order = [];
+        const byUid = new Map();
+        const add = (conv, title) => {
+            const uid = archiveUidOf(conv);
+            if (!uid) return;
+            let row = byUid.get(uid);
+            if (!row) {
+                row = { uid, title: title || '未命名', messages: [] };
+                byUid.set(uid, row);
+                order.push(row);
+            } else if (title && title !== '未命名' && row.title === '未命名') {
+                row.title = title;
+            }
+            for (const m of (conv && conv.messages) || []) row.messages.push(m);
+        };
+        for (const conv of stored || []) add(conv, archiveTitleOf(conv));
+        if (live && (live.messages || []).length) add(live, liveTitle || archiveTitleOf(live));
+        return order;
+    }
+
+    function nextArchive(sources, done) {
+        for (const src of sources || []) {
+            const messages = [];
+            const seen = new Set();
+            for (const m of src.messages) {
+                if (!m || !m.id || seen.has(m.id) || done.has(src.uid + ':' + m.id)) continue;
+                seen.add(m.id);
+                messages.push(m);
+                if (messages.length >= 30) break;
+            }
+            if (messages.length) return { uid: src.uid, title: src.title, messages };
+        }
+        return null;
+    }
+
+    // ponytail: 每次心跳讀全部本地對話，只送 30 則。則數很多時再改成記住送到哪。
+    function relayArchive() {
+        notePartnerFromList();
+        const stored = [];
+        const seen = new Set();
+        for (const c of [...getSavedConversations(), ...getAutoConversations()]) {
+            if (!c || seen.has(c.id)) continue;
+            seen.add(c.id);
+            stored.push(c);
+        }
+        const next = nextArchive(archiveSources(currentConversation, stored, currentPartnerName() || ''), relayArchived);
+        if (!next) return null;
+        const messages = [];
+        const skip = [];
+        for (const m of next.messages) {
+            const row = relayArchiveRow(m);
+            if (row) messages.push(row);
+            else skip.push(m);
+        }
+        if (skip.length) rememberArchived(next.uid, skip);
+        if (!messages.length) return null;
+        return { uid: next.uid, title: next.title, messages };
     }
 
     const relaySending = new Map();
     const relayUploaded = new Set();
     const relayImageDone = new Set();
+    const relayArchived = new Set();
     let relayImageBooted = false;
     let relayBusy = false;
 
@@ -2624,7 +2717,19 @@
     try {
         const savedDone = JSON.parse(sessionStorage.getItem('knockRelayImageDone') || '[]');
         if (Array.isArray(savedDone)) savedDone.forEach(id => { if (id) relayImageDone.add(id); });
+        const savedArchive = JSON.parse(sessionStorage.getItem('knockRelayArchived') || '[]');
+        if (Array.isArray(savedArchive)) savedArchive.forEach(id => { if (id) relayArchived.add(id); });
     } catch (e) {}
+
+    function rememberArchived(uid, messages) {
+        if (!uid) return;
+        for (const m of messages || []) {
+            if (m && m.id) relayArchived.add(uid + ':' + m.id);
+        }
+        try {
+            sessionStorage.setItem('knockRelayArchived', JSON.stringify([...relayArchived].slice(-3000)));
+        } catch (e) {}
+    }
 
     function relayControls() {
         const range = keepAliveHoursRange();
@@ -2885,6 +2990,7 @@
                 timeout: 8000
             });
             if (res && res.status === 200) {
+            if (snap.archive) rememberArchived(snap.archive.uid, snap.archive.messages);
             const data = JSON.parse(res.responseText || '{}');
             if (data.controls) applyRelayControls(data.controls);
             if (typeof data.avatarOn === 'boolean') {
@@ -3784,6 +3890,26 @@
         const encodedParent = 'req0___data__=%7B%22parent%22%3A%22projects%2Fknocktalk-prod%2Fdatabases%2F(default)%2Fdocuments%2Fchannels%2FekVlFOyWwL9KlwjaDgj6%22%7D';
         if (extractChannelId(encodedParent) !== 'ekVlFOyWwL9KlwjaDgj6' || isChannelId('conv_1') || !isChannelId('ekVlFOyWwL9KlwjaDgj6')) {
             console.error('knock: channel id 解析失敗');
+        }
+        const storedTalks = [
+            { id: 'c1', partnerUid: 'user_one', label: '阿明', messages: [{ id: 'm1' }, { id: 'm2' }] },
+            { id: 'c2', partnerUid: 'user_two', messages: [{ id: 'x' }] },
+            { id: 'conv_old_1', messages: [{ id: 'y' }] },
+            { id: 'short', messages: [{ id: 'z' }] }
+        ];
+        const src = archiveSources(
+            { id: 'live1', partnerUid: 'user_one', messages: [{ id: 'm3' }, { id: 'm2' }] },
+            storedTalks,
+            ''
+        );
+        const batch = nextArchive(src, new Set(['user_one:m1']));
+        const later = nextArchive(src, new Set(['user_one:m1', 'user_one:m2', 'user_one:m3']));
+        if (src.length !== 3 || src[0].uid !== 'user_one' || src[0].title !== '阿明'
+            || src[0].messages.map(m => m.id).join() !== 'm1,m2,m3,m2'
+            || src[2].uid !== 'conv_old_1'
+            || !batch || batch.messages.map(m => m.id).join() !== 'm2,m3'
+            || !later || later.uid !== 'user_two') {
+            console.error('knock: 本地對話同步失敗');
         }
         const talks = pastTalks([
             { id: 'a', partnerUid: 'u1', messages: [{}], endTime: '2026-01-01' },

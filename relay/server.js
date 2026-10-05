@@ -10,7 +10,9 @@ const PORT = Number(process.env.PORT || 8787);
 const WAIT_MS = 3 * 60 * 1000;
 const POLL_MS = 2000;
 const DATA = process.env.KNOCK_DATA || '/app/sessions.json';
+const TALK_FILE = path.join(path.dirname(DATA), 'talks.json');
 const IMG_DIR = path.join(path.dirname(DATA), 'images');
+const TALK_KEEP = 800;
 
 function tokenOk(header) {
     const got = String(header || '').startsWith('Bearer ') ? header.slice(7).trim() : '';
@@ -18,6 +20,90 @@ function tokenOk(header) {
     const a = crypto.createHash('sha256').update(TOKEN).digest();
     const b = crypto.createHash('sha256').update(got).digest();
     return crypto.timingSafeEqual(a, b);
+}
+
+function cleanUid(raw) {
+    const s = String(raw || '').trim();
+    if (!/^[A-Za-z0-9_-]{6,128}$/.test(s)) return '';
+    return s;
+}
+
+function archiveMessage(m) {
+    const id = String(m && m.id || '').slice(0, 80);
+    const text = String(m && m.text || '').slice(0, 500);
+    const quote = String(m && m.quote || '').slice(0, 200);
+    const image = /^[a-z0-9]{8,40}$/.test(m && m.image) ? m.image : '';
+    const time = String(m && m.time || '').slice(0, 32);
+    if (!id || !(text || quote || image)) return null;
+    return { id, text, quote, image, mine: !!(m && m.mine), time };
+}
+
+// ponytail: 一人最多 800 則、最多 300 人，超過留最新的。要完整更久再改檔案。
+function rememberTalk(talks, body, now) {
+    const archive = body && body.archive;
+    if (!archive || typeof archive !== 'object') return false;
+    const uid = cleanUid(archive.uid);
+    if (!uid) return false;
+    const incoming = (Array.isArray(archive.messages) ? archive.messages : []).map(archiveMessage).filter(Boolean).slice(0, 40);
+    const prev = talks.get(uid);
+    if (!incoming.length && (!prev || prev.title === String(archive.title || '').trim().slice(0, 40))) return false;
+    const map = new Map();
+    for (const m of (prev && prev.messages) || []) if (m && m.id) map.set(m.id, m);
+    let changed = !prev || prev.title !== String(archive.title || '').trim().slice(0, 40);
+    for (const m of incoming) {
+        const old = map.get(m.id);
+        if (old && !m.time) m.time = old.time;
+        if (old && !m.quote) m.quote = old.quote;
+        if (!old || old.text !== m.text || old.quote !== m.quote || old.image !== m.image || old.mine !== m.mine || old.time !== m.time) changed = true;
+        map.set(m.id, m);
+    }
+    if (!changed) return false;
+    let messages = [...map.values()];
+    if (messages.length > TALK_KEEP) messages = messages.slice(messages.length - TALK_KEEP);
+    const title = String(archive.title || (prev && prev.title) || '').trim().slice(0, 40) || '未命名';
+    if (!messages.length) return false;
+    talks.set(uid, { uid, title, messages, updated: now });
+    if (talks.size > 300) {
+        let oldest = null;
+        for (const t of talks.values()) {
+            if (t.uid === uid) continue;
+            if (!oldest || t.updated < oldest.updated) oldest = t;
+        }
+        if (oldest) talks.delete(oldest.uid);
+    }
+    return true;
+}
+
+function visibleTalks(talks) {
+    return [...talks.values()]
+        .map(t => ({ uid: t.uid, title: t.title, updated: t.updated, count: t.messages.length }))
+        .sort((a, b) => b.updated - a.updated || (a.uid < b.uid ? -1 : 1));
+}
+
+function loadTalks() {
+    try {
+        const raw = JSON.parse(fs.readFileSync(TALK_FILE, 'utf8'));
+        const map = new Map();
+        for (const t of raw || []) {
+            const uid = cleanUid(t && t.uid);
+            if (!uid) continue;
+            const messages = (Array.isArray(t.messages) ? t.messages : []).map(archiveMessage).filter(Boolean).slice(-TALK_KEEP);
+            if (!messages.length) continue;
+            map.set(uid, {
+                uid,
+                title: String(t.title || '未命名').slice(0, 40) || '未命名',
+                messages,
+                updated: Number(t.updated) || 0
+            });
+        }
+        return map;
+    } catch (e) {
+        return new Map();
+    }
+}
+
+function saveTalks(talks) {
+    fs.writeFileSync(TALK_FILE, JSON.stringify([...talks.values()]));
 }
 
 function cleanMessages(list) {
@@ -303,6 +389,16 @@ function selfCheck() {
         || cleanOpenings({ them: '' }, null, 1)) {
         throw new Error('knock relay 檢查失敗');
     }
+    const talks = new Map();
+    if (!rememberTalk(talks, { archive: { uid: 'user_one', title: '阿明', messages: [{ id: 'a', text: '嗨', mine: false, time: '10:01' }] } }, 1)
+        || !rememberTalk(talks, { archive: { uid: 'user_one', title: '阿明', messages: [{ id: 'b', text: '在嗎', mine: true }] } }, 2)
+        || rememberTalk(talks, { archive: { uid: 'user_one', title: '阿明', messages: [{ id: 'a', text: '嗨', mine: false }] } }, 3)
+        || rememberTalk(talks, { archive: { uid: 'no', messages: [{ id: 'c', text: 'x' }] } }, 4)
+        || talks.size !== 1
+        || talks.get('user_one').messages.map(m => m.id).join() !== 'a,b'
+        || visibleTalks(talks)[0].count !== 2) {
+        throw new Error('knock relay 檢查失敗');
+    }
 }
 
 function pause(ms, req) {
@@ -477,8 +573,13 @@ const TOKEN_KEY = 'knockRelayPageToken';
 const app = document.getElementById('app');
 let token = localStorage.getItem(TOKEN_KEY) || '';
 let current = '';
+let archiveUid = '';
+let archiveTalk = null;
+let archiveUpdated = 0;
+let archiveLoading = '';
 let listTab = 'live';
 let sessions = [];
+let talks = [];
 let sending = false;
 let lastSentText = '';
 let lastSentAt = 0;
@@ -534,6 +635,63 @@ function statusText(s) {
   if (!s.canType) return '現在不能回';
   if (s.pending) return '有 ' + s.pending + ' 則待送出';
   return '';
+}
+
+function talkClock(ms) {
+  const d = new Date(ms);
+  if (!ms || isNaN(d.getTime())) return '';
+  const p = (n) => (n < 10 ? '0' : '') + n;
+  return (d.getMonth() + 1) + '/' + d.getDate() + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
+
+function loadArchive(uid) {
+  if (!uid || archiveLoading === uid) return;
+  archiveLoading = uid;
+  api('/api/talks/' + encodeURIComponent(uid)).then(data => {
+    if (archiveUid !== uid) return;
+    archiveTalk = data.talk || null;
+    archiveUpdated = archiveTalk ? archiveTalk.updated : 0;
+    paint();
+  }).catch(() => {}).finally(() => {
+    if (archiveLoading === uid) archiveLoading = '';
+  });
+}
+
+function paintArchive(talk, follow, y) {
+  document.body.classList.add('in-thread');
+  clearChrome();
+  clearForm();
+  const bar = document.createElement('div');
+  bar.className = 'topbar';
+  const back = document.createElement('button');
+  back.className = 'card';
+  back.type = 'button';
+  back.textContent = '返回';
+  back.style.flex = 'none';
+  back.onclick = () => { archiveUid = ''; archiveTalk = null; resetListScroll = true; paint(); };
+  const who = document.createElement('span');
+  who.textContent = (talk && talk.title) || '對話記錄';
+  who.style.cssText = 'flex:1;display:flex;align-items:center;padding:0 12px;background:#1c1c1c;border-bottom:1px solid #333;';
+  bar.append(back, who);
+  document.body.append(bar);
+  app.replaceChildren();
+  if (!talk) {
+    const p = document.createElement('p');
+    p.className = 'muted';
+    p.textContent = '正在讀取對話記錄';
+    app.append(p);
+    return;
+  }
+  const messages = talk.messages || [];
+  if (!messages.length) {
+    const p = document.createElement('p');
+    p.className = 'muted';
+    p.textContent = '這份紀錄還沒有訊息';
+    app.append(p);
+    return;
+  }
+  messages.forEach(paintBubble);
+  placeThread({ tabId: 'talk:' + archiveUid, messages }, follow, y);
 }
 
 function tailId(s) {
@@ -912,6 +1070,12 @@ function paint() {
     if (!editing) paintControls();
     return;
   }
+  if (archiveUid) {
+    const y = window.scrollY;
+    const follow = stickBottom || nearBottom();
+    paintArchive(archiveTalk, follow, y);
+    return;
+  }
   const y = window.scrollY;
   const follow = stickBottom || (!!current && nearBottom());
   const focused = document.activeElement && document.activeElement.closest && document.activeElement.closest('form');
@@ -934,15 +1098,54 @@ function paint() {
     if (resetListScroll) { window.scrollTo(0, 0); resetListScroll = false; }
     const tabs = document.createElement('div');
     tabs.className = 'tabs';
-    [['live', '連線中'], ['quiet', '沒回報']].forEach(([id, label]) => {
+    [['live', '連線中'], ['quiet', '沒回報'], ['talks', '紀錄']].forEach(([id, label]) => {
       const tab = document.createElement('button');
       tab.type = 'button';
       tab.textContent = label;
       tab.className = listTab === id ? 'on' : '';
-      tab.onclick = () => { listTab = id; paint(); };
+      tab.onclick = () => { listTab = id; archiveUid = ''; archiveTalk = null; paint(); };
       tabs.append(tab);
     });
     document.body.append(tabs);
+    if (listTab === 'talks') {
+      if (!talks.length) {
+        const p = document.createElement('p');
+        p.className = 'muted';
+        p.textContent = '還沒有對話記錄';
+        app.append(p);
+        return;
+      }
+      talks.forEach(t => {
+        const btn = document.createElement('button');
+        btn.className = 'card';
+        btn.type = 'button';
+        const name = document.createElement('div');
+        name.className = 'who';
+        name.textContent = t.title || '未命名';
+        const sub = document.createElement('small');
+        sub.className = 'preview';
+        const label = document.createElement('span');
+        label.className = 'preview-text';
+        label.textContent = (t.count || 0) + ' 則';
+        sub.append(label);
+        const when = document.createElement('span');
+        when.className = 'preview-time';
+        when.textContent = talkClock(t.updated);
+        sub.append(when);
+        btn.append(name, sub);
+        btn.onclick = () => {
+          archiveUid = t.uid;
+          archiveTalk = null;
+          archiveUpdated = 0;
+          current = '';
+          stickBottom = true;
+          paint();
+          loadArchive(t.uid);
+        };
+        app.append(btn);
+      });
+      return;
+    }
     const shown = sessions.filter(s => listTab === 'quiet' ? s.waiting : !s.waiting)
       .sort((a, b) => lastMessageAt(b) - lastMessageAt(a) || (a.tabId < b.tabId ? -1 : a.tabId > b.tabId ? 1 : 0));
     if (!shown.length) {
@@ -984,7 +1187,7 @@ function paint() {
         st.textContent = extra;
         btn.append(st);
       }
-      btn.onclick = () => { current = s.tabId; stickBottom = true; paint(); };
+      btn.onclick = () => { archiveUid = ''; archiveTalk = null; current = s.tabId; stickBottom = true; paint(); };
       app.append(btn);
     });
     return;
@@ -1117,6 +1320,11 @@ async function tick() {
     if (!token) return paint();
     const data = await api('/api/sessions' + (pollWait ? '?wait=1' : ''));
     sessions = data.sessions || [];
+    talks = data.talks || [];
+    if (archiveUid) {
+      const sum = talks.find(t => t.uid === archiveUid);
+      if (!archiveTalk || (sum && sum.updated !== archiveUpdated)) loadArchive(archiveUid);
+    }
     if (controlDraft && sessions.some(s => s.controls && JSON.stringify(packControls(s.controls)) === JSON.stringify(controlDraft))) controlDraft = null;
     if (avatarDraft) {
       const hit = sessions.find(s => s.tabId === avatarDraft.tabId);
@@ -1151,6 +1359,7 @@ loop();
 
 function main() {
     const sessions = loadSessions();
+    const talks = loadTalks();
     const server = http.createServer(async (req, res) => {
         const url = new URL(req.url, 'http://localhost');
         if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname === '/') {
@@ -1166,13 +1375,21 @@ function main() {
             if (req.method === 'GET' && url.pathname === '/api/sessions') {
                 if (url.searchParams.get('wait') === '1') await pause(POLL_MS, req);
                 if (clientGone(req, res)) return;
-                return send(res, 200, { sessions: visibleSessions(sessions, Date.now(), WAIT_MS) });
+                return send(res, 200, { sessions: visibleSessions(sessions, Date.now(), WAIT_MS), talks: visibleTalks(talks) });
+            }
+            const talkMatch = url.pathname.match(/^\/api\/talks\/([A-Za-z0-9_-]{6,128})$/);
+            if (req.method === 'GET' && talkMatch) {
+                const talk = talks.get(talkMatch[1]);
+                if (!talk) return send(res, 404, { error: 'gone' });
+                return send(res, 200, { talk });
             }
             if (req.method === 'POST' && url.pathname === '/api/heartbeat') {
                 const body = await readBody(req);
                 const session = applyHeartbeat(sessions, body, Date.now());
                 if (!session) return send(res, 400, { error: 'bad tab' });
+                const archived = rememberTalk(talks, body, Date.now());
                 saveSessions(sessions);
+                if (archived) saveTalks(talks);
                 if (url.searchParams.get('wait') === '1') await pause(POLL_MS, req);
                 if (clientGone(req, res)) return;
                 const outbox = pendingOutbox(session);
