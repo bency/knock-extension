@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.72
+// @version      1.4.73
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -66,7 +66,7 @@
     const HINT_CODE_KEY = 'knockHintCode';
     const HINT_NOTIFIED_KEY = 'knockHintConnectedNotified';
     const HINT_WAS_WAITING_KEY = 'knockHintWasWaiting';
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.72';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.73';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -1131,6 +1131,7 @@
 
         const clock = clockMinutesOnly(timestamp);
         const domId = (String(messageLi.className || '').match(/message-li-(\S+)/) || [])[1] || '';
+        if (messageText === '已收回一則訊息' && !imageUrls.length && noteRecalledLocal(domId, quote, date)) return;
         const imageKeys = imageUrls.map(stableImageKey).filter(Boolean);
         const imageSig = imageKeys.length
             ? `${messageText}|${imageKeys.join(',')}|${isMyMessage}|${clock ?? ''}`
@@ -2758,6 +2759,40 @@
         try {
             sessionStorage.setItem('knockRelayArchived', JSON.stringify([...relayArchived].slice(-3000)));
         } catch (e) {}
+    }
+
+    function forgetArchivedMessage(id) {
+        if (!id) return;
+        let changed = false;
+        for (const key of [...relayArchived]) {
+            const cut = key.lastIndexOf(':');
+            if (cut > 0 && key.slice(cut + 1) === id) {
+                relayArchived.delete(key);
+                changed = true;
+            }
+        }
+        if (!changed) return;
+        try {
+            sessionStorage.setItem('knockRelayArchived', JSON.stringify([...relayArchived].slice(-3000)));
+        } catch (e) {}
+    }
+
+    function noteRecalledLocal(domId, quote, date) {
+        if (!domId) return false;
+        const prev = currentConversation.messages.find(m => m && (m.domId === domId || m.id === domId));
+        if (!prev) return false;
+        if ((prev.imageKeys && prev.imageKeys.length) || (prev.imageUrls && prev.imageUrls.length)) return true;
+        const base = String(prev.text || '');
+        if (!base || base === '已收回一則訊息') return true;
+        const next = base.endsWith('（已收回）') ? base : base + '（已收回）';
+        if (prev.text !== next) {
+            prev.text = next;
+            if (quote) prev.quote = quote;
+            if (date) prev.date = date;
+            forgetArchivedMessage(prev.id);
+            persistLiveConversationSoon();
+        }
+        return true;
     }
 
     function relayControls() {

@@ -55,6 +55,14 @@ function rememberTalk(talks, body, now) {
     let changed = !prev || prev.title !== String(archive.title || '').trim().slice(0, 40);
     for (const m of incoming) {
         const old = map.get(m.id);
+        if (old && m.text === '已收回一則訊息' && !m.image) {
+            if (old.image) {
+                m.text = old.text || '';
+                m.image = old.image;
+            } else if (old.text && old.text !== '已收回一則訊息') {
+                m.text = withRecall(old.text);
+            }
+        }
         if (old && !m.time) m.time = old.time;
         if (old && !m.quote) m.quote = old.quote;
         if (!old || old.text !== m.text || old.quote !== m.quote || old.image !== m.image || old.mine !== m.mine || old.time !== m.time) changed = true;
@@ -219,6 +227,25 @@ function cleanMessages(list) {
     })).filter(m => m.id && (m.text || m.quote || m.image));
 }
 
+function withRecall(text) {
+    const t = String(text || '');
+    if (!t || t === '已收回一則訊息') return t;
+    return t.endsWith('（已收回）') ? t : (t + '（已收回）').slice(0, 500);
+}
+
+function keepRecalled(incoming, prev) {
+    const oldById = new Map();
+    for (const m of prev || []) if (m && m.id) oldById.set(m.id, m);
+    return (incoming || []).map(m => {
+        if (!m || m.image || m.text !== '已收回一則訊息') return m;
+        const old = oldById.get(m.id);
+        if (!old) return m;
+        if (old.image) return { ...m, text: old.text || '', quote: m.quote || old.quote || '', image: old.image };
+        if (!old.text || old.text === '已收回一則訊息') return m;
+        return { ...m, text: withRecall(old.text) };
+    });
+}
+
 function applyHeartbeat(sessions, body, now) {
     const tabId = String(body && body.tabId || '').trim();
     if (!/^[a-z0-9]{8,40}$/.test(tabId)) return null;
@@ -232,7 +259,7 @@ function applyHeartbeat(sessions, body, now) {
         title,
         canType: !!body.canType,
         status: body.status === 'left' ? 'left' : 'live',
-        messages: cleanMessages(body.messages),
+        messages: keepRecalled(cleanMessages(body.messages), prev && prev.messages),
         seen: now,
         openings: body.openings
             ? cleanOpenings(body.openings, sameChannel ? prev.openings : null, now)
@@ -522,6 +549,28 @@ function selfCheck() {
         || box.users.some(x => x.u === 'user_one')
         || !applyFilterPatch(box, { clearAvatars: true })
         || box.avatars.length) {
+        throw new Error('knock relay 檢查失敗');
+    }
+    const recalled = applyHeartbeat(sessions, {
+        tabId: 'recalltab1', title: '收回', canType: true,
+        messages: [{ id: 'm9', text: '原本的話', mine: false }, { id: 'picmsg01', text: '', image: 'abcd1234', mine: false }]
+    }, 15000);
+    const second = applyHeartbeat(sessions, {
+        tabId: 'recalltab1', title: '收回', canType: true,
+        messages: [{ id: 'm9', text: '已收回一則訊息', mine: false }, { id: 'picmsg01', text: '已收回一則訊息', mine: false }]
+    }, 15001);
+    const recalledAgain = applyHeartbeat(sessions, {
+        tabId: 'recalltab1', title: '收回', canType: true,
+        messages: [{ id: 'm9', text: '已收回一則訊息', mine: false }]
+    }, 15002);
+    const words = second.messages.find(m => m.id === 'm9');
+    const pic = second.messages.find(m => m.id === 'picmsg01');
+    const recallTalks = new Map();
+    if (!recalled || !words || words.text !== '原本的話（已收回）' || recalledAgain.messages.find(m => m.id === 'm9').text !== '原本的話（已收回）'
+        || !pic || pic.image !== 'abcd1234' || pic.text
+        || !rememberTalk(recallTalks, { archive: { uid: 'user_two', title: '阿明', messages: [{ id: 'c', text: '晚安', mine: true, time: '01:01' }] } }, 9)
+        || !rememberTalk(recallTalks, { archive: { uid: 'user_two', title: '阿明', messages: [{ id: 'c', text: '已收回一則訊息', mine: true }] } }, 10)
+        || recallTalks.get('user_two').messages[0].text !== '晚安（已收回）') {
         throw new Error('knock relay 檢查失敗');
     }
     dropped.delete('user_one:a');
