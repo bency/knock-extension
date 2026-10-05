@@ -3,12 +3,14 @@
 const http = require('http');
 const crypto = require('crypto');
 const fs = require('fs');
+const path = require('path');
 
 const TOKEN = process.env.KNOCK_TOKEN || '';
 const PORT = Number(process.env.PORT || 8787);
 const WAIT_MS = 3 * 60 * 1000;
 const POLL_MS = 2000;
 const DATA = process.env.KNOCK_DATA || '/app/sessions.json';
+const IMG_DIR = path.join(path.dirname(DATA), 'images');
 
 function tokenOk(header) {
     const got = String(header || '').startsWith('Bearer ') ? header.slice(7).trim() : '';
@@ -23,9 +25,11 @@ function cleanMessages(list) {
     return list.slice(-40).map(m => ({
         id: String(m && m.id || '').slice(0, 80),
         text: String(m && m.text || '').slice(0, 500),
+        quote: String(m && m.quote || '').slice(0, 200),
+        image: /^[a-z0-9]{8,40}$/.test(m && m.image) ? m.image : '',
         mine: !!(m && m.mine),
         time: String(m && m.time || '').slice(0, 32)
-    })).filter(m => m.id && m.text);
+    })).filter(m => m.id && (m.text || m.quote || m.image));
 }
 
 function applyHeartbeat(sessions, body, now) {
@@ -93,11 +97,16 @@ function saveSessions(sessions) {
     fs.writeFileSync(DATA, JSON.stringify([...sessions.values()]));
 }
 
-function enqueue(session, text, now) {
-    const item = { id: crypto.randomBytes(8).toString('hex'), text: String(text || '').trim().slice(0, 2000), at: now };
-    if (!item.text) return null;
+function enqueue(session, text, now, image) {
+    const item = {
+        id: crypto.randomBytes(8).toString('hex'),
+        text: String(text || '').trim().slice(0, 2000),
+        image: /^[a-z0-9]{8,40}$/.test(image || '') ? image : '',
+        at: now
+    };
+    if (!item.text && !item.image) return null;
     const last = session.outbox[session.outbox.length - 1];
-    if (last && last.text === item.text && now - Number(last.at) < 2000) return last;
+    if (!item.image && last && !last.image && last.text === item.text && now - Number(last.at) < 2000) return last;
     if (session.outbox.length >= 20) session.outbox.shift();
     session.outbox.push(item);
     return item;
@@ -123,6 +132,11 @@ function selfCheck() {
         throw new Error('knock relay 檢查失敗');
     }
     if (applyHeartbeat(sessions, { tabId: '../x', title: 'x' }, 2000)) throw new Error('knock relay 檢查失敗');
+    const imgItem = enqueue(sessions.get('abc12345'), '', 30000, 'abcd1234');
+    const withImg = cleanMessages([{ id: 'imgmsg01', text: '', quote: '原文', image: 'abcd1234' }]);
+    if (!imgItem || !imgItem.image || withImg.length !== 1 || withImg[0].quote !== '原文' || withImg[0].image !== 'abcd1234') {
+        throw new Error('knock relay 檢查失敗');
+    }
 }
 
 function pause(ms, req) {
@@ -143,6 +157,49 @@ function pause(ms, req) {
 
 function clientGone(req, res) {
     return res.writableEnded || res.destroyed || !req.socket || req.socket.destroyed;
+}
+
+function readRaw(req, max) {
+    return new Promise((resolve, reject) => {
+        const chunks = [];
+        let n = 0;
+        req.on('data', (c) => {
+            n += c.length;
+            if (n > max) {
+                reject(new Error('too big'));
+                req.destroy();
+                return;
+            }
+            chunks.push(c);
+        });
+        req.on('end', () => resolve(Buffer.concat(chunks)));
+        req.on('error', reject);
+    });
+}
+
+function imageExt(type) {
+    const t = String(type || '').toLowerCase();
+    if (t.indexOf('image/png') === 0) return 'png';
+    if (t.indexOf('image/gif') === 0) return 'gif';
+    if (t.indexOf('image/jpeg') === 0 || t.indexOf('image/jpg') === 0) return 'jpg';
+    return '';
+}
+
+function imagePath(id) {
+    if (!/^[a-z0-9]{8,40}$/.test(id)) return '';
+    for (const ext of ['jpg', 'png', 'gif']) {
+        const file = path.join(IMG_DIR, id + '.' + ext);
+        if (fs.existsSync(file)) return file;
+    }
+    return '';
+}
+
+function writeImage(id, buf, type) {
+    const ext = imageExt(type);
+    if (!ext || !/^[a-z0-9]{8,40}$/.test(id) || !buf || buf.length < 32 || buf.length > 1500000) return false;
+    fs.mkdirSync(IMG_DIR, { recursive: true });
+    fs.writeFileSync(path.join(IMG_DIR, id + '.' + ext), buf);
+    return true;
 }
 
 function readBody(req) {
@@ -208,10 +265,14 @@ const PAGE = `<!DOCTYPE html>
   .bubble.mine .msg { background:#2d5a3d; border-color:#2d5a3d; }
   .bubble.them .msg { background:#2d2d3d; }
   .msg { padding:8px 10px; white-space:pre-wrap; word-break:break-word; }
+  .quote { font-size:12px; color:rgba(255,255,255,.7); border-left:2px solid rgba(255,255,255,.35); padding-left:6px; margin-bottom:6px; }
+  .msg img.pic { display:block; max-width:100%; max-height:240px; border-radius:6px; margin-top:6px; }
   .time { display:block; margin-top:4px; font-size:11px; color:rgba(255,255,255,.55); }
   form { position:fixed; left:0; right:0; bottom:0; display:flex; gap:8px; padding:10px; background:#111; border-top:1px solid #333; }
   form input { flex:1; padding:10px; border-radius:8px; border:1px solid #444; background:#1a1a1a; }
+  form input[type=file] { display:none; }
   form button { padding:10px 14px; border:none; border-radius:8px; background:#4CAF50; cursor:pointer; }
+  form button.pick { background:#333; }
   form button:disabled { opacity:0.45; }
   .gate { display:flex; flex-direction:column; gap:8px; }
   .muted { color:#888; }
@@ -230,6 +291,7 @@ let sessions = [];
 let sending = false;
 let lastSentText = '';
 let lastSentAt = 0;
+const picUrls = {};
 let stickBottom = false;
 let resetListScroll = false;
 const seenTail = {};
@@ -377,9 +439,24 @@ function paintThread(s, follow, y) {
     wrap.className = 'bubble ' + (m.mine ? 'mine' : 'them');
     const row = document.createElement('div');
     row.className = 'msg';
-    const text = document.createElement('div');
-    text.textContent = m.text;
-    row.append(text);
+    if (m.quote) {
+      const quote = document.createElement('div');
+      quote.className = 'quote';
+      quote.textContent = m.quote;
+      row.append(quote);
+    }
+    if (m.text) {
+      const text = document.createElement('div');
+      text.textContent = m.text;
+      row.append(text);
+    }
+    if (m.image) {
+      const img = document.createElement('img');
+      img.className = 'pic';
+      img.alt = '圖片';
+      row.append(img);
+      showPic(m.image, img);
+    }
     if (m.time) {
       const time = document.createElement('div');
       time.className = 'time';
@@ -403,7 +480,7 @@ function paint() {
     const input = document.querySelector('form input');
     const sendBtn = document.querySelector('form button');
     if (input) input.disabled = !canSend(s);
-    if (sendBtn) sendBtn.disabled = sending || !canSend(s);
+    document.querySelectorAll('form button').forEach(btn => { btn.disabled = sending || !canSend(s); });
     return;
   }
   const keepInput = document.querySelector('form input');
@@ -446,7 +523,7 @@ function paint() {
       sub.className = 'preview' + (last && last.mine ? ' mine' : '');
       const label = document.createElement('span');
       label.className = 'preview-text';
-      label.textContent = last ? last.text : '還沒有訊息';
+      label.textContent = last ? (last.text || (last.image ? '圖片' : (last.quote || '還沒有訊息'))) : '還沒有訊息';
       sub.append(label);
       if (last && last.time) {
         const when = document.createElement('span');
@@ -499,12 +576,71 @@ function paint() {
       lastSentAt = Date.now();
     }).catch(err => { alert(err.message); }).finally(() => {
       sending = false;
-      const btn = document.querySelector('form button');
-      if (btn) btn.disabled = !canSend(s);
+      document.querySelectorAll('form button').forEach(btn => { btn.disabled = !canSend(s); });
     });
   };
+  const file = document.createElement('input');
+  file.type = 'file';
+  file.accept = 'image/png,image/jpeg,image/gif';
+  const pick = document.createElement('button');
+  pick.type = 'button';
+  pick.className = 'pick';
+  pick.textContent = '圖片';
+  pick.disabled = sending || !canSend(s);
+  pick.onclick = () => file.click();
+  file.onchange = () => {
+    const chosen = file.files && file.files[0];
+    file.value = '';
+    if (chosen) sendImage(s, chosen);
+  };
+  form.append(file, pick);
   document.body.append(form);
   if (draft) input.focus();
+}
+
+function showPic(id, img) {
+  if (picUrls[id]) { img.src = picUrls[id]; return; }
+  fetch('/api/images/' + id, { headers: { Authorization: 'Bearer ' + token } })
+    .then(r => { if (!r.ok) throw new Error('no'); return r.blob(); })
+    .then(blob => {
+      picUrls[id] = URL.createObjectURL(blob);
+      if (img.isConnected) img.src = picUrls[id];
+    })
+    .catch(() => {});
+}
+
+function shrinkFile(file) {
+  if (file.type === 'image/gif') {
+    if (file.size > 1200000) return Promise.reject(new Error('GIF 太大'));
+    return Promise.resolve(file);
+  }
+  if (file.type !== 'image/jpeg' && file.type !== 'image/png' && file.type !== 'image/jpg') {
+    return Promise.reject(new Error('只收 png、jpeg、gif'));
+  }
+  if (file.size <= 400000) return Promise.resolve(file);
+  return createImageBitmap(file).then(bitmap => new Promise(resolve => {
+    const scale = Math.min(1, 960 / bitmap.width);
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+    canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    if (bitmap.close) bitmap.close();
+    canvas.toBlob(blob => resolve(blob ? new File([blob], 'relay.jpg', { type: 'image/jpeg' }) : file), 'image/jpeg', 0.8);
+  }));
+}
+
+function sendImage(s, file) {
+  if (!s || sending || !canSend(s)) return;
+  sending = true;
+  document.querySelectorAll('form button').forEach(btn => { btn.disabled = true; });
+  shrinkFile(file).then(ready => api('/api/sessions/' + encodeURIComponent(s.tabId) + '/send-image', {
+    method: 'POST',
+    headers: { 'Content-Type': ready.type || 'image/jpeg' },
+    body: ready
+  })).catch(err => alert(err.message || '圖片送出失敗')).finally(() => {
+    sending = false;
+    document.querySelectorAll('form button').forEach(btn => { btn.disabled = !canSend(s); });
+  });
 }
 
 let ticking = false;
@@ -565,6 +701,35 @@ function main() {
                 if (url.searchParams.get('wait') === '1') await pause(POLL_MS, req);
                 if (clientGone(req, res)) return;
                 return send(res, 200, { ok: true, outbox: session.outbox });
+            }
+            const imgMatch = url.pathname.match(/^\/api\/images\/([a-z0-9]{8,40})$/);
+            if (imgMatch && req.method === 'GET') {
+                const file = imagePath(imgMatch[1]);
+                if (!file) return send(res, 404, { error: 'gone' });
+                const ext = path.extname(file).slice(1);
+                const mime = ext === 'png' ? 'image/png' : ext === 'gif' ? 'image/gif' : 'image/jpeg';
+                res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'private, max-age=86400' });
+                fs.createReadStream(file).pipe(res);
+                return;
+            }
+            if (imgMatch && req.method === 'POST') {
+                if (imagePath(imgMatch[1])) return send(res, 200, { ok: true });
+                const buf = await readRaw(req, 1500000);
+                if (!writeImage(imgMatch[1], buf, req.headers['content-type'])) return send(res, 400, { error: 'bad image' });
+                return send(res, 200, { ok: true });
+            }
+            const imgSend = url.pathname.match(/^\/api\/sessions\/([a-z0-9]{8,40})\/send-image$/);
+            if (req.method === 'POST' && imgSend) {
+                const session = sessions.get(imgSend[1]);
+                if (!session) return send(res, 404, { error: 'gone' });
+                if (!session.canType || session.status === 'left') return send(res, 409, { error: 'cannot send' });
+                const buf = await readRaw(req, 1500000);
+                const imageId = crypto.randomBytes(8).toString('hex');
+                if (!writeImage(imageId, buf, req.headers['content-type'])) return send(res, 400, { error: 'bad image' });
+                const item = enqueue(session, '', Date.now(), imageId);
+                if (!item) return send(res, 400, { error: 'empty' });
+                saveSessions(sessions);
+                return send(res, 200, { ok: true, id: item.id });
             }
             const sendMatch = url.pathname.match(/^\/api\/sessions\/([a-z0-9]{8,40})\/send$/);
             if (req.method === 'POST' && sendMatch) {

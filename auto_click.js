@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.60
+// @version      1.4.61
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -66,7 +66,7 @@
     const HINT_CODE_KEY = 'knockHintCode';
     const HINT_NOTIFIED_KEY = 'knockHintConnectedNotified';
     const HINT_WAS_WAITING_KEY = 'knockHintWasWaiting';
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.60';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.61';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -802,19 +802,57 @@
         syncUnnamedChip();
     }
 
+    // 引用區裡才有另一個頭像。往上找到同時有「不含頭像的正文」的那一層。
+    function replySplit(messageDiv) {
+        const avatar = messageDiv.querySelector('[data-test="user-avatar"]');
+        if (!avatar) return null;
+        let node = avatar;
+        while (node.parentElement && messageDiv.contains(node.parentElement)) {
+            const parent = node.parentElement;
+            const body = Array.from(parent.children).find(el =>
+                el !== node && !el.contains(avatar) && el.textContent.trim() && !el.querySelector('[data-test="date"]')
+            );
+            if (body && node !== avatar) return { quote: node, body };
+            node = parent;
+        }
+        return null;
+    }
+
+    function getMessageQuote(messageDiv) {
+        const split = replySplit(messageDiv);
+        if (!split) return '';
+        const clone = split.quote.cloneNode(true);
+        clone.querySelectorAll('[data-test="user-avatar"]').forEach(el => el.remove());
+        const text = clone.textContent.replace(/\[unknown\]/g, '').replace(/\(未知對象\)/g, '').replace(/\s+/g, ' ').trim();
+        if (text) return text.slice(0, 200);
+        const img = Array.from(split.quote.querySelectorAll('img')).find(el => !el.closest('[data-test="user-avatar"]'));
+        return img ? '圖片' : '';
+    }
+
     function getMessageText(messageDiv) {
-        const timeEl = messageDiv.querySelector('span[data-test="date"]');
-        if (!timeEl) return messageDiv.textContent.trim();
-        const clone = messageDiv.cloneNode(true);
+        const split = replySplit(messageDiv);
+        const root = split ? split.body : messageDiv;
+        if (!split) {
+            const timeEl = messageDiv.querySelector('span[data-test="date"]');
+            if (!timeEl) return messageDiv.textContent.trim();
+        }
+        const clone = root.cloneNode(true);
         clone.querySelector('div[style*="grid-area: date"]')?.remove();
         clone.querySelectorAll('[data-test="message-image"]').forEach(el => el.remove());
         return clone.textContent.trim();
     }
 
     function getMessageImages(messageDiv) {
-        return Array.from(messageDiv.querySelectorAll('[data-test="message-image"] img'))
+        const split = replySplit(messageDiv);
+        const root = split ? split.body : messageDiv;
+        return Array.from(root.querySelectorAll('[data-test="message-image"] img'))
             .map(img => img.currentSrc || img.src)
             .filter(src => src && /^https?:\/\//.test(src));
+    }
+
+    function quoteHtml(msg) {
+        if (!msg || !msg.quote) return '';
+        return `<div style="font-size:12px;color:rgba(255,255,255,.65);border-left:2px solid rgba(255,255,255,.35);padding-left:6px;margin-bottom:6px;">${escapeHtml(msg.quote)}</div>`;
     }
 
     function messagePreviewText(msg) {
@@ -1018,6 +1056,15 @@
         });
     }
 
+    function dataUrlToBlob(dataUrl) {
+        const parts = String(dataUrl || '').split(',');
+        const mime = ((parts[0] || '').match(/:(.*?);/) || [])[1] || 'image/jpeg';
+        const bin = atob(parts[1] || '');
+        const arr = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+        return new Blob([arr], { type: mime });
+    }
+
     function attachImages(message, urls) {
         const keys = (urls || []).map(stableImageKey).filter(Boolean);
         if (keys.length) message.imageKeys = keys;
@@ -1048,9 +1095,10 @@
         const timestamp = timeElement ? timeElement.textContent.trim() : null;
         date = date || parseKnockDateLabel(timestamp) || '';
         const messageText = getMessageText(messageDiv);
+        const quote = getMessageQuote(messageDiv);
         const imageUrls = getMessageImages(messageDiv);
         if (TYPING_RE.test(messageText)) return;
-        if (!messageText && !imageUrls.length) return;
+        if (!messageText && !imageUrls.length && !quote) return;
 
         const clock = clockMinutesOnly(timestamp);
         const domId = (String(messageLi.className || '').match(/message-li-(\S+)/) || [])[1] || '';
@@ -1063,6 +1111,7 @@
                 (domId && (m.domId === domId || m.id === domId)) || imageMessageSig(m) === imageSig
             );
             if (existingImg) {
+                if (quote) existingImg.quote = quote;
                 if (domId) existingImg.domId = domId;
                 existingImg.imageKeys = imageKeys;
                 if (date && existingImg.date !== date) existingImg.date = date;
@@ -1080,6 +1129,7 @@
                 m.timestamp && `${m.text || ''}|${(m.imageUrls || []).join(',')}|${!!m.isMyMessage}` === content
             );
             if (existingByContent) {
+                if (quote) existingByContent.quote = quote;
                 if (date && existingByContent.date !== date) {
                     existingByContent.date = date;
                     persistLiveConversationSoon();
@@ -1092,6 +1142,7 @@
             : hashMessage(messageText, [], isMyMessage, clock ?? date);
         const existing = currentConversation.messages.find(m => m.id === messageHash);
         if (existing) {
+            if (quote) existing.quote = quote;
             if (domId) existing.domId = domId;
             if (imageKeys.length) existing.imageKeys = imageKeys;
             if (date && existing.date !== date) {
@@ -1105,6 +1156,7 @@
         const message = {
             id: messageHash,
             text: messageText,
+            quote,
             imageUrls,
             imageKeys,
             domId,
@@ -2136,6 +2188,7 @@
                         : `<div style="color:#888;font-size:18px;">${msg.isMyMessage ? '我' : '對'}</div>`}
                 </div>
                 <div style="background:${msg.isMyMessage ? '#2d5a3d' : '#2d2d3d'};border-radius:8px;padding:8px 10px;max-width:70%;">
+                    ${quoteHtml(msg)}
                     ${msg.text ? `<div style="font-size:14px;line-height:1.4;word-wrap:break-word;">${escapeHtml(msg.text)}</div>` : ''}
                     ${(msg.imageUrls || []).map(src => `
                         <a href="${escapeHtml(src)}" target="_blank" rel="noreferrer">
@@ -2454,7 +2507,11 @@
             const messageDiv = li.querySelector('div[data-test="message"]');
             if (!messageDiv) continue;
             const text = getMessageText(messageDiv);
-            if (!text || TYPING_RE.test(text)) continue;
+            if (TYPING_RE.test(text)) continue;
+            const images = getMessageImages(messageDiv);
+            const image = images[0] ? relayImageId(images[0]) : '';
+            const quote = getMessageQuote(messageDiv);
+            if (!text && !image && !quote) continue;
             const id = (String(li.className || '').match(/message-li-(\S+)/) || [])[1] || '';
             if (!id) continue;
             const timeEl = messageDiv.querySelector('span[data-test="date"]');
@@ -2462,7 +2519,8 @@
                 timestamp: timeEl ? timeEl.textContent.trim() : '',
                 date: dateByLi.get(li) || ''
             });
-            messages.push({ id, text: text.slice(0, 500), mine: isMyMessageLi(li), time });
+            // ponytail: 一則只帶第一張圖。多圖再改成陣列。
+            messages.push({ id, text: text.slice(0, 500), quote, image, mine: isMyMessageLi(li), time });
         }
         return {
             tabId: relayTabId(),
@@ -2475,7 +2533,65 @@
     }
 
     const relaySending = new Map();
+    const relayUploaded = new Set();
     let relayBusy = false;
+
+    function relayImageId(url) {
+        const key = stableImageKey(url) || url;
+        let id = hashString(key).replace(/[^a-z0-9]/g, '');
+        if (id.length < 8) id = (id + 'knockimg').slice(0, 12);
+        return id.slice(0, 40);
+    }
+
+    async function relayUploadImages(snap) {
+        for (const m of snap.messages || []) {
+            if (!m.image || relayUploaded.has(m.image)) continue;
+            const li = Array.from(document.querySelectorAll('li.message-li')).find(el => el.classList.contains('message-li-' + m.id));
+            const messageDiv = li && li.querySelector('[data-test="message"]');
+            const url = messageDiv && getMessageImages(messageDiv)[0];
+            if (!url) continue;
+            try {
+                let blob = await fetchImageBlob(url);
+                if (blob.size > 400 * 1024 && blob.type !== 'image/gif') {
+                    const dataUrl = await blobToDataUrl(blob);
+                    if (String(dataUrl).startsWith('data:')) blob = dataUrlToBlob(dataUrl);
+                }
+                const res = await gmRequest({
+                    method: 'POST',
+                    url: `${RELAY_URL}/api/images/${m.image}`,
+                    headers: { Authorization: `Bearer ${relayToken()}`, 'Content-Type': blob.type || 'image/jpeg' },
+                    data: blob,
+                    timeout: 20000
+                });
+                if (res && (res.status === 200 || res.status === 409)) relayUploaded.add(m.image);
+            } catch (e) {}
+            return;
+        }
+    }
+
+    async function relayDropImage(item) {
+        const res = await gmRequest({
+            method: 'GET',
+            url: `${RELAY_URL}/api/images/${item.image}`,
+            headers: { Authorization: `Bearer ${relayToken()}` },
+            responseType: 'blob',
+            timeout: 20000
+        });
+        const blob = res && res.response;
+        if (!res || res.status !== 200 || !blob) return false;
+        const type = blob.type && blob.type.indexOf('image/') === 0 ? blob.type : 'image/jpeg';
+        const gif = type.indexOf('gif') !== -1;
+        const file = new File([blob], gif ? 'relay.gif' : 'relay.jpg', { type: gif ? 'image/gif' : type });
+        const input = document.querySelector(gif
+            ? '#filepond-video-gif-uploader input.filepond--browser'
+            : '#filepond-image-uploader input.filepond--browser');
+        if (!input || typeof DataTransfer === 'undefined') return false;
+        const dt = new DataTransfer();
+        dt.items.add(file);
+        input.files = dt.files;
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        return input.files && input.files.length === 1;
+    }
 
     async function relayTick() {
         const token = relayToken();
@@ -2494,10 +2610,22 @@
             if (res && res.status === 200) {
             const data = JSON.parse(res.responseText || '{}');
             for (const item of data.outbox || []) {
-                if (!item || !item.id || !item.text || !snap.canType) continue;
+                if (!item || !item.id || !snap.canType || (!item.text && !item.image)) continue;
                 const started = relaySending.get(item.id) || 0;
                 if (Date.now() - started < 8000) continue;
                 relaySending.set(item.id, Date.now());
+                if (item.image) {
+                    const ok = await relayDropImage(item);
+                    if (!ok) { relaySending.delete(item.id); continue; }
+                    gmRequest({
+                        method: 'POST',
+                        url: `${RELAY_URL}/api/sessions/${snap.tabId}/ack`,
+                        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                        data: JSON.stringify({ id: item.id }),
+                        timeout: 8000
+                    }).catch(() => {}).finally(() => relaySending.delete(item.id));
+                    continue;
+                }
                 const sent = sendChatMessage(item.text, () => {
                     gmRequest({
                         method: 'POST',
@@ -2509,6 +2637,7 @@
                 });
                 if (!sent) relaySending.delete(item.id);
             }
+            await relayUploadImages(snap);
             }
         } catch (e) {}
         relayBusy = false;
@@ -2620,7 +2749,8 @@
             const links = (msg.imageUrls || []).filter(src => src && !String(src).startsWith('data:'));
             const content = [msg.text, ...links].filter(Boolean).join(' ')
                 || ((msg.imageUrls || []).length ? '[圖片]' : '');
-            return `${speaker}：${content} （${msg.timestamp || '未知時間'}）`;
+            const quoted = msg.quote ? `（回覆 ${msg.quote}）` : '';
+            return `${speaker}：${quoted}${content} （${msg.timestamp || '未知時間'}）`;
         }).join('\n');
     }
 
@@ -3143,6 +3273,7 @@
                         </div>
                         <div style="background:${msg.isMyMessage ? '#2d5a3d' : '#2d2d3d'};border-radius:8px;padding:8px 10px;max-width:70%;display:flex;align-items:flex-start;gap:8px;">
                             <div style="flex:1;min-width:0;">
+                                ${quoteHtml(msg)}
                                 ${msg.text ? `<div style="font-size:14px;line-height:1.4;word-wrap:break-word;">${escapeHtml(msg.text)}</div>` : ''}
                                 ${(msg.imageUrls || []).map(src => `
                                     <a href="${escapeHtml(src)}" target="_blank" rel="noreferrer">
@@ -3401,6 +3532,12 @@
             || openingLineName('新句子', '已命名')
             || openingLineName('一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十多餘', '').length !== 40) {
             console.error('knock: 發語詞當顯示名稱失敗');
+        }
+        const replyHost = document.createElement('div');
+        replyHost.innerHTML = '<div data-test="message"><span><div><div><div></div><div><div data-test="user-avatar"></div><div>[unknown]</div><div>原文</div></div></div><div>回覆</div></div></span></div>';
+        const replyDiv = replyHost.querySelector('[data-test="message"]');
+        if (getMessageQuote(replyDiv) !== '原文' || getMessageText(replyDiv) !== '回覆') {
+            console.error('knock: 回覆拆分失敗', getMessageQuote(replyDiv), getMessageText(replyDiv));
         }
         if (cooldownReasonText('firstFilter', '阿明') !== '開始聊天 · 過濾了 阿明'
             || cooldownReasonText('firstFilter', '') !== '開始聊天 · 使用者過濾而重連'
