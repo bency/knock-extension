@@ -73,7 +73,8 @@ function rememberTalk(talks, body, now) {
     if (messages.length > TALK_KEEP) messages = messages.slice(messages.length - TALK_KEEP);
     const title = String(archive.title || (prev && prev.title) || '').trim().slice(0, 40) || '未命名';
     if (!messages.length) return false;
-    talks.set(uid, { uid, title, messages, updated: now });
+    const lastAt = talkLastAt(messages) || (prev && prev.lastAt) || 0;
+    talks.set(uid, { uid, title, messages, updated: now, lastAt });
     if (talks.size > 300) {
         let oldest = null;
         for (const t of talks.values()) {
@@ -85,10 +86,42 @@ function rememberTalk(talks, body, now) {
     return true;
 }
 
+function messageTimeMs(text) {
+    const raw = String(text || '').trim();
+    const space = raw.lastIndexOf(' ');
+    const datePart = space > 0 ? raw.slice(0, space) : '';
+    const clockPart = space > 0 ? raw.slice(space + 1) : raw;
+    const colon = clockPart.indexOf(':');
+    if (colon < 1) return 0;
+    const hh = parseInt(clockPart.slice(0, colon), 10);
+    const mm = parseInt(clockPart.slice(colon + 1), 10);
+    if (hh !== hh || mm !== mm) return 0;
+    const slash = datePart.indexOf('/');
+    const now = new Date();
+    let month = parseInt(slash > 0 ? datePart.slice(0, slash) : '', 10);
+    let day = parseInt(slash > 0 ? datePart.slice(slash + 1) : '', 10);
+    const dated = month === month && day === day;
+    if (!dated) { month = now.getMonth() + 1; day = now.getDate(); }
+    let at = new Date(now.getFullYear(), month - 1, day, hh, mm).getTime();
+    if (at > Date.now() + 60000) {
+        at = dated ? new Date(now.getFullYear() - 1, month - 1, day, hh, mm).getTime() : at - 86400000;
+    }
+    return at;
+}
+
+function talkLastAt(messages) {
+    let best = 0;
+    for (const m of messages || []) {
+        const at = messageTimeMs(m && m.time);
+        if (at > best) best = at;
+    }
+    return best;
+}
+
 function visibleTalks(talks) {
     return [...talks.values()]
-        .map(t => ({ uid: t.uid, title: t.title, updated: t.updated, count: t.messages.length }))
-        .sort((a, b) => b.updated - a.updated || (a.uid < b.uid ? -1 : 1));
+        .map(t => ({ uid: t.uid, title: t.title, updated: t.updated, lastAt: t.lastAt || talkLastAt(t.messages) || t.updated, count: t.messages.length }))
+        .sort((a, b) => b.lastAt - a.lastAt || b.updated - a.updated || (a.uid < b.uid ? -1 : 1));
 }
 
 function loadTalks() {
@@ -100,11 +133,13 @@ function loadTalks() {
             if (!uid) continue;
             const messages = (Array.isArray(t.messages) ? t.messages : []).map(archiveMessage).filter(Boolean).slice(-TALK_KEEP);
             if (!messages.length) continue;
+            const updated = Number(t.updated) || 0;
             map.set(uid, {
                 uid,
                 title: String(t.title || '未命名').slice(0, 40) || '未命名',
                 messages,
-                updated: Number(t.updated) || 0
+                updated,
+                lastAt: talkLastAt(messages) || Number(t.lastAt) || updated
             });
         }
         return map;
@@ -571,6 +606,13 @@ function selfCheck() {
         || !rememberTalk(recallTalks, { archive: { uid: 'user_two', title: '阿明', messages: [{ id: 'c', text: '晚安', mine: true, time: '01:01' }] } }, 9)
         || !rememberTalk(recallTalks, { archive: { uid: 'user_two', title: '阿明', messages: [{ id: 'c', text: '已收回一則訊息', mine: true }] } }, 10)
         || recallTalks.get('user_two').messages[0].text !== '晚安（已收回）') {
+        throw new Error('knock relay 檢查失敗');
+    }
+    const ordered = new Map();
+    rememberTalk(ordered, { archive: { uid: 'user_two', title: '舊', messages: [{ id: 'oldmsg1', text: '早', time: '1/2 08:00' }] } }, 1);
+    rememberTalk(ordered, { archive: { uid: 'user_new1', title: '新', messages: [{ id: 'newmsg1', text: '晚', time: '10/6 01:02' }] } }, 2);
+    const order = visibleTalks(ordered);
+    if (order[0].uid !== 'user_new1' || order[1].uid !== 'user_two' || !(order[0].lastAt > order[1].lastAt)) {
         throw new Error('knock relay 檢查失敗');
     }
     dropped.delete('user_one:a');
@@ -1132,7 +1174,7 @@ function talkCard(t) {
   sub.append(label);
   const when = document.createElement('span');
   when.className = 'preview-time';
-  when.textContent = talkClock(t.updated);
+  when.textContent = talkClock(t.lastAt || t.updated);
   sub.append(when);
   btn.append(name, sub);
   btn.onclick = () => {

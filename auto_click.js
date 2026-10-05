@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.73
+// @version      1.4.74
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -66,7 +66,7 @@
     const HINT_CODE_KEY = 'knockHintCode';
     const HINT_NOTIFIED_KEY = 'knockHintConnectedNotified';
     const HINT_WAS_WAITING_KEY = 'knockHintWasWaiting';
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.73';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.74';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -2705,17 +2705,10 @@
         return null;
     }
 
-    // ponytail: 每次心跳讀全部本地對話，只送 30 則。則數很多時再改成記住送到哪。
+    // 只送目前這場。舊的本地紀錄已同步過，不再每輪重讀。
     function relayArchive() {
         notePartnerFromList();
-        const stored = [];
-        const seen = new Set();
-        for (const c of [...getSavedConversations(), ...getAutoConversations()]) {
-            if (!c || seen.has(c.id)) continue;
-            seen.add(c.id);
-            stored.push(c);
-        }
-        const next = nextArchive(archiveSources(currentConversation, stored, currentPartnerName() || ''), relayArchived);
+        const next = nextArchive(archiveSources(currentConversation, [], currentPartnerName() || ''), relayArchived);
         if (!next) return null;
         const messages = [];
         const skip = [];
