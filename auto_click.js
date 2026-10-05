@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.70
+// @version      1.4.71
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -66,7 +66,7 @@
     const HINT_CODE_KEY = 'knockHintCode';
     const HINT_NOTIFIED_KEY = 'knockHintConnectedNotified';
     const HINT_WAS_WAITING_KEY = 'knockHintWasWaiting';
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.70';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.71';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -2792,6 +2792,19 @@
             dock.remove();
             createDock();
         }
+        saveRoomControls();
+    }
+
+    function saveRoomControls() {
+        try { sessionStorage.setItem('knockRoomControls', JSON.stringify(relayControls())); } catch (e) {}
+    }
+
+    function storedRoomControls() {
+        try {
+            const raw = JSON.parse(sessionStorage.getItem('knockRoomControls') || 'null');
+            if (raw && typeof raw === 'object') return raw;
+        } catch (e) {}
+        return null;
     }
 
     function relayImageId(url) {
@@ -2978,6 +2991,7 @@
     async function relayTick() {
         const token = relayToken();
         if (!token || relayBusy) return;
+        saveRoomControls();
         const snap = relaySnapshot();
         if (!snap) return;
         relayBusy = true;
@@ -3805,6 +3819,8 @@
     function mountChrome() {
         if (!document.body) return;
         OLD_FLOAT_IDS.forEach(id => el(id)?.remove());
+        const room = storedRoomControls();
+        if (room) applyRelayControls(room);
         createDock();
     }
 

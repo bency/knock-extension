@@ -11,6 +11,7 @@ const WAIT_MS = 3 * 60 * 1000;
 const POLL_MS = 2000;
 const DATA = process.env.KNOCK_DATA || '/app/sessions.json';
 const TALK_FILE = path.join(path.dirname(DATA), 'talks.json');
+const DROP_FILE = path.join(path.dirname(DATA), 'dropped.json');
 const IMG_DIR = path.join(path.dirname(DATA), 'images');
 const TALK_KEEP = 800;
 
@@ -44,7 +45,7 @@ function rememberTalk(talks, body, now) {
     if (!archive || typeof archive !== 'object') return false;
     const uid = cleanUid(archive.uid);
     if (!uid) return false;
-    const incoming = (Array.isArray(archive.messages) ? archive.messages : []).map(archiveMessage).filter(Boolean).slice(0, 40);
+    const incoming = (Array.isArray(archive.messages) ? archive.messages : []).map(archiveMessage).filter(Boolean).filter(m => !dropped.has(uid + ':' + m.id)).slice(0, 40);
     const prev = talks.get(uid);
     if (!incoming.length && (!prev || prev.title === String(archive.title || '').trim().slice(0, 40))) return false;
     const map = new Map();
@@ -102,6 +103,30 @@ function loadTalks() {
     }
 }
 
+const dropped = new Set();
+
+function loadDropped() {
+    try {
+        const raw = JSON.parse(fs.readFileSync(DROP_FILE, 'utf8'));
+        if (!Array.isArray(raw)) return;
+        dropped.clear();
+        raw.slice(-20000).forEach(id => { if (id) dropped.add(String(id)); });
+    } catch (e) {}
+}
+
+function saveDropped() {
+    fs.writeFileSync(DROP_FILE, JSON.stringify([...dropped].slice(-20000)));
+}
+
+function dropTalk(talks, uid) {
+    const prev = talks.get(uid);
+    if (!prev) return false;
+    for (const m of prev.messages || []) if (m && m.id) dropped.add(uid + ':' + m.id);
+    talks.delete(uid);
+    touch();
+    return true;
+}
+
 function saveTalks(talks) {
     fs.writeFileSync(TALK_FILE, JSON.stringify([...talks.values()]));
 }
@@ -143,6 +168,7 @@ function applyHeartbeat(sessions, body, now) {
         outbox: prev ? prev.outbox : []
     };
     sessions.set(tabId, session);
+    touch();
     return session;
 }
 
@@ -322,6 +348,7 @@ function enqueue(session, text, now, image) {
     if (!item.image && last && !last.image && last.text === item.text && now - Number(last.at) < 2000) return last;
     if (session.outbox.length >= 20) session.outbox.shift();
     session.outbox.push(item);
+    touch();
     return item;
 }
 
@@ -340,8 +367,10 @@ function selfCheck() {
     const vis = visibleSessions(sessions, 20000, 15000);
     const fresh = vis.find(s => s.tabId === 'abc12345');
     const old = vis.find(s => s.tabId === 'zzzzzzzz');
+    const quiet = applyHeartbeat(sessions, { tabId: 'quiettab1', title: '空', canType: true, messages: [] }, 1000);
     if (!live || sessions.get('abc12345').outbox.length !== 1 || vis.length !== 2
-        || !fresh || fresh.waiting || fresh.title !== '阿明' || !old || !old.waiting) {
+        || !fresh || fresh.waiting || fresh.title !== '阿明' || !old || !old.waiting
+        || heartbeatReady(quiet) || !heartbeatReady(sessions.get('abc12345'))) {
         throw new Error('knock relay 檢查失敗');
     }
     if (applyHeartbeat(sessions, { tabId: '../x', title: 'x' }, 2000)) throw new Error('knock relay 檢查失敗');
@@ -396,9 +425,16 @@ function selfCheck() {
         || rememberTalk(talks, { archive: { uid: 'no', messages: [{ id: 'c', text: 'x' }] } }, 4)
         || talks.size !== 1
         || talks.get('user_one').messages.map(m => m.id).join() !== 'a,b'
-        || visibleTalks(talks)[0].count !== 2) {
+        || visibleTalks(talks)[0].count !== 2
+        || !dropTalk(talks, 'user_one')
+        || talks.has('user_one')
+        || rememberTalk(talks, { archive: { uid: 'user_one', title: '阿明', messages: [{ id: 'a', text: '嗨', mine: false }] } }, 5)
+        || talks.has('user_one')
+        || dropTalk(talks, 'user_one')) {
         throw new Error('knock relay 檢查失敗');
     }
+    dropped.delete('user_one:a');
+    dropped.delete('user_one:b');
 }
 
 function pause(ms, req) {
@@ -415,6 +451,45 @@ function pause(ms, req) {
         const timer = setTimeout(finish, ms);
         if (socket) socket.on('close', finish);
     });
+}
+
+let revision = 0;
+const wakes = new Set();
+
+function touch() {
+    revision += 1;
+    for (const wake of wakes) wake();
+}
+
+function waitUntil(ms, req, ready) {
+    if (ready()) return Promise.resolve();
+    return new Promise(resolve => {
+        let done = false;
+        const socket = req.socket;
+        const finish = () => {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            wakes.delete(check);
+            if (socket) socket.removeListener('close', finish);
+            resolve();
+        };
+        const check = () => { if (ready()) finish(); };
+        const timer = setTimeout(finish, ms);
+        wakes.add(check);
+        if (socket) socket.on('close', finish);
+        if (ready()) finish();
+    });
+}
+
+function heartbeatReady(session) {
+    if ((session.outbox || []).some(item => item && !(item.image && item.handed))) return true;
+    if (session.controlWanted && !sameControls(session.controls, session.controlWanted)) return true;
+    const avatarOn = !!(session.openings && session.openings.avatarOn);
+    if (typeof session.avatarWanted === 'boolean' && session.avatarWanted !== avatarOn) return true;
+    const userOn = !!(session.openings && session.openings.userOn);
+    if (typeof session.userWanted === 'boolean' && session.userWanted !== userOn) return true;
+    return false;
 }
 
 function clientGone(req, res) {
@@ -502,28 +577,51 @@ const PAGE = `<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Knock 遠端</title>
 <style>
-  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:#111; color:#eee; }
-  header { position:fixed; top:0; left:0; right:0; z-index:5; height:48px; box-sizing:border-box; padding:8px 12px; font-size:18px; border-bottom:1px solid #333; background:#111; display:flex; align-items:center; justify-content:space-between; }
-  header button { border:1px solid #444; background:#1c1c1c; border-radius:8px; padding:4px 10px; cursor:pointer; font-size:14px; }
-  .tabs { position:fixed; top:48px; left:0; right:0; z-index:5; display:flex; gap:8px; padding:8px 12px; background:#111; border-bottom:1px solid #333; }
-  .tabs button { flex:1; padding:8px; border:1px solid #444; border-radius:8px; background:#1c1c1c; cursor:pointer; }
-  .tabs button.on { background:#2d5a3d; border-color:#2d5a3d; }
-  .back { position:fixed; top:0; left:0; right:0; z-index:6; margin:0; border-radius:0; border-left:none; border-right:none; }
-  .topbar { position:fixed; top:0; left:0; right:0; z-index:6; display:flex; }
+  html, body { height:100%; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:#111; color:#eee; overflow:hidden; }
+  .shell { display:flex; height:100%; }
+  #rail { width:220px; flex:none; overflow:auto; border-right:1px solid #333; background:#111; }
+  #rail .fold { display:flex; align-items:center; gap:6px; width:100%; margin:0; padding:10px 12px; border:none; background:transparent; color:#888; font-size:12px; font-weight:600; cursor:pointer; text-align:left; }
+  #rail .card { width:calc(100% - 16px); box-sizing:border-box; margin:0 8px 4px; padding:4px 8px; }
+  #rail .muted { margin:0 12px 8px; font-size:13px; }
+  #rail .card.on { background:#1e3326; border-color:#2d5a3d; }
+  #rail .talk { margin:0 8px 4px; }
+  #rail .talk .card { position:relative; width:100%; margin:0; box-sizing:border-box; }
+  #rail .talk .who { min-height:22px; padding-right:26px; }
+  #rail .talk .who span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #rail .bin { position:absolute; top:4px; right:8px; z-index:2; width:22px; height:22px; padding:0; border:none; background:transparent; color:#e53935; cursor:pointer; display:flex; align-items:center; justify-content:center; }
+  .stage { flex:1; min-width:0; height:100%; display:flex; flex-direction:column; position:relative; }
+  #shade { display:none; position:fixed; inset:0; z-index:19; border:none; padding:0; background:rgba(0,0,0,.5); }
+  .topbar .menu { width:48px; height:48px; padding:0; display:flex; align-items:center; justify-content:center; }
+  .topbar .rail-btn { display:none; }
+  @media (max-width:760px) {
+    #rail { position:fixed; z-index:20; top:0; bottom:0; left:0; width:min(280px, 86vw); transform:translateX(-110%); transition:transform .18s ease; }
+    body.rail-open #rail { transform:none; }
+    body.rail-open #shade { display:block; }
+    .topbar .rail-btn { display:flex; }
+  }
+  body.locked { overflow:auto; }
+  body.locked .shell, body.locked #shade { display:none; }
+  .topbar { position:relative; flex:none; z-index:6; display:flex; justify-content:space-between; height:48px; background:#111; border-bottom:1px solid #333; }
   .topbar .card { margin:0; border-radius:0; flex:1; border-left:none; border-right:none; }
-  .topbar .gear { flex:none; width:72px; border-radius:0; border:1px solid #333; background:#1c1c1c; cursor:pointer; }
-  main { max-width:640px; margin:0 auto; padding:108px 12px 88px; }
-  body.in-thread header, body.in-thread .tabs { display:none; }
-  body.in-thread main { padding-top:64px; }
+  .topbar .gear { position:relative; z-index:1; flex:none; width:auto; height:48px; padding:0 12px; border-radius:0; border:1px solid #333; background:#1c1c1c; cursor:pointer; }
+  .topbar .gear.menu { width:48px; padding:0; }
+  .topbar .end { margin-left:auto; }
+  .topbar .who { position:absolute; left:0; right:0; top:0; height:48px; display:flex; align-items:center; justify-content:center; padding:0 72px; pointer-events:none; overflow:hidden; }
+  .topbar .who span { min-width:0; max-width:100%; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+  .topbar .del { background:#e53935; border-color:#e53935; color:#fff; }
+  main { flex:1; min-height:0; overflow:auto; padding:12px; }
   button, input { font:inherit; color:#eee; }
   .card, .msg { background:#1c1c1c; border:1px solid #333; border-radius:10px; }
   .card { display:block; width:100%; text-align:left; padding:12px; margin:0 0 8px; cursor:pointer; }
+  #rail .card { width:calc(100% - 16px); box-sizing:border-box; margin:0 8px 4px; padding:4px 8px; }
+  #rail .card small { margin-top:2px; }
   .card small { display:block; color:#aaa; margin-top:4px; }
   .card small.preview { display:flex; gap:8px; align-items:baseline; color:#ffb74d; }
   .card small.preview .preview-text { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .card small.preview .preview-time { flex:none; color:#888; white-space:nowrap; }
   .card small.preview.mine { color:#9ccc65; }
-  .new-msg { position:fixed; left:50%; bottom:72px; transform:translateX(-50%); z-index:7; padding:6px 14px; border:none; border-radius:16px; background:#ffb74d; color:#111; font-size:13px; cursor:pointer; box-shadow:0 2px 8px rgba(0,0,0,.35); }
+  .new-msg { position:absolute; left:50%; bottom:72px; transform:translateX(-50%); z-index:7; padding:6px 14px; border:none; border-radius:16px; background:#ffb74d; color:#111; font-size:13px; cursor:pointer; box-shadow:0 2px 8px rgba(0,0,0,.35); }
   .bubble { display:flex; margin:0 0 8px; }
   .bubble.mine { justify-content:flex-end; }
   .bubble.them { justify-content:flex-start; }
@@ -534,7 +632,7 @@ const PAGE = `<!DOCTYPE html>
   .quote { font-size:12px; color:rgba(255,255,255,.7); border-left:2px solid rgba(255,255,255,.35); padding-left:6px; margin-bottom:6px; }
   .msg img.pic { display:block; max-width:100%; max-height:240px; border-radius:6px; margin-top:6px; }
   .time { display:block; margin-top:4px; font-size:11px; color:rgba(255,255,255,.55); }
-  form { position:fixed; left:0; right:0; bottom:0; display:flex; gap:8px; padding:10px; background:#111; border-top:1px solid #333; }
+  form { position:relative; flex:none; display:flex; gap:8px; padding:10px; background:#111; border-top:1px solid #333; }
   form input { flex:1; padding:10px; border-radius:8px; border:1px solid #444; background:#1a1a1a; }
   form input[type=file] { display:none; }
   form button { padding:10px 14px; border:none; border-radius:8px; background:#4CAF50; cursor:pointer; }
@@ -566,32 +664,39 @@ const PAGE = `<!DOCTYPE html>
 </style>
 </head>
 <body>
-<header><span>Knock 遠端</span><button type="button" id="controls-btn">控制</button></header>
+<div class="shell">
+<aside id="rail"></aside>
+<div class="stage" id="stage">
 <main id="app"></main>
+</div>
+</div>
+<button type="button" id="shade" aria-label="關閉列表"></button>
 <script>
 const TOKEN_KEY = 'knockRelayPageToken';
 const app = document.getElementById('app');
+const rail = document.getElementById('rail');
+const stage = document.getElementById('stage');
 let token = localStorage.getItem(TOKEN_KEY) || '';
 let current = '';
 let archiveUid = '';
 let archiveTalk = null;
 let archiveUpdated = 0;
 let archiveLoading = '';
-let listTab = 'live';
 let sessions = [];
 let talks = [];
+const droppedTalks = new Set();
 let sending = false;
 let lastSentText = '';
 let lastSentAt = 0;
 const picUrls = {};
 let stickBottom = false;
-let resetListScroll = false;
 let showControls = false;
 let controlDraft = null;
 let avatarDraft = null;
 let userDraft = null;
 let keepOpen = false;
 let phoneOpen = false;
+const railFold = { live: false, quiet: true, talks: true };
 const seenTail = {};
 
 function api(path, opts) {
@@ -606,9 +711,12 @@ function api(path, opts) {
 
 function gate() {
   if (document.querySelector('.gate')) return;
-  document.body.classList.remove('in-thread');
+  document.body.classList.add('locked');
+  document.body.classList.remove('rail-open');
   clearChrome();
+  clearForm();
   app.replaceChildren();
+  rail.replaceChildren();
   const box = document.createElement('div');
   box.className = 'gate';
   const p = document.createElement('p');
@@ -626,7 +734,7 @@ function gate() {
     tick();
   };
   box.append(p, input, btn);
-  app.append(box);
+  document.body.append(box);
 }
 
 function statusText(s) {
@@ -635,6 +743,33 @@ function statusText(s) {
   if (!s.canType) return '現在不能回';
   if (s.pending) return '有 ' + s.pending + ' 則待送出';
   return '';
+}
+
+function deleteTalk(uid) {
+  const viewing = archiveUid === uid;
+  const at = talks.findIndex(t => t.uid === uid);
+  const older = viewing && at >= 0 ? talks[at + 1] : null;
+  droppedTalks.add(uid);
+  talks = talks.filter(t => t.uid !== uid);
+  if (older) {
+    archiveUid = older.uid;
+    archiveTalk = null;
+    archiveUpdated = 0;
+    railFold.talks = false;
+    stickBottom = true;
+    paint();
+    loadArchive(older.uid);
+  } else if (viewing) {
+    archiveUid = '';
+    archiveTalk = null;
+    paint();
+  } else {
+    paint();
+  }
+  api('/api/talks/' + encodeURIComponent(uid), { method: 'DELETE' }).catch(() => {
+    droppedTalks.delete(uid);
+    alert('刪除失敗');
+  });
 }
 
 function talkClock(ms) {
@@ -657,23 +792,213 @@ function loadArchive(uid) {
   });
 }
 
-function paintArchive(talk, follow, y) {
-  document.body.classList.add('in-thread');
+function barsIcon() {
+  const bars = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  bars.setAttribute('viewBox', '0 0 24 24');
+  bars.setAttribute('width', '22');
+  bars.setAttribute('height', '22');
+  bars.setAttribute('aria-hidden', 'true');
+  const barPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  barPath.setAttribute('fill', 'currentColor');
+  barPath.setAttribute('d', 'M3 6h18v2H3V6zm0 5h18v2H3v-2zm0 5h18v2H3v-2z');
+  bars.append(barPath);
+  return bars;
+}
+
+function closeRail() { document.body.classList.remove('rail-open'); }
+
+function paintBar(title, end) {
   clearChrome();
-  clearForm();
   const bar = document.createElement('div');
   bar.className = 'topbar';
-  const back = document.createElement('button');
-  back.className = 'card';
-  back.type = 'button';
-  back.textContent = '返回';
-  back.style.flex = 'none';
-  back.onclick = () => { archiveUid = ''; archiveTalk = null; resetListScroll = true; paint(); };
+  const railBtn = document.createElement('button');
+  railBtn.type = 'button';
+  railBtn.className = 'gear menu rail-btn';
+  railBtn.setAttribute('aria-label', '列表');
+  railBtn.append(barsIcon());
+  railBtn.onclick = () => document.body.classList.toggle('rail-open');
   const who = document.createElement('span');
-  who.textContent = (talk && talk.title) || '對話記錄';
-  who.style.cssText = 'flex:1;display:flex;align-items:center;padding:0 12px;background:#1c1c1c;border-bottom:1px solid #333;';
-  bar.append(back, who);
-  document.body.append(bar);
+  who.className = 'who';
+  const whoText = document.createElement('span');
+  whoText.textContent = title || 'Knock 遠端';
+  who.append(whoText);
+  bar.append(railBtn, who);
+  if (end) bar.append(end);
+  stage.insertBefore(bar, app);
+}
+
+function controlsGear() {
+  const gear = document.createElement('button');
+  gear.type = 'button';
+  gear.className = 'gear menu end';
+  gear.setAttribute('aria-label', '控制');
+  gear.append(barsIcon());
+  gear.onclick = () => { showControls = !showControls; paint(); };
+  return gear;
+}
+
+function byRecent(a, b) {
+  return lastMessageAt(b) - lastMessageAt(a) || (a.tabId < b.tabId ? -1 : a.tabId > b.tabId ? 1 : 0);
+}
+
+function trashIcon() {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('width', '18');
+  svg.setAttribute('height', '18');
+  svg.setAttribute('aria-hidden', 'true');
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('fill', 'currentColor');
+  path.setAttribute('d', 'M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z');
+  svg.append(path);
+  return svg;
+}
+
+function railSection(key, title, fill) {
+  const head = document.createElement('button');
+  head.type = 'button';
+  head.className = 'fold';
+  const mark = document.createElement('span');
+  mark.textContent = railFold[key] ? '▸' : '▾';
+  const label = document.createElement('span');
+  label.textContent = title;
+  head.append(mark, label);
+  head.onclick = () => { railFold[key] = !railFold[key]; paint(); };
+  rail.append(head);
+  if (!railFold[key]) fill();
+}
+
+function railEmpty(text) {
+  const p = document.createElement('p');
+  p.className = 'muted';
+  p.textContent = text;
+  return p;
+}
+
+function liveCard(s) {
+  const btn = document.createElement('button');
+  btn.className = 'card' + (s.tabId === current ? ' on' : '');
+  btn.type = 'button';
+  const name = document.createElement('div');
+  name.className = 'who';
+  if (s.openings && s.openings.avatar) name.append(faceNode(s.openings.avatar));
+  const title = document.createElement('span');
+  title.textContent = s.title || '未命名';
+  name.append(title);
+  const ms = s.messages || [];
+  const last = ms[ms.length - 1];
+  const openingText = s.openings && ((s.openings.them && s.openings.them.text) || (s.openings.mine && s.openings.mine.text));
+  const sub = document.createElement('small');
+  sub.className = 'preview' + (last && last.mine ? ' mine' : '');
+  const label = document.createElement('span');
+  label.className = 'preview-text';
+  label.textContent = last ? (last.text || (last.image ? '圖片' : (last.quote || openingText || '還沒有訊息'))) : (openingText || '還沒有訊息');
+  sub.append(label);
+  if (last && last.time) {
+    const when = document.createElement('span');
+    when.className = 'preview-time';
+    when.textContent = last.time;
+    sub.append(when);
+  }
+  btn.append(name, sub);
+  const extra = s.waiting ? '' : statusText(s);
+  if (extra) {
+    const st = document.createElement('small');
+    st.textContent = extra;
+    btn.append(st);
+  }
+  btn.onclick = () => {
+    showControls = false;
+    archiveUid = '';
+    archiveTalk = null;
+    current = s.tabId;
+    stickBottom = true;
+    closeRail();
+    paint();
+  };
+  return btn;
+}
+
+function talkCard(t) {
+  const row = document.createElement('div');
+  row.className = 'talk';
+  const btn = document.createElement('button');
+  btn.className = 'card' + (t.uid === archiveUid ? ' on' : '');
+  btn.type = 'button';
+  const name = document.createElement('div');
+  name.className = 'who';
+  const title = document.createElement('span');
+  title.textContent = t.title || '未命名';
+  name.append(title);
+  const sub = document.createElement('small');
+  sub.className = 'preview';
+  const label = document.createElement('span');
+  label.className = 'preview-text';
+  label.textContent = (t.count || 0) + ' 則';
+  sub.append(label);
+  const when = document.createElement('span');
+  when.className = 'preview-time';
+  when.textContent = talkClock(t.updated);
+  sub.append(when);
+  btn.append(name, sub);
+  btn.onclick = () => {
+    showControls = false;
+    archiveUid = t.uid;
+    archiveTalk = null;
+    archiveUpdated = 0;
+    current = '';
+    stickBottom = true;
+    closeRail();
+    paint();
+    loadArchive(t.uid);
+  };
+  const bin = document.createElement('span');
+  bin.className = 'bin';
+  bin.setAttribute('role', 'button');
+  bin.tabIndex = 0;
+  bin.setAttribute('aria-label', '刪除');
+  bin.append(trashIcon());
+  bin.onclick = (e) => { e.preventDefault(); e.stopPropagation(); deleteTalk(t.uid); };
+  bin.onkeydown = (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    e.preventDefault();
+    e.stopPropagation();
+    deleteTalk(t.uid);
+  };
+  btn.append(bin);
+  row.append(btn);
+  return row;
+}
+
+function paintRail() {
+  const top = rail.scrollTop;
+  rail.replaceChildren();
+  const live = sessions.filter(s => !s.waiting).sort(byRecent);
+  const quiet = sessions.filter(s => s.waiting).sort(byRecent);
+  railSection('live', '連線中', () => {
+    if (!live.length) rail.append(railEmpty('沒有正在回報的對話'));
+    else live.forEach(s => rail.append(liveCard(s)));
+  });
+  railSection('quiet', '離線', () => {
+    if (!quiet.length) rail.append(railEmpty('沒有離線的對話'));
+    else quiet.forEach(s => rail.append(liveCard(s)));
+  });
+  railSection('talks', '紀錄', () => {
+    if (!talks.length) rail.append(railEmpty('還沒有對話記錄'));
+    else talks.forEach(t => rail.append(talkCard(t)));
+  });
+  rail.scrollTop = top;
+}
+
+function paintArchive(talk, follow, y) {
+  clearForm();
+  const uid = archiveUid;
+  const del = document.createElement('button');
+  del.className = 'gear del end';
+  del.type = 'button';
+  del.textContent = '刪除';
+  del.onclick = () => { if (uid) deleteTalk(uid); };
+  paintBar((talk && talk.title) || '對話記錄', del);
   app.replaceChildren();
   if (!talk) {
     const p = document.createElement('p');
@@ -732,12 +1057,11 @@ function lastMessageAt(s) {
 }
 
 function nearBottom() {
-  const el = document.documentElement;
-  return el.scrollHeight - window.scrollY - window.innerHeight < 80;
+  return app.scrollHeight - app.scrollTop - app.clientHeight < 80;
 }
 
 function scrollBottom() {
-  window.scrollTo(0, document.documentElement.scrollHeight);
+  app.scrollTop = app.scrollHeight;
 }
 
 function canSend(s) {
@@ -756,7 +1080,7 @@ function placeThread(s, follow, y) {
     scrollBottom();
     return;
   }
-  window.scrollTo(0, y || 0);
+  app.scrollTop = y || 0;
   if (seenTail[s.tabId] === undefined) seenTail[s.tabId] = tail;
   if (!tail || seenTail[s.tabId] === tail) return;
   const chip = document.createElement('button');
@@ -769,7 +1093,7 @@ function placeThread(s, follow, y) {
     chip.remove();
     scrollBottom();
   };
-  document.body.append(chip);
+  stage.append(chip);
 }
 
 function topicOk(s) {
@@ -810,21 +1134,19 @@ function packControls(c) {
 }
 
 function shownControls() {
-  if (controlDraft) return controlDraft;
-  let found = null;
-  sessions.forEach(s => {
-    if (!s.controls) return;
-    if (!found || s.seen > found.seen) found = s;
-  });
-  return found && found.controls;
+  const s = sessions.find(x => x.tabId === current);
+  if (controlDraft && controlDraft.tabId === current) return controlDraft.controls;
+  return s && s.controls;
 }
 
 function postControls(next) {
+  if (!current) return;
   const packed = packControls(next);
   if (!topicOk(packed.phoneTopic)) { alert('主題只接受英文、數字、底線和減號'); return; }
-  controlDraft = packed;
+  const tabId = current;
+  controlDraft = { tabId: tabId, controls: packed };
   paint();
-  api('/api/controls', {
+  api('/api/sessions/' + encodeURIComponent(tabId) + '/controls', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(packed)
@@ -859,17 +1181,13 @@ function fieldInput(value, placeholder) {
 }
 
 function paintControls() {
-  const btn = document.getElementById('controls-btn');
-  if (btn) btn.textContent = '關閉';
-  document.body.classList.remove('in-thread');
   app.replaceChildren();
   clearForm();
-  clearChrome();
   const src = shownControls();
   if (!src) {
     const p = document.createElement('p');
     p.className = 'muted';
-    p.textContent = '還沒有分頁回報設定。先讓敲敲看那一頁開著，並更新腳本。';
+    p.textContent = '這個聊天室還沒回報設定。先讓那一頁開著。';
     app.append(p);
     return;
   }
@@ -1032,22 +1350,7 @@ function paintOpening(s) {
 }
 
 function paintThread(s, follow, y) {
-  document.body.classList.add('in-thread');
-  clearChrome();
-  const bar = document.createElement('div');
-  bar.className = 'topbar';
-  const back = document.createElement('button');
-  back.className = 'card';
-  back.type = 'button';
-  back.textContent = '回到列表';
-  back.onclick = () => { current = ''; resetListScroll = true; paint(); };
-  const gear = document.createElement('button');
-  gear.type = 'button';
-  gear.className = 'gear';
-  gear.textContent = '控制';
-  gear.onclick = () => { showControls = true; current = ''; paint(); };
-  bar.append(back, gear);
-  document.body.append(bar);
+  paintBar((s && s.title) || '未命名', controlsGear());
   app.replaceChildren();
   if (!s) {
     const p = document.createElement('p');
@@ -1062,136 +1365,49 @@ function paintThread(s, follow, y) {
 }
 
 function paint() {
-  const gear = document.getElementById('controls-btn');
-  if (gear) gear.textContent = showControls ? '關閉' : '控制';
   if (!token) { clearForm(); return gate(); }
+  document.body.classList.remove('locked');
+  document.querySelectorAll('.gate').forEach(el => el.remove());
+  paintRail();
   if (showControls) {
     const editing = document.activeElement && document.activeElement.tagName === 'INPUT' && document.activeElement.closest && document.activeElement.closest('#app');
-    if (!editing) paintControls();
+    if (!editing) {
+      const s = sessions.find(x => x.tabId === current);
+      paintBar((s && s.title) || '控制', controlsGear());
+      paintControls();
+    }
     return;
   }
   if (archiveUid) {
-    const y = window.scrollY;
+    const y = app.scrollTop;
     const follow = stickBottom || nearBottom();
     paintArchive(archiveTalk, follow, y);
     return;
   }
-  const y = window.scrollY;
+  const y = app.scrollTop;
   const follow = stickBottom || (!!current && nearBottom());
   const focused = document.activeElement && document.activeElement.closest && document.activeElement.closest('form');
   if (focused && current) {
     const s = sessions.find(x => x.tabId === current);
     paintThread(s, follow, y);
     const input = document.querySelector('form input');
-    const sendBtn = document.querySelector('form button');
     if (input) input.disabled = !canSend(s);
     document.querySelectorAll('form button').forEach(btn => { btn.disabled = sending || !canSend(s); });
     return;
   }
   const keepInput = document.querySelector('form input');
   const draft = keepInput && document.activeElement === keepInput ? keepInput.value : '';
-  document.body.classList.remove('in-thread');
-  app.replaceChildren();
-  clearForm();
-  clearChrome();
   if (!current) {
-    if (resetListScroll) { window.scrollTo(0, 0); resetListScroll = false; }
-    const tabs = document.createElement('div');
-    tabs.className = 'tabs';
-    [['live', '連線中'], ['quiet', '沒回報'], ['talks', '紀錄']].forEach(([id, label]) => {
-      const tab = document.createElement('button');
-      tab.type = 'button';
-      tab.textContent = label;
-      tab.className = listTab === id ? 'on' : '';
-      tab.onclick = () => { listTab = id; archiveUid = ''; archiveTalk = null; paint(); };
-      tabs.append(tab);
-    });
-    document.body.append(tabs);
-    if (listTab === 'talks') {
-      if (!talks.length) {
-        const p = document.createElement('p');
-        p.className = 'muted';
-        p.textContent = '還沒有對話記錄';
-        app.append(p);
-        return;
-      }
-      talks.forEach(t => {
-        const btn = document.createElement('button');
-        btn.className = 'card';
-        btn.type = 'button';
-        const name = document.createElement('div');
-        name.className = 'who';
-        name.textContent = t.title || '未命名';
-        const sub = document.createElement('small');
-        sub.className = 'preview';
-        const label = document.createElement('span');
-        label.className = 'preview-text';
-        label.textContent = (t.count || 0) + ' 則';
-        sub.append(label);
-        const when = document.createElement('span');
-        when.className = 'preview-time';
-        when.textContent = talkClock(t.updated);
-        sub.append(when);
-        btn.append(name, sub);
-        btn.onclick = () => {
-          archiveUid = t.uid;
-          archiveTalk = null;
-          archiveUpdated = 0;
-          current = '';
-          stickBottom = true;
-          paint();
-          loadArchive(t.uid);
-        };
-        app.append(btn);
-      });
-      return;
-    }
-    const shown = sessions.filter(s => listTab === 'quiet' ? s.waiting : !s.waiting)
-      .sort((a, b) => lastMessageAt(b) - lastMessageAt(a) || (a.tabId < b.tabId ? -1 : a.tabId > b.tabId ? 1 : 0));
-    if (!shown.length) {
-      const p = document.createElement('p');
-      p.className = 'muted';
-      p.textContent = listTab === 'quiet' ? '沒有未回報的對話' : '沒有正在回報的對話';
-      app.append(p);
-      return;
-    }
-    shown.forEach(s => {
-      const btn = document.createElement('button');
-      btn.className = 'card';
-      btn.type = 'button';
-      const name = document.createElement('div');
-      name.className = 'who';
-      if (s.openings && s.openings.avatar) name.append(faceNode(s.openings.avatar));
-      const title = document.createElement('span');
-      title.textContent = s.title || '未命名';
-      name.append(title);
-      const ms = s.messages || [];
-      const last = ms[ms.length - 1];
-      const openingText = s.openings && ((s.openings.them && s.openings.them.text) || (s.openings.mine && s.openings.mine.text));
-      const sub = document.createElement('small');
-      sub.className = 'preview' + (last && last.mine ? ' mine' : '');
-      const label = document.createElement('span');
-      label.className = 'preview-text';
-      label.textContent = last ? (last.text || (last.image ? '圖片' : (last.quote || openingText || '還沒有訊息'))) : (openingText || '還沒有訊息');
-      sub.append(label);
-      if (last && last.time) {
-        const when = document.createElement('span');
-        when.className = 'preview-time';
-        when.textContent = last.time;
-        sub.append(when);
-      }
-      btn.append(name, sub);
-      const extra = statusText(s);
-      if (extra) {
-        const st = document.createElement('small');
-        st.textContent = extra;
-        btn.append(st);
-      }
-      btn.onclick = () => { archiveUid = ''; archiveTalk = null; current = s.tabId; stickBottom = true; paint(); };
-      app.append(btn);
-    });
+    paintBar('Knock 遠端');
+    app.replaceChildren();
+    clearForm();
+    const p = document.createElement('p');
+    p.className = 'muted';
+    p.textContent = '選一個對話';
+    app.append(p);
     return;
   }
+  clearForm();
   const s = sessions.find(x => x.tabId === current);
   paintThread(s, follow, y);
   if (!s) return;
@@ -1243,8 +1459,9 @@ function paint() {
     if (chosen) sendImage(s, chosen);
   };
   form.append(file, pick);
-  document.body.append(form);
+  stage.append(form);
   if (draft) input.focus();
+  if (follow) scrollBottom();
 }
 
 function plainFace() {
@@ -1320,12 +1537,19 @@ async function tick() {
     if (!token) return paint();
     const data = await api('/api/sessions' + (pollWait ? '?wait=1' : ''));
     sessions = data.sessions || [];
-    talks = data.talks || [];
+    const freshTalks = data.talks || [];
+    for (const uid of [...droppedTalks]) {
+      if (!freshTalks.some(t => t.uid === uid)) droppedTalks.delete(uid);
+    }
+    talks = freshTalks.filter(t => !droppedTalks.has(t.uid));
     if (archiveUid) {
       const sum = talks.find(t => t.uid === archiveUid);
       if (!archiveTalk || (sum && sum.updated !== archiveUpdated)) loadArchive(archiveUid);
     }
-    if (controlDraft && sessions.some(s => s.controls && JSON.stringify(packControls(s.controls)) === JSON.stringify(controlDraft))) controlDraft = null;
+    if (controlDraft) {
+      const hit = sessions.find(s => s.tabId === controlDraft.tabId);
+      if (hit && hit.controls && JSON.stringify(packControls(hit.controls)) === JSON.stringify(controlDraft.controls)) controlDraft = null;
+    }
     if (avatarDraft) {
       const hit = sessions.find(s => s.tabId === avatarDraft.tabId);
       if (hit && hit.openings && !!hit.openings.avatarOn === avatarDraft.on) avatarDraft = null;
@@ -1351,13 +1575,27 @@ async function loop() {
   }
 }
 document.addEventListener('visibilitychange', () => { if (!document.hidden) tick(); });
-document.getElementById('controls-btn').onclick = () => { showControls = !showControls; if (showControls) current = ''; paint(); };
+document.getElementById('shade').onclick = () => closeRail();
+let edgeSwipe = null;
+document.addEventListener('pointerdown', (e) => {
+  if (e.button || document.body.classList.contains('rail-open') || e.clientX > 28) return;
+  edgeSwipe = { x: e.clientX, y: e.clientY, id: e.pointerId };
+});
+document.addEventListener('pointerup', (e) => {
+  if (!edgeSwipe || e.pointerId !== edgeSwipe.id) return;
+  const dx = e.clientX - edgeSwipe.x;
+  const dy = e.clientY - edgeSwipe.y;
+  edgeSwipe = null;
+  if (dx >= 48 && dx > Math.abs(dy)) document.body.classList.add('rail-open');
+});
+document.addEventListener('pointercancel', () => { edgeSwipe = null; });
 loop();
 </script>
 </body>
 </html>`;
 
 function main() {
+    loadDropped();
     const sessions = loadSessions();
     const talks = loadTalks();
     const server = http.createServer(async (req, res) => {
@@ -1373,7 +1611,10 @@ function main() {
         if (!tokenOk(req.headers.authorization)) return send(res, 401, { error: 'unauthorized' });
         try {
             if (req.method === 'GET' && url.pathname === '/api/sessions') {
-                if (url.searchParams.get('wait') === '1') await pause(POLL_MS, req);
+                if (url.searchParams.get('wait') === '1') {
+                    const seen = revision;
+                    await waitUntil(POLL_MS, req, () => revision !== seen);
+                }
                 if (clientGone(req, res)) return;
                 return send(res, 200, { sessions: visibleSessions(sessions, Date.now(), WAIT_MS), talks: visibleTalks(talks) });
             }
@@ -1383,6 +1624,12 @@ function main() {
                 if (!talk) return send(res, 404, { error: 'gone' });
                 return send(res, 200, { talk });
             }
+            if (req.method === 'DELETE' && talkMatch) {
+                if (!dropTalk(talks, talkMatch[1])) return send(res, 404, { error: 'gone' });
+                saveTalks(talks);
+                saveDropped();
+                return send(res, 200, { ok: true });
+            }
             if (req.method === 'POST' && url.pathname === '/api/heartbeat') {
                 const body = await readBody(req);
                 const session = applyHeartbeat(sessions, body, Date.now());
@@ -1390,7 +1637,7 @@ function main() {
                 const archived = rememberTalk(talks, body, Date.now());
                 saveSessions(sessions);
                 if (archived) saveTalks(talks);
-                if (url.searchParams.get('wait') === '1') await pause(POLL_MS, req);
+                if (url.searchParams.get('wait') === '1') await waitUntil(POLL_MS, req, () => heartbeatReady(session));
                 if (clientGone(req, res)) return;
                 const outbox = pendingOutbox(session);
                 const patch = takeControlPatch(session);
@@ -1447,6 +1694,7 @@ function main() {
                 const body = await readBody(req);
                 session.avatarWanted = !!body.on;
                 saveSessions(sessions);
+                touch();
                 return send(res, 200, { ok: true });
             }
             const userPost = url.pathname.match(/^\/api\/sessions\/([a-z0-9]{8,40})\/user$/);
@@ -1456,14 +1704,18 @@ function main() {
                 const body = await readBody(req);
                 session.userWanted = !!body.on;
                 saveSessions(sessions);
+                touch();
                 return send(res, 200, { ok: true });
             }
-            if (req.method === 'POST' && url.pathname === '/api/controls') {
+            const controlPost = url.pathname.match(/^\/api\/sessions\/([a-z0-9]{8,40})\/controls$/);
+            if (req.method === 'POST' && controlPost) {
+                const session = sessions.get(controlPost[1]);
+                if (!session) return send(res, 404, { error: 'gone' });
                 const patch = cleanControls(await readBody(req));
                 if (!patch) return send(res, 400, { error: 'bad controls' });
-                if (!sessions.size) return send(res, 409, { error: 'no tab' });
-                for (const session of sessions.values()) session.controlWanted = patch;
+                session.controlWanted = patch;
                 saveSessions(sessions);
+                touch();
                 return send(res, 200, { ok: true });
             }
             const ackMatch = url.pathname.match(/^\/api\/sessions\/([a-z0-9]{8,40})\/ack$/);
@@ -1474,6 +1726,7 @@ function main() {
                 const id = String(body.id || '');
                 session.outbox = session.outbox.filter(item => item.id !== id);
                 saveSessions(sessions);
+                touch();
                 return send(res, 200, { ok: true });
             }
             return send(res, 404, { error: 'not found' });
