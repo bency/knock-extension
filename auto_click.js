@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.64
+// @version      1.4.68
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -66,7 +66,7 @@
     const HINT_CODE_KEY = 'knockHintCode';
     const HINT_NOTIFIED_KEY = 'knockHintConnectedNotified';
     const HINT_WAS_WAITING_KEY = 'knockHintWasWaiting';
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.64';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.68';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -1519,6 +1519,38 @@
         return /\/users-common(%2F|\/)avatars(%2F|\/)/i.test(url || '');
     }
 
+    // 預設圖只認檔名。男女與其他預設圖各存一份，不把對方網址送到遠端頁。
+    function stockAvatarFile(url) {
+        if (!isStockAvatar(url)) return '';
+        const key = stableImageKey(url);
+        const encoded = 'avatars%2F';
+        const plain = 'avatars/';
+        let file = '';
+        const at = key.indexOf(encoded);
+        if (at !== -1) file = key.slice(at + encoded.length);
+        else {
+            const slash = key.toLowerCase().indexOf(plain);
+            if (slash !== -1) file = key.slice(slash + plain.length);
+        }
+        if (!file) return '';
+        try { file = decodeURIComponent(file); } catch (e) { return ''; }
+        file = file.toLowerCase();
+        if (!/^[a-z0-9-]{1,40}\.(svg|png|jpe?g)$/.test(file)) return '';
+        return file;
+    }
+
+    function stockAvatarId(url) {
+        const file = stockAvatarFile(url);
+        return file ? relayImageId('stock:' + file) : '';
+    }
+
+    function openingAvatar(li, url) {
+        const stock = stockAvatarId(url);
+        if (stock) return stock;
+        if (!url && li && li.querySelector('[data-test="fallback-avatar"]')) return 'plain';
+        return url ? relayImageId(url) : '';
+    }
+
     function checkAvatarMatch(otherMessageLi) {
         const myAvatar = getMyAvatarUrl();
         const otherAvatar = getAvatarUrl(otherMessageLi);
@@ -2496,6 +2528,46 @@
         return id;
     }
 
+    function relayOpenings() {
+        const list = document.querySelector('ul[data-test="messages"]');
+        if (!list) return null;
+        let them = '';
+        let mine = '';
+        let themLi = null;
+        let avatarUrl = '';
+        let uid = '';
+        let filterKey = '';
+        let avatarHash = '';
+        for (const li of list.querySelectorAll('li.message-li')) {
+            const messageDiv = li.querySelector('div[data-test="message"]');
+            if (!messageDiv || messageDiv.querySelector('span[data-test="date"]')) continue;
+            const text = getMessageText(messageDiv);
+            if (TYPING_RE.test(text)) continue;
+            const images = getMessageImages(messageDiv);
+            const body = (text || (images[0] ? '圖片' : '')).trim().slice(0, 200);
+            if (!body) continue;
+            if (isMyMessageLi(li)) {
+                if (!mine) mine = body;
+            } else if (!them) {
+                them = body;
+                themLi = li;
+                avatarUrl = getAvatarUrl(li) || '';
+                uid = messageSentBy(li) || '';
+                filterKey = (text || stableImageKey(images[0]) || '').trim();
+                avatarHash = avatarHashOf(avatarUrl);
+            }
+        }
+        const avatar = themLi ? openingAvatar(themLi, avatarUrl) : '';
+        if (!them && !mine && !avatar) return null;
+        return {
+            them,
+            mine,
+            avatar,
+            avatarOn: !!(avatarUrl && isAvatarFiltered(avatarUrl)),
+            userOn: !!(uid && isFirstMessageFiltered(uid, filterKey, avatarHash))
+        };
+    }
+
     function relaySnapshot() {
         const list = document.querySelector('ul[data-test="messages"]');
         if (!list) return null;
@@ -2515,6 +2587,7 @@
             const id = (String(li.className || '').match(/message-li-(\S+)/) || [])[1] || '';
             if (!id) continue;
             const timeEl = messageDiv.querySelector('span[data-test="date"]');
+            if (!timeEl) continue;
             const time = formatMessageStamp({
                 timestamp: timeEl ? timeEl.textContent.trim() : '',
                 date: dateByLi.get(li) || ''
@@ -2528,7 +2601,9 @@
             title: currentPartnerName() || '未命名',
             canType,
             status: left ? 'left' : 'live',
-            messages: messages.slice(-40)
+            messages: messages.slice(-40),
+            openings: relayOpenings(),
+            controls: relayControls()
         };
     }
 
@@ -2551,6 +2626,69 @@
         if (Array.isArray(savedDone)) savedDone.forEach(id => { if (id) relayImageDone.add(id); });
     } catch (e) {}
 
+    function relayControls() {
+        const range = keepAliveHoursRange();
+        return {
+            auto: autoClickEnabled,
+            keep: keepAliveEnabled,
+            keepText: getKeepAliveText(),
+            keepMin: range.min,
+            keepMax: range.max,
+            userFilter: firstFilterEnabled,
+            avatarFilter: avatarFilterEnabled,
+            browser: browserNotifyEnabled,
+            phone: ntfyEnabled,
+            phoneTopic: getNtfyTopic(),
+            phoneTitle: getNtfyTitle()
+        };
+    }
+
+    function relayControlsMatch(cur, next) {
+        if (!cur || !next) return false;
+        const title = String(next.phoneTitle || '').trim() || 'Knock 新訊息';
+        return !!next.auto === !!cur.auto
+            && !!next.keep === !!cur.keep
+            && String(next.keepText || '').trim() === String(cur.keepText || '')
+            && Number(next.keepMin) === Number(cur.keepMin)
+            && Number(next.keepMax) === Number(cur.keepMax)
+            && !!next.userFilter === !!cur.userFilter
+            && !!next.avatarFilter === !!cur.avatarFilter
+            && !!next.browser === !!cur.browser
+            && !!next.phone === !!cur.phone
+            && String(next.phoneTopic || '').trim() === String(cur.phoneTopic || '')
+            && title === (String(cur.phoneTitle || '').trim() || 'Knock 新訊息');
+    }
+
+    function applyRelayControls(c) {
+        if (!c || relayControlsMatch(relayControls(), c)) return;
+        const keepWas = keepAliveEnabled;
+        const range = keepAliveHoursRange();
+        const hoursChanged = Number(c.keepMin) !== range.min || Number(c.keepMax) !== range.max;
+        autoClickEnabled = !!c.auto;
+        localStorage.setItem(AUTO_CLICK_ENABLED_KEY, String(autoClickEnabled));
+        keepAliveEnabled = !!c.keep;
+        localStorage.setItem(KEEP_ALIVE_ENABLED_KEY, String(keepAliveEnabled));
+        localStorage.setItem(KEEP_ALIVE_TEXT_KEY, String(c.keepText || '').trim().slice(0, 200));
+        setKeepAliveHoursRange(c.keepMin, c.keepMax);
+        if (keepAliveEnabled && (!keepWas || hoursChanged)) rollKeepAliveWaitMs();
+        firstFilterEnabled = !!c.userFilter;
+        localStorage.setItem(FIRST_FILTER_ENABLED_KEY, String(firstFilterEnabled));
+        avatarFilterEnabled = !!c.avatarFilter;
+        localStorage.setItem(AVATAR_FILTER_ENABLED_KEY, String(avatarFilterEnabled));
+        browserNotifyEnabled = !!c.browser;
+        localStorage.setItem(BROWSER_NOTIFY_ENABLED_KEY, String(browserNotifyEnabled));
+        if (browserNotifyEnabled) requestNotifyPermission();
+        ntfyEnabled = !!c.phone;
+        localStorage.setItem(NTFY_ENABLED_KEY, String(ntfyEnabled));
+        if (typeof c.phoneTopic === 'string') setNtfyTopic(c.phoneTopic);
+        if (typeof c.phoneTitle === 'string') setNtfyTitle(c.phoneTitle);
+        const dock = el('knock-dock');
+        if (dock) {
+            dock.remove();
+            createDock();
+        }
+    }
+
     function relayImageId(url) {
         const key = stableImageKey(url) || url;
         let id = hashString(key).replace(/[^a-z0-9]/g, '');
@@ -2558,30 +2696,87 @@
         return id.slice(0, 40);
     }
 
+    function svgToJpeg(blob) {
+        const read = blob && typeof blob.text === 'function'
+            ? blob.text()
+            : new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(String(reader.result || ''));
+                reader.onerror = () => reject(reader.error);
+                reader.readAsText(blob);
+            });
+        return read.then(text => {
+            let svg = String(text || '');
+            if (svg.indexOf('<svg') === -1) throw new Error('svg');
+            if (svg.indexOf('width=') === -1) svg = svg.replace('<svg', '<svg width="128" height="128"');
+            const fixed = new Blob([svg], { type: 'image/svg+xml' });
+            return new Promise((resolve, reject) => {
+                const img = new Image();
+                const u = URL.createObjectURL(fixed);
+                img.onload = () => {
+                    const canvas = document.createElement('canvas');
+                    canvas.width = 128;
+                    canvas.height = 128;
+                    const ctx = canvas.getContext('2d');
+                    ctx.fillStyle = '#fff';
+                    ctx.fillRect(0, 0, 128, 128);
+                    ctx.drawImage(img, 0, 0, 128, 128);
+                    URL.revokeObjectURL(u);
+                    resolve(dataUrlToBlob(canvas.toDataURL('image/jpeg', 0.85)));
+                };
+                img.onerror = () => {
+                    URL.revokeObjectURL(u);
+                    reject(new Error('svg'));
+                };
+                img.src = u;
+            });
+        });
+    }
+
     async function relayUploadImages(snap) {
+        const avatarId = snap.openings && /^[a-z0-9]{8,40}$/.test(snap.openings.avatar || '') ? snap.openings.avatar : '';
+        const queue = [];
+        if (avatarId && !relayUploaded.has(avatarId)) {
+            const first = findFirstOtherMessage();
+            if (first && first.avatarUrl) queue.push({ id: avatarId, url: first.avatarUrl, stock: isStockAvatar(first.avatarUrl) });
+        }
         for (const m of snap.messages || []) {
             if (!m.image || relayUploaded.has(m.image)) continue;
             const li = Array.from(document.querySelectorAll('li.message-li')).find(el => el.classList.contains('message-li-' + m.id));
             const messageDiv = li && li.querySelector('[data-test="message"]');
             const url = messageDiv && getMessageImages(messageDiv)[0];
-            if (!url) continue;
-            try {
-                let blob = await fetchImageBlob(url);
-                if (blob.size > 400 * 1024 && blob.type !== 'image/gif') {
-                    const dataUrl = await blobToDataUrl(blob);
-                    if (String(dataUrl).startsWith('data:')) blob = dataUrlToBlob(dataUrl);
-                }
-                const res = await gmRequest({
-                    method: 'POST',
-                    url: `${RELAY_URL}/api/images/${m.image}`,
-                    headers: { Authorization: `Bearer ${relayToken()}`, 'Content-Type': blob.type || 'image/jpeg' },
-                    data: blob,
-                    timeout: 20000
-                });
-                if (res && (res.status === 200 || res.status === 409)) relayUploaded.add(m.image);
-            } catch (e) {}
-            return;
+            if (url) queue.push({ id: m.image, url });
         }
+        const item = queue[0];
+        if (!item) return;
+        try {
+            if (item.stock) {
+                const have = await gmRequest({
+                    method: 'GET',
+                    url: `${RELAY_URL}/api/images/${item.id}`,
+                    headers: { Authorization: `Bearer ${relayToken()}` },
+                    timeout: 8000
+                });
+                if (have && have.status === 200) {
+                    relayUploaded.add(item.id);
+                    return;
+                }
+            }
+            let blob = await fetchImageBlob(item.url);
+            if (item.stock && (!blob.type || blob.type.indexOf('svg') !== -1)) blob = await svgToJpeg(blob);
+            if (blob.size > 400 * 1024 && blob.type !== 'image/gif') {
+                const dataUrl = await blobToDataUrl(blob);
+                if (String(dataUrl).startsWith('data:')) blob = dataUrlToBlob(dataUrl);
+            }
+            const res = await gmRequest({
+                method: 'POST',
+                url: `${RELAY_URL}/api/images/${item.id}`,
+                headers: { Authorization: `Bearer ${relayToken()}`, 'Content-Type': blob.type || 'image/jpeg' },
+                data: blob,
+                timeout: 20000
+            });
+            if (res && (res.status === 200 || res.status === 409)) relayUploaded.add(item.id);
+        } catch (e) {}
     }
 
     function relayParkedFile() {
@@ -2691,6 +2886,18 @@
             });
             if (res && res.status === 200) {
             const data = JSON.parse(res.responseText || '{}');
+            if (data.controls) applyRelayControls(data.controls);
+            if (typeof data.avatarOn === 'boolean') {
+                const first = findFirstOtherMessage();
+                const url = first && first.avatarUrl;
+                if (url && isAvatarFiltered(url) !== data.avatarOn) toggleAvatarFilter(url);
+            }
+            if (typeof data.userOn === 'boolean') {
+                const first = findFirstOtherMessage();
+                if (first && first.uid && isFirstMessageFiltered(first.uid, first.filterKey, first.avatarHash) !== data.userOn) {
+                    toggleFirstMessageFilter(first.uid, first.filterKey, first.avatarHash);
+                }
+            }
             if (!relayImageBooted) {
                 relayImageBooted = true;
                 for (const queued of data.outbox || []) {
@@ -3544,8 +3751,14 @@
         if (isSameConversation(hello, mega, true)) {
             console.error('knock: 一句對上不該併進已儲存');
         }
-        const stock = 'https://firebasestorage.googleapis.com/v0/b/knocktalk-prod.appspot.com/o/users-common%2Favatars%2Fmale-user.svg?alt=media';
-        if (!isStockAvatar(stock) || isStockAvatar('https://example.com/custom.png')) {
+        const stock = 'https://firebasestorage.googleapis.com/v0/b/knocktalk-prod.appspot.com/o/users-common%2Favatars%2Fmale-user.svg?alt=media&token=abc';
+        const female = 'https://firebasestorage.googleapis.com/v0/b/knocktalk-prod.appspot.com/o/users-common/avatars/female-user.svg?alt=media';
+        const maleId = stockAvatarId(stock);
+        if (!isStockAvatar(stock) || isStockAvatar('https://example.com/custom.png')
+            || !maleId || maleId.indexOf('http') !== -1
+            || maleId !== stockAvatarId('https://firebasestorage.googleapis.com/v0/b/knocktalk-prod.appspot.com/o/users-common%2Favatars%2Fmale-user.svg?alt=media')
+            || maleId === stockAvatarId(female)
+            || stockAvatarId('https://example.com/custom.png')) {
             console.error('knock: 預設頭像判斷失敗');
         }
         if (parseHintWaitText('等待也想聊聊 早安 的人上線') !== '早安'
@@ -3639,6 +3852,10 @@
             || relayImagePlan('old', imageDone, true) !== 'ack'
             || relayImagePlan('new', imageDone, true) !== 'send') {
             console.error('knock: 遠端圖片只送一次失敗');
+        }
+        const ctrl = { auto: true, keep: false, keepText: '在嗎', keepMin: 1.5, keepMax: 2.5, userFilter: true, avatarFilter: false, browser: true, phone: true, phoneTopic: 'abc', phoneTitle: 'Knock 新訊息' };
+        if (!relayControlsMatch(ctrl, ctrl) || relayControlsMatch(ctrl, Object.assign({}, ctrl, { keep: true }))) {
+            console.error('knock: 遠端控制比對失敗');
         }
         if (cooldownReasonText('firstFilter', '阿明') !== '開始聊天 · 過濾了 阿明'
             || cooldownReasonText('firstFilter', '') !== '開始聊天 · 使用者過濾而重連'

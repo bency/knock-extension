@@ -37,14 +37,23 @@ function applyHeartbeat(sessions, body, now) {
     if (!/^[a-z0-9]{8,40}$/.test(tabId)) return null;
     const prev = sessions.get(tabId);
     const title = String(body.title || '').trim().slice(0, 40) || '未命名';
+    const channelId = String(body.channelId || '').slice(0, 80);
+    const sameChannel = !!(prev && prev.channelId === channelId);
     const session = {
         tabId,
-        channelId: String(body.channelId || '').slice(0, 80),
+        channelId,
         title,
         canType: !!body.canType,
         status: body.status === 'left' ? 'left' : 'live',
         messages: cleanMessages(body.messages),
         seen: now,
+        openings: body.openings
+            ? cleanOpenings(body.openings, sameChannel ? prev.openings : null, now)
+            : (sameChannel && prev && prev.openings) || null,
+        avatarWanted: prev && typeof prev.avatarWanted === 'boolean' ? prev.avatarWanted : null,
+        userWanted: prev && typeof prev.userWanted === 'boolean' ? prev.userWanted : null,
+        controls: cleanControls(body.controls) || (prev && prev.controls) || null,
+        controlWanted: prev ? prev.controlWanted : null,
         outbox: prev ? prev.outbox : []
     };
     sessions.set(tabId, session);
@@ -63,6 +72,8 @@ function visibleSessions(sessions, now, waitMs) {
             seen: s.seen,
             waiting: now - s.seen > waitMs,
             messages: s.messages,
+            openings: s.openings || null,
+            controls: s.controls || null,
             pending: s.outbox.length
         });
     }
@@ -84,6 +95,11 @@ function loadSessions() {
                 status: s.status === 'left' ? 'left' : 'live',
                 messages: cleanMessages(s.messages),
                 seen: Number(s.seen) || 0,
+                openings: cleanOpenings(s.openings, s.openings, Number(s.seen) || 0),
+                avatarWanted: s.avatarWanted === true ? true : s.avatarWanted === false ? false : null,
+                userWanted: s.userWanted === true ? true : s.userWanted === false ? false : null,
+                controls: cleanControls(s.controls),
+                controlWanted: cleanControls(s.controlWanted),
                 outbox: keptOutbox(s.outbox)
             });
         }
@@ -115,6 +131,97 @@ function pendingOutbox(session) {
         pending.push(item);
     }
     return { pending, dirty };
+}
+
+function controlHours(n, fallback) {
+    let v = Number(n);
+    if (!Number.isFinite(v) || v < 0.1) v = fallback;
+    if (v > 48) v = 48;
+    return Math.round(v * 10) / 10;
+}
+
+// 頁面上的 packControls 要跟這份欄位、順序一致。
+function cleanControls(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const phoneTopic = String(raw.phoneTopic || '').trim();
+    if (phoneTopic && !/^[A-Za-z0-9_-]{1,64}$/.test(phoneTopic)) return null;
+    let keepMin = controlHours(raw.keepMin, 1.5);
+    let keepMax = controlHours(raw.keepMax, 2.5);
+    if (keepMax < keepMin) [keepMin, keepMax] = [keepMax, keepMin];
+    return {
+        auto: !!raw.auto,
+        keep: !!raw.keep,
+        keepText: String(raw.keepText || '').trim().slice(0, 200),
+        keepMin,
+        keepMax,
+        userFilter: !!raw.userFilter,
+        avatarFilter: !!raw.avatarFilter,
+        browser: !!raw.browser,
+        phone: !!raw.phone,
+        phoneTopic,
+        phoneTitle: String(raw.phoneTitle || '').trim().slice(0, 80) || 'Knock 新訊息'
+    };
+}
+
+function sameControls(a, b) {
+    const x = cleanControls(a);
+    const y = cleanControls(b);
+    if (!x || !y) return false;
+    return JSON.stringify(x) === JSON.stringify(y);
+}
+
+function takeControlPatch(session) {
+    if (!session.controlWanted) return { controls: null, dirty: false };
+    if (sameControls(session.controls, session.controlWanted)) {
+        session.controlWanted = null;
+        return { controls: null, dirty: true };
+    }
+    return { controls: session.controlWanted, dirty: false };
+}
+
+function cleanAvatar(raw) {
+    const s = String(raw || '').trim();
+    if (s.indexOf('http://') === 0 || s.indexOf('https://') === 0) return '';
+    if (/^[a-z0-9]{8,40}$/.test(s)) return s;
+    if (s === 'plain') return 'plain';
+    return '';
+}
+
+function openingSide(text, old, now) {
+    const t = String(text && text.text ? text.text : text || '').trim().slice(0, 200);
+    if (!t) return null;
+    const at = old && old.text === t && Number(old.at) ? Number(old.at) : now;
+    return { text: t, at };
+}
+
+// ponytail: 發語詞沒有畫面上的時間，第一次收到就蓋上，同一句不再改。
+function cleanOpenings(raw, prev, now) {
+    if (!raw || typeof raw !== 'object') return null;
+    const avatar = cleanAvatar(raw.avatar);
+    const them = openingSide(raw.them, prev && prev.them, now);
+    const mine = openingSide(raw.mine, prev && prev.mine, now);
+    if (!them && !mine && !avatar) return null;
+    return { them, mine, avatar, avatarOn: !!raw.avatarOn, userOn: !!raw.userOn };
+}
+
+function takeAvatarPatch(session) {
+    if (typeof session.avatarWanted !== 'boolean') return { avatarOn: null, dirty: false };
+    const current = !!(session.openings && session.openings.avatarOn);
+    if (current === session.avatarWanted) {
+        session.avatarWanted = null;
+        return { avatarOn: null, dirty: true };
+    }
+    return { avatarOn: session.avatarWanted, dirty: false };
+}
+
+function takeUserPatch(session) {
+    if (typeof session.userWanted !== 'boolean') return { userOn: null, dirty: false };
+    const current = !!(session.openings && session.openings.userOn);
+    if (current === session.userWanted) {
+        session.userWanted = null;
+        return { userOn: null, dirty: true };
+    }
+    return { userOn: session.userWanted, dirty: false };
 }
 
 function enqueue(session, text, now, image) {
@@ -161,6 +268,39 @@ function selfCheck() {
         || handed.pending.filter(item => item.image).length !== 1
         || again.pending.some(item => item.image)
         || kept.length !== 2) {
+        throw new Error('knock relay 檢查失敗');
+    }
+    const wanted = cleanControls({ auto: 1, keep: 0, keepText: ' 嗨 ', keepMin: 2, keepMax: 1, phoneTopic: 'topic', phoneTitle: '' });
+    sessions.get('abc12345').controlWanted = wanted;
+    applyHeartbeat(sessions, { tabId: 'abc12345', title: '阿明', canType: true, messages: [{ id: 'm1', text: '嗨', mine: false }] }, 11000);
+    const keptWanted = sessions.get('abc12345').controlWanted;
+    if (!wanted || wanted.keepMin !== 1 || wanted.keepMax !== 2 || wanted.keepText !== '嗨' || wanted.phoneTitle !== 'Knock 新訊息'
+        || !keptWanted || keptWanted.phoneTopic !== 'topic'
+        || cleanControls({ phoneTopic: 'a b' })
+        || !sameControls(wanted, keptWanted)) {
+        throw new Error('knock relay 檢查失敗');
+    }
+    const firstOpen = applyHeartbeat(sessions, {
+        tabId: 'abc12345', title: '阿明', canType: true, channelId: 'c1',
+        messages: [{ id: 'm1', text: '嗨', mine: false }],
+        openings: { them: '嗨', mine: '你好', avatar: 'abcd1234', avatarOn: false }
+    }, 12000);
+    const againOpen = applyHeartbeat(sessions, {
+        tabId: 'abc12345', title: '阿明', canType: true, channelId: 'c1',
+        messages: [{ id: 'm1', text: '嗨', mine: false }],
+        openings: { them: '嗨', mine: '你好', avatar: 'abcd1234', avatarOn: true }
+    }, 13000);
+    const nextOpen = applyHeartbeat(sessions, {
+        tabId: 'abc12345', title: '阿明', canType: true, channelId: 'c2',
+        messages: [{ id: 'm1', text: '嗨', mine: false }],
+        openings: { them: '嗨', mine: '你好', avatar: 'abcd1234', avatarOn: false }
+    }, 14000);
+    if (!firstOpen.openings || firstOpen.openings.them.at !== 12000 || againOpen.openings.them.at !== 12000
+        || !againOpen.openings.avatarOn || nextOpen.openings.them.at !== 14000
+        || !cleanOpenings({ them: '嗨', userOn: true }, null, 1).userOn
+        || cleanOpenings({ them: '嗨', avatar: 'https://firebasestorage.googleapis.com/v0/b/knocktalk-prod.appspot.com/o/users-common%2Favatars%2Fmale-user.svg?alt=media' }, null, 1).avatar
+        || cleanOpenings({ them: '嗨', avatar: 'plain' }, null, 1).avatar !== 'plain'
+        || cleanOpenings({ them: '' }, null, 1)) {
         throw new Error('knock relay 檢查失敗');
     }
 }
@@ -267,11 +407,15 @@ const PAGE = `<!DOCTYPE html>
 <title>Knock 遠端</title>
 <style>
   body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:#111; color:#eee; }
-  header { position:fixed; top:0; left:0; right:0; z-index:5; height:48px; box-sizing:border-box; padding:12px 16px; font-size:18px; border-bottom:1px solid #333; background:#111; }
+  header { position:fixed; top:0; left:0; right:0; z-index:5; height:48px; box-sizing:border-box; padding:8px 12px; font-size:18px; border-bottom:1px solid #333; background:#111; display:flex; align-items:center; justify-content:space-between; }
+  header button { border:1px solid #444; background:#1c1c1c; border-radius:8px; padding:4px 10px; cursor:pointer; font-size:14px; }
   .tabs { position:fixed; top:48px; left:0; right:0; z-index:5; display:flex; gap:8px; padding:8px 12px; background:#111; border-bottom:1px solid #333; }
   .tabs button { flex:1; padding:8px; border:1px solid #444; border-radius:8px; background:#1c1c1c; cursor:pointer; }
   .tabs button.on { background:#2d5a3d; border-color:#2d5a3d; }
   .back { position:fixed; top:0; left:0; right:0; z-index:6; margin:0; border-radius:0; border-left:none; border-right:none; }
+  .topbar { position:fixed; top:0; left:0; right:0; z-index:6; display:flex; }
+  .topbar .card { margin:0; border-radius:0; flex:1; border-left:none; border-right:none; }
+  .topbar .gear { flex:none; width:72px; border-radius:0; border:1px solid #333; background:#1c1c1c; cursor:pointer; }
   main { max-width:640px; margin:0 auto; padding:108px 12px 88px; }
   body.in-thread header, body.in-thread .tabs { display:none; }
   body.in-thread main { padding-top:64px; }
@@ -302,10 +446,31 @@ const PAGE = `<!DOCTYPE html>
   form button:disabled { opacity:0.45; }
   .gate { display:flex; flex-direction:column; gap:8px; }
   .muted { color:#888; }
+  .who { display:flex; gap:10px; align-items:center; }
+  .face { width:40px; height:40px; border-radius:50%; object-fit:cover; background:#333; flex:none; }
+  svg.face { display:block; fill:#9a9a9a; }
+  .open { display:flex; gap:12px; align-items:center; margin:0 0 12px; }
+  .open .face { width:64px; height:64px; }
+  .group { margin-left:auto; flex:none; display:flex; width:calc((100% - 76px) / 4); }
+  .group button { flex:1; min-width:0; padding:6px 2px; border:1px solid #666; background:transparent; color:#eee; cursor:pointer; font-size:12px; white-space:nowrap; }
+  .group button.on { background:#e53935; color:#fff; border-color:#e53935; }
+  .group button:first-child { border-radius:8px 0 0 8px; }
+  .group button:last-child { border-radius:0 8px 8px 0; }
+  .group button:only-child { border-radius:8px; }
+  .group button + button { border-left:1px solid rgba(0,0,0,.2); }
+  .ctrl { display:flex; align-items:center; justify-content:space-between; gap:8px; width:100%; box-sizing:border-box; text-align:left; padding:10px 12px; margin:0 0 8px; background:#1c1c1c; border:1px solid #333; border-radius:10px; cursor:pointer; }
+  .sw { width:40px; height:22px; border-radius:11px; background:#555; position:relative; flex:none; }
+  .sw.on { background:#4CAF50; }
+  .sw i { width:18px; height:18px; border-radius:50%; background:#fff; position:absolute; top:2px; left:2px; }
+  .sw.on i { left:20px; }
+  .extra { display:flex; flex-direction:column; gap:8px; margin:-2px 0 8px; }
+  .extra input { width:100%; box-sizing:border-box; padding:8px 10px; border:1px solid #444; border-radius:8px; background:#1a1a1a; }
+  .hours { display:flex; align-items:center; gap:6px; color:#aaa; font-size:13px; }
+  .hours input { width:64px; }
 </style>
 </head>
 <body>
-<header>Knock 遠端</header>
+<header><span>Knock 遠端</span><button type="button" id="controls-btn">控制</button></header>
 <main id="app"></main>
 <script>
 const TOKEN_KEY = 'knockRelayPageToken';
@@ -320,6 +485,12 @@ let lastSentAt = 0;
 const picUrls = {};
 let stickBottom = false;
 let resetListScroll = false;
+let showControls = false;
+let controlDraft = null;
+let avatarDraft = null;
+let userDraft = null;
+let keepOpen = false;
+let phoneOpen = false;
 const seenTail = {};
 
 function api(path, opts) {
@@ -416,7 +587,7 @@ function canSend(s) {
 }
 
 function clearForm() { document.querySelectorAll('form').forEach(f => f.remove()); }
-function clearChrome() { document.querySelectorAll('.tabs,.back,.new-msg').forEach(el => el.remove()); }
+function clearChrome() { document.querySelectorAll('.tabs,.back,.topbar,.new-msg').forEach(el => el.remove()); }
 
 function placeThread(s, follow, y) {
   if (!s) return;
@@ -443,15 +614,282 @@ function placeThread(s, follow, y) {
   document.body.append(chip);
 }
 
+function topicOk(s) {
+  if (!s) return true;
+  if (s.length > 64) return false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s.charAt(i);
+    const ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch === '_' || ch === '-';
+    if (!ok) return false;
+  }
+  return true;
+}
+
+function packControls(c) {
+  c = c || {};
+  let min = Number(c.keepMin);
+  let max = Number(c.keepMax);
+  if (!(min >= 0.1)) min = 1.5;
+  if (!(max >= 0.1)) max = 2.5;
+  if (min > 48) min = 48;
+  if (max > 48) max = 48;
+  min = Math.round(min * 10) / 10;
+  max = Math.round(max * 10) / 10;
+  if (max < min) { const t = min; min = max; max = t; }
+  return {
+    auto: !!c.auto,
+    keep: !!c.keep,
+    keepText: String(c.keepText || '').trim().slice(0, 200),
+    keepMin: min,
+    keepMax: max,
+    userFilter: !!c.userFilter,
+    avatarFilter: !!c.avatarFilter,
+    browser: !!c.browser,
+    phone: !!c.phone,
+    phoneTopic: String(c.phoneTopic || '').trim(),
+    phoneTitle: String(c.phoneTitle || '').trim().slice(0, 80) || 'Knock 新訊息'
+  };
+}
+
+function shownControls() {
+  if (controlDraft) return controlDraft;
+  let found = null;
+  sessions.forEach(s => {
+    if (!s.controls) return;
+    if (!found || s.seen > found.seen) found = s;
+  });
+  return found && found.controls;
+}
+
+function postControls(next) {
+  const packed = packControls(next);
+  if (!topicOk(packed.phoneTopic)) { alert('主題只接受英文、數字、底線和減號'); return; }
+  controlDraft = packed;
+  paint();
+  api('/api/controls', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(packed)
+  }).catch(err => { controlDraft = null; alert(err.message || '設定失敗'); paint(); });
+}
+
+function switchBox(on) {
+  const sw = document.createElement('div');
+  sw.className = 'sw' + (on ? ' on' : '');
+  sw.append(document.createElement('i'));
+  return sw;
+}
+
+function controlRow(label, on, onToggle) {
+  const row = document.createElement('button');
+  row.type = 'button';
+  row.className = 'ctrl';
+  const name = document.createElement('span');
+  name.textContent = label;
+  const sw = switchBox(on);
+  sw.onclick = (e) => { e.stopPropagation(); onToggle(); };
+  row.append(name, sw);
+  return row;
+}
+
+function fieldInput(value, placeholder) {
+  const input = document.createElement('input');
+  input.value = value || '';
+  input.placeholder = placeholder || '';
+  input.onkeydown = (e) => e.stopPropagation();
+  return input;
+}
+
+function paintControls() {
+  const btn = document.getElementById('controls-btn');
+  if (btn) btn.textContent = '關閉';
+  document.body.classList.remove('in-thread');
+  app.replaceChildren();
+  clearForm();
+  clearChrome();
+  const src = shownControls();
+  if (!src) {
+    const p = document.createElement('p');
+    p.className = 'muted';
+    p.textContent = '還沒有分頁回報設定。先讓敲敲看那一頁開著，並更新腳本。';
+    app.append(p);
+    return;
+  }
+  const c = packControls(src);
+  const flip = (key) => { const next = packControls(c); next[key] = !c[key]; postControls(next); };
+  const autoRow = controlRow('自動開啟新對話', c.auto, () => flip('auto'));
+  autoRow.onclick = () => flip('auto');
+  const keepRow = controlRow('持續連線', c.keep, () => flip('keep'));
+  keepRow.onclick = () => { keepOpen = !keepOpen; paint(); };
+  const userRow = controlRow('使用者過濾', c.userFilter, () => flip('userFilter'));
+  userRow.onclick = () => flip('userFilter');
+  const avatarRow = controlRow('大頭貼過濾', c.avatarFilter, () => flip('avatarFilter'));
+  avatarRow.onclick = () => flip('avatarFilter');
+  const browserRow = controlRow('瀏覽器通知', c.browser, () => flip('browser'));
+  browserRow.onclick = () => flip('browser');
+  const phoneRow = controlRow('手機通知', c.phone, () => flip('phone'));
+  phoneRow.onclick = () => { phoneOpen = !phoneOpen; paint(); };
+  app.append(autoRow, keepRow);
+  if (keepOpen) {
+    const extra = document.createElement('div');
+    extra.className = 'extra';
+    const sentence = fieldInput(c.keepText, '沒說話就送這句');
+    sentence.onchange = () => postControls(Object.assign({}, c, { keepText: sentence.value }));
+    const hours = document.createElement('div');
+    hours.className = 'hours';
+    const minInp = fieldInput(String(c.keepMin), '');
+    minInp.type = 'number';
+    minInp.min = '0.1';
+    minInp.step = '0.1';
+    const maxInp = fieldInput(String(c.keepMax), '');
+    maxInp.type = 'number';
+    maxInp.min = '0.1';
+    maxInp.step = '0.1';
+    const saveHours = () => postControls(Object.assign({}, c, { keepMin: minInp.value, keepMax: maxInp.value }));
+    minInp.onchange = saveHours;
+    maxInp.onchange = saveHours;
+    const tilde = document.createElement('span');
+    tilde.textContent = '～';
+    const unit = document.createElement('span');
+    unit.textContent = '小時';
+    hours.append(minInp, tilde, maxInp, unit);
+    extra.append(sentence, hours);
+    app.append(extra);
+  }
+  app.append(userRow, avatarRow, browserRow, phoneRow);
+  if (phoneOpen) {
+    const extra = document.createElement('div');
+    extra.className = 'extra';
+    const topic = fieldInput(c.phoneTopic, 'ntfy 主題');
+    topic.onchange = () => postControls(Object.assign({}, c, { phoneTopic: topic.value }));
+    const title = fieldInput(c.phoneTitle, 'Knock 新訊息');
+    title.onchange = () => postControls(Object.assign({}, c, { phoneTitle: title.value }));
+    extra.append(topic, title);
+    app.append(extra);
+  }
+}
+
+function openingClock(ms) {
+  const d = new Date(Number(ms) || 0);
+  if (!ms || Number.isNaN(d.getTime())) return '';
+  const p = n => (n < 10 ? '0' : '') + n;
+  return p(d.getMonth() + 1) + '/' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
+
+function postAvatar(s, on) {
+  if (!s || !s.openings) return;
+  avatarDraft = { tabId: s.tabId, on: !!on };
+  paint();
+  api('/api/sessions/' + encodeURIComponent(s.tabId) + '/avatar', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ on: !!on })
+  }).catch(err => { avatarDraft = null; alert(err.message || '設定失敗'); paint(); });
+}
+
+function postUser(s, on) {
+  if (!s || !s.openings) return;
+  userDraft = { tabId: s.tabId, on: !!on };
+  paint();
+  api('/api/sessions/' + encodeURIComponent(s.tabId) + '/user', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ on: !!on })
+  }).catch(err => { userDraft = null; alert(err.message || '設定失敗'); paint(); });
+}
+
+function shownOpenings(s) {
+  let o = s && s.openings;
+  if (!o) return null;
+  if (avatarDraft && avatarDraft.tabId === s.tabId) o = Object.assign({}, o, { avatarOn: avatarDraft.on });
+  if (userDraft && userDraft.tabId === s.tabId) o = Object.assign({}, o, { userOn: userDraft.on });
+  return o;
+}
+
+function paintBubble(m) {
+  const wrap = document.createElement('div');
+  wrap.className = 'bubble ' + (m.mine ? 'mine' : 'them');
+  const row = document.createElement('div');
+  row.className = 'msg';
+  if (m.quote) {
+    const quote = document.createElement('div');
+    quote.className = 'quote';
+    quote.textContent = m.quote;
+    row.append(quote);
+  }
+  if (m.text) {
+    const text = document.createElement('div');
+    text.textContent = m.text;
+    row.append(text);
+  }
+  if (m.image) {
+    const img = document.createElement('img');
+    img.className = 'pic';
+    img.alt = '圖片';
+    row.append(img);
+    showPic(m.image, img);
+  }
+  if (m.time) {
+    const time = document.createElement('div');
+    time.className = 'time';
+    time.textContent = m.time;
+    row.append(time);
+  }
+  wrap.append(row);
+  app.append(wrap);
+}
+
+function paintOpening(s) {
+  const o = shownOpenings(s);
+  if (!o) return;
+  const box = document.createElement('div');
+  box.className = 'open';
+  if (o.avatar) {
+    const face = faceNode(o.avatar);
+    face.alt = '大頭貼';
+    box.append(face);
+  }
+  const toggles = document.createElement('div');
+  toggles.className = 'group';
+  if (o.avatar) {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.textContent = '過濾大頭貼';
+    if (o.avatarOn) row.className = 'on';
+    row.onclick = () => postAvatar(s, !o.avatarOn);
+    toggles.append(row);
+  }
+  const userRow = document.createElement('button');
+  userRow.type = 'button';
+  userRow.textContent = '過濾使用者';
+  if (o.userOn) userRow.className = 'on';
+  userRow.onclick = () => postUser(s, !o.userOn);
+  toggles.append(userRow);
+  box.append(toggles);
+  app.append(box);
+  const them = o.them && o.them.text ? { mine: false, text: o.them.text, time: openingClock(o.them.at) } : null;
+  const mine = o.mine && o.mine.text ? { mine: true, text: o.mine.text, time: openingClock(o.mine.at) } : null;
+  if (them) paintBubble(them);
+  if (mine) paintBubble(mine);
+}
+
 function paintThread(s, follow, y) {
   document.body.classList.add('in-thread');
   clearChrome();
+  const bar = document.createElement('div');
+  bar.className = 'topbar';
   const back = document.createElement('button');
-  back.className = 'card back';
+  back.className = 'card';
   back.type = 'button';
   back.textContent = '回到列表';
   back.onclick = () => { current = ''; resetListScroll = true; paint(); };
-  document.body.append(back);
+  const gear = document.createElement('button');
+  gear.type = 'button';
+  gear.className = 'gear';
+  gear.textContent = '控制';
+  gear.onclick = () => { showControls = true; current = ''; paint(); };
+  bar.append(back, gear);
+  document.body.append(bar);
   app.replaceChildren();
   if (!s) {
     const p = document.createElement('p');
@@ -460,43 +898,20 @@ function paintThread(s, follow, y) {
     app.append(p);
     return;
   }
-  (s.messages || []).forEach(m => {
-    const wrap = document.createElement('div');
-    wrap.className = 'bubble ' + (m.mine ? 'mine' : 'them');
-    const row = document.createElement('div');
-    row.className = 'msg';
-    if (m.quote) {
-      const quote = document.createElement('div');
-      quote.className = 'quote';
-      quote.textContent = m.quote;
-      row.append(quote);
-    }
-    if (m.text) {
-      const text = document.createElement('div');
-      text.textContent = m.text;
-      row.append(text);
-    }
-    if (m.image) {
-      const img = document.createElement('img');
-      img.className = 'pic';
-      img.alt = '圖片';
-      row.append(img);
-      showPic(m.image, img);
-    }
-    if (m.time) {
-      const time = document.createElement('div');
-      time.className = 'time';
-      time.textContent = m.time;
-      row.append(time);
-    }
-    wrap.append(row);
-    app.append(wrap);
-  });
+  paintOpening(s);
+  (s.messages || []).forEach(paintBubble);
   placeThread(s, follow, y);
 }
 
 function paint() {
+  const gear = document.getElementById('controls-btn');
+  if (gear) gear.textContent = showControls ? '關閉' : '控制';
   if (!token) { clearForm(); return gate(); }
+  if (showControls) {
+    const editing = document.activeElement && document.activeElement.tagName === 'INPUT' && document.activeElement.closest && document.activeElement.closest('#app');
+    if (!editing) paintControls();
+    return;
+  }
   const y = window.scrollY;
   const follow = stickBottom || (!!current && nearBottom());
   const focused = document.activeElement && document.activeElement.closest && document.activeElement.closest('form');
@@ -542,14 +957,19 @@ function paint() {
       btn.className = 'card';
       btn.type = 'button';
       const name = document.createElement('div');
-      name.textContent = s.title || '未命名';
+      name.className = 'who';
+      if (s.openings && s.openings.avatar) name.append(faceNode(s.openings.avatar));
+      const title = document.createElement('span');
+      title.textContent = s.title || '未命名';
+      name.append(title);
       const ms = s.messages || [];
       const last = ms[ms.length - 1];
+      const openingText = s.openings && ((s.openings.them && s.openings.them.text) || (s.openings.mine && s.openings.mine.text));
       const sub = document.createElement('small');
       sub.className = 'preview' + (last && last.mine ? ' mine' : '');
       const label = document.createElement('span');
       label.className = 'preview-text';
-      label.textContent = last ? (last.text || (last.image ? '圖片' : (last.quote || '還沒有訊息'))) : '還沒有訊息';
+      label.textContent = last ? (last.text || (last.image ? '圖片' : (last.quote || openingText || '還沒有訊息'))) : (openingText || '還沒有訊息');
       sub.append(label);
       if (last && last.time) {
         const when = document.createElement('span');
@@ -624,6 +1044,25 @@ function paint() {
   if (draft) input.focus();
 }
 
+function plainFace() {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('class', 'face');
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('d', 'M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 3c1.66 0 3 1.34 3 3s-1.34 3-3 3-3-1.34-3-3 1.34-3 3-3zm0 14.2c-2.5 0-4.71-1.28-6-3.22.03-1.99 4-3.08 6-3.08 1.99 0 5.97 1.09 6 3.08-1.29 1.94-3.5 3.22-6 3.22z');
+  svg.append(path);
+  return svg;
+}
+
+function faceNode(avatar) {
+  if (avatar === 'plain') return plainFace();
+  const img = document.createElement('img');
+  img.className = 'face';
+  img.alt = '';
+  showPic(avatar, img);
+  return img;
+}
+
 function showPic(id, img) {
   if (picUrls[id]) { img.src = picUrls[id]; return; }
   fetch('/api/images/' + id, { headers: { Authorization: 'Bearer ' + token } })
@@ -678,6 +1117,15 @@ async function tick() {
     if (!token) return paint();
     const data = await api('/api/sessions' + (pollWait ? '?wait=1' : ''));
     sessions = data.sessions || [];
+    if (controlDraft && sessions.some(s => s.controls && JSON.stringify(packControls(s.controls)) === JSON.stringify(controlDraft))) controlDraft = null;
+    if (avatarDraft) {
+      const hit = sessions.find(s => s.tabId === avatarDraft.tabId);
+      if (hit && hit.openings && !!hit.openings.avatarOn === avatarDraft.on) avatarDraft = null;
+    }
+    if (userDraft) {
+      const hit = sessions.find(s => s.tabId === userDraft.tabId);
+      if (hit && hit.openings && !!hit.openings.userOn === userDraft.on) userDraft = null;
+    }
     paint();
   } catch (e) {
     if (!token) paint();
@@ -695,6 +1143,7 @@ async function loop() {
   }
 }
 document.addEventListener('visibilitychange', () => { if (!document.hidden) tick(); });
+document.getElementById('controls-btn').onclick = () => { showControls = !showControls; if (showControls) current = ''; paint(); };
 loop();
 </script>
 </body>
@@ -727,8 +1176,11 @@ function main() {
                 if (url.searchParams.get('wait') === '1') await pause(POLL_MS, req);
                 if (clientGone(req, res)) return;
                 const outbox = pendingOutbox(session);
-                if (outbox.dirty) saveSessions(sessions);
-                return send(res, 200, { ok: true, outbox: outbox.pending });
+                const patch = takeControlPatch(session);
+                const avatarPatch = takeAvatarPatch(session);
+                const userPatch = takeUserPatch(session);
+                if (outbox.dirty || patch.dirty || avatarPatch.dirty || userPatch.dirty) saveSessions(sessions);
+                return send(res, 200, { ok: true, outbox: outbox.pending, controls: patch.controls, avatarOn: avatarPatch.avatarOn, userOn: userPatch.userOn });
             }
             const imgMatch = url.pathname.match(/^\/api\/images\/([a-z0-9]{8,40})$/);
             if (imgMatch && req.method === 'GET') {
@@ -741,6 +1193,7 @@ function main() {
                 return;
             }
             if (imgMatch && req.method === 'POST') {
+                // 檔案已在就用同一份，不再寫一次。
                 if (imagePath(imgMatch[1])) return send(res, 200, { ok: true });
                 const buf = await readRaw(req, 1500000);
                 if (!writeImage(imgMatch[1], buf, req.headers['content-type'])) return send(res, 400, { error: 'bad image' });
@@ -769,6 +1222,32 @@ function main() {
                 if (!item) return send(res, 400, { error: 'empty' });
                 saveSessions(sessions);
                 return send(res, 200, { ok: true, id: item.id });
+            }
+            const avatarPost = url.pathname.match(/^\/api\/sessions\/([a-z0-9]{8,40})\/avatar$/);
+            if (req.method === 'POST' && avatarPost) {
+                const session = sessions.get(avatarPost[1]);
+                if (!session) return send(res, 404, { error: 'gone' });
+                const body = await readBody(req);
+                session.avatarWanted = !!body.on;
+                saveSessions(sessions);
+                return send(res, 200, { ok: true });
+            }
+            const userPost = url.pathname.match(/^\/api\/sessions\/([a-z0-9]{8,40})\/user$/);
+            if (req.method === 'POST' && userPost) {
+                const session = sessions.get(userPost[1]);
+                if (!session) return send(res, 404, { error: 'gone' });
+                const body = await readBody(req);
+                session.userWanted = !!body.on;
+                saveSessions(sessions);
+                return send(res, 200, { ok: true });
+            }
+            if (req.method === 'POST' && url.pathname === '/api/controls') {
+                const patch = cleanControls(await readBody(req));
+                if (!patch) return send(res, 400, { error: 'bad controls' });
+                if (!sessions.size) return send(res, 409, { error: 'no tab' });
+                for (const session of sessions.values()) session.controlWanted = patch;
+                saveSessions(sessions);
+                return send(res, 200, { ok: true });
             }
             const ackMatch = url.pathname.match(/^\/api\/sessions\/([a-z0-9]{8,40})\/ack$/);
             if (req.method === 'POST' && ackMatch) {
