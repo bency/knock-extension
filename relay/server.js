@@ -84,7 +84,7 @@ function loadSessions() {
                 status: s.status === 'left' ? 'left' : 'live',
                 messages: cleanMessages(s.messages),
                 seen: Number(s.seen) || 0,
-                outbox: Array.isArray(s.outbox) ? s.outbox.slice(-20) : []
+                outbox: keptOutbox(s.outbox)
             });
         }
         return map;
@@ -95,6 +95,26 @@ function loadSessions() {
 
 function saveSessions(sessions) {
     fs.writeFileSync(DATA, JSON.stringify([...sessions.values()]));
+}
+
+// ponytail: 重開時還沒交出去的圖片直接丟掉，避免舊腳本把同一張再送進聊天室。
+function keptOutbox(list) {
+    return (Array.isArray(list) ? list : []).filter(item => item && !item.image).slice(-20);
+}
+
+function pendingOutbox(session) {
+    const pending = [];
+    let dirty = false;
+    for (const item of session.outbox) {
+        if (!item) continue;
+        if (item.image) {
+            if (item.handed) continue;
+            item.handed = true;
+            dirty = true;
+        }
+        pending.push(item);
+    }
+    return { pending, dirty };
 }
 
 function enqueue(session, text, now, image) {
@@ -134,7 +154,13 @@ function selfCheck() {
     if (applyHeartbeat(sessions, { tabId: '../x', title: 'x' }, 2000)) throw new Error('knock relay 檢查失敗');
     const imgItem = enqueue(sessions.get('abc12345'), '', 30000, 'abcd1234');
     const withImg = cleanMessages([{ id: 'imgmsg01', text: '', quote: '原文', image: 'abcd1234' }]);
-    if (!imgItem || !imgItem.image || withImg.length !== 1 || withImg[0].quote !== '原文' || withImg[0].image !== 'abcd1234') {
+    const handed = pendingOutbox(sessions.get('abc12345'));
+    const again = pendingOutbox(sessions.get('abc12345'));
+    const kept = keptOutbox([{ text: 'a' }, { image: 'abcd1234' }, { text: 'b' }]);
+    if (!imgItem || !imgItem.image || withImg.length !== 1 || withImg[0].quote !== '原文' || withImg[0].image !== 'abcd1234'
+        || handed.pending.filter(item => item.image).length !== 1
+        || again.pending.some(item => item.image)
+        || kept.length !== 2) {
         throw new Error('knock relay 檢查失敗');
     }
 }
@@ -700,7 +726,9 @@ function main() {
                 saveSessions(sessions);
                 if (url.searchParams.get('wait') === '1') await pause(POLL_MS, req);
                 if (clientGone(req, res)) return;
-                return send(res, 200, { ok: true, outbox: session.outbox });
+                const outbox = pendingOutbox(session);
+                if (outbox.dirty) saveSessions(sessions);
+                return send(res, 200, { ok: true, outbox: outbox.pending });
             }
             const imgMatch = url.pathname.match(/^\/api\/images\/([a-z0-9]{8,40})$/);
             if (imgMatch && req.method === 'GET') {

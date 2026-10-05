@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.61
+// @version      1.4.64
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -66,7 +66,7 @@
     const HINT_CODE_KEY = 'knockHintCode';
     const HINT_NOTIFIED_KEY = 'knockHintConnectedNotified';
     const HINT_WAS_WAITING_KEY = 'knockHintWasWaiting';
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.61';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.64';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -2534,7 +2534,22 @@
 
     const relaySending = new Map();
     const relayUploaded = new Set();
+    const relayImageDone = new Set();
+    let relayImageBooted = false;
     let relayBusy = false;
+
+    function rememberRelayImage(id) {
+        if (!id || relayImageDone.has(id)) return;
+        relayImageDone.add(id);
+        try {
+            sessionStorage.setItem('knockRelayImageDone', JSON.stringify([...relayImageDone].slice(-40)));
+        } catch (e) {}
+    }
+
+    try {
+        const savedDone = JSON.parse(sessionStorage.getItem('knockRelayImageDone') || '[]');
+        if (Array.isArray(savedDone)) savedDone.forEach(id => { if (id) relayImageDone.add(id); });
+    } catch (e) {}
 
     function relayImageId(url) {
         const key = stableImageKey(url) || url;
@@ -2569,6 +2584,59 @@
         }
     }
 
+    function relayParkedFile() {
+        const item = document.querySelector('#filepond-image-uploader .filepond--item, #filepond-video-gif-uploader .filepond--item');
+        if (!item) return null;
+        const nameEl = item.querySelector('.filepond--file-info-main');
+        const name = nameEl ? nameEl.textContent.trim() : '';
+        if (name !== 'relay.jpg' && name !== 'relay.gif') return null;
+        return item;
+    }
+
+    function chatDraft() {
+        const box = Array.from(document.querySelectorAll('[data-test="input-message"] textarea')).find(t =>
+            t.getAttribute('aria-hidden') !== 'true' && t.style.visibility !== 'hidden'
+        );
+        return box ? box.value : '';
+    }
+
+    // 輸入框有草稿就不要按送出，避免把正在打的字一起送出去。
+    function relayShouldPushImage(fileName, draft) {
+        if (fileName !== 'relay.jpg' && fileName !== 'relay.gif') return false;
+        return !String(draft || '').trim();
+    }
+
+    // 同一張只送一次。腳本剛載入時佇列裡已有的圖片只回報、不再塞進聊天室。
+    function relayImagePlan(id, done, booted) {
+        if (!id || !booted || done.has(id)) return 'ack';
+        return 'send';
+    }
+
+    function ackRelayItem(token, tabId, id) {
+        return gmRequest({
+            method: 'POST',
+            url: `${RELAY_URL}/api/sessions/${tabId}/ack`,
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+            data: JSON.stringify({ id }),
+            timeout: 8000
+        }).catch(() => {});
+    }
+
+    function waitFor(pred, ms) {
+        const end = Date.now() + ms;
+        const step = () => pred() || Date.now() >= end
+            ? Promise.resolve(!!pred())
+            : new Promise(r => setTimeout(r, 80)).then(step);
+        return step();
+    }
+
+    function removeParkedFile() {
+        const parked = relayParkedFile();
+        if (!parked) return;
+        const remove = parked.querySelector('button.filepond--action-remove-item');
+        if (remove) remove.click();
+    }
+
     async function relayDropImage(item) {
         const res = await gmRequest({
             method: 'GET',
@@ -2590,7 +2658,21 @@
         dt.items.add(file);
         input.files = dt.files;
         input.dispatchEvent(new Event('change', { bubbles: true }));
-        return input.files && input.files.length === 1;
+        return waitFor(() => !!relayParkedFile(), 2000);
+    }
+
+    // 送出鈕只點一次。simulateMouseClick 會連點，預覽還在就會連送同一張。
+    async function relayPushParkedImage() {
+        const parked = relayParkedFile();
+        if (!parked) return true;
+        const nameEl = parked.querySelector('.filepond--file-info-main');
+        const name = nameEl ? nameEl.textContent.trim() : '';
+        if (!relayShouldPushImage(name, chatDraft())) return false;
+        const send = document.querySelector('button[data-test="send"]');
+        if (!send || send.disabled) return false;
+        send.click();
+        removeParkedFile();
+        return true;
     }
 
     async function relayTick() {
@@ -2609,23 +2691,32 @@
             });
             if (res && res.status === 200) {
             const data = JSON.parse(res.responseText || '{}');
+            if (!relayImageBooted) {
+                relayImageBooted = true;
+                for (const queued of data.outbox || []) {
+                    if (queued && queued.image && queued.id) rememberRelayImage(queued.id);
+                }
+            }
+            // 殘留預覽只移掉，不再補按。補按會把同一張一直送出去。
+            if (relayParkedFile()) removeParkedFile();
             for (const item of data.outbox || []) {
                 if (!item || !item.id || !snap.canType || (!item.text && !item.image)) continue;
+                if (item.image) {
+                    if (relayImagePlan(item.id, relayImageDone, relayImageBooted) === 'ack') {
+                        if (relayParkedFile()) removeParkedFile();
+                        await ackRelayItem(token, snap.tabId, item.id);
+                        continue;
+                    }
+                    rememberRelayImage(item.id);
+                    if (relayParkedFile()) removeParkedFile();
+                    const dropped = await relayDropImage(item);
+                    if (dropped) await relayPushParkedImage();
+                    await ackRelayItem(token, snap.tabId, item.id);
+                    continue;
+                }
                 const started = relaySending.get(item.id) || 0;
                 if (Date.now() - started < 8000) continue;
                 relaySending.set(item.id, Date.now());
-                if (item.image) {
-                    const ok = await relayDropImage(item);
-                    if (!ok) { relaySending.delete(item.id); continue; }
-                    gmRequest({
-                        method: 'POST',
-                        url: `${RELAY_URL}/api/sessions/${snap.tabId}/ack`,
-                        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-                        data: JSON.stringify({ id: item.id }),
-                        timeout: 8000
-                    }).catch(() => {}).finally(() => relaySending.delete(item.id));
-                    continue;
-                }
                 const sent = sendChatMessage(item.text, () => {
                     gmRequest({
                         method: 'POST',
@@ -3538,6 +3629,16 @@
         const replyDiv = replyHost.querySelector('[data-test="message"]');
         if (getMessageQuote(replyDiv) !== '原文' || getMessageText(replyDiv) !== '回覆') {
             console.error('knock: 回覆拆分失敗', getMessageQuote(replyDiv), getMessageText(replyDiv));
+        }
+        if (!relayShouldPushImage('relay.jpg', '') || !relayShouldPushImage('relay.gif', '')
+            || relayShouldPushImage('relay.jpg', '草稿') || relayShouldPushImage('photo.jpg', '')) {
+            console.error('knock: 遠端圖片送出判斷失敗');
+        }
+        const imageDone = new Set(['old']);
+        if (relayImagePlan('old', imageDone, false) !== 'ack'
+            || relayImagePlan('old', imageDone, true) !== 'ack'
+            || relayImagePlan('new', imageDone, true) !== 'send') {
+            console.error('knock: 遠端圖片只送一次失敗');
         }
         if (cooldownReasonText('firstFilter', '阿明') !== '開始聊天 · 過濾了 阿明'
             || cooldownReasonText('firstFilter', '') !== '開始聊天 · 使用者過濾而重連'
