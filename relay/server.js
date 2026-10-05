@@ -12,6 +12,8 @@ const POLL_MS = 2000;
 const DATA = process.env.KNOCK_DATA || '/app/sessions.json';
 const TALK_FILE = path.join(path.dirname(DATA), 'talks.json');
 const DROP_FILE = path.join(path.dirname(DATA), 'dropped.json');
+const FILTER_FILE = path.join(path.dirname(DATA), 'filters.json');
+const FILTER_KEEP = 2000;
 const IMG_DIR = path.join(path.dirname(DATA), 'images');
 const TALK_KEEP = 800;
 
@@ -129,6 +131,80 @@ function dropTalk(talks, uid) {
 
 function saveTalks(talks) {
     fs.writeFileSync(TALK_FILE, JSON.stringify([...talks.values()]));
+}
+
+// ponytail: 使用者與大頭貼各最多 2000 筆，超過不再加。要再多就改分檔。
+const filters = { users: [], avatars: [] };
+
+function cleanUserFilter(item) {
+    if (item == null) return null;
+    if (typeof item !== 'object') {
+        const t = String(item).trim().slice(0, 200);
+        return t ? { u: '', t, a: '' } : null;
+    }
+    const u = String(item.u || item.uid || '').trim().slice(0, 128);
+    const t = String(item.t || item.text || '').trim().slice(0, 200);
+    const a = String(item.a || item.avatarHash || '').trim().slice(0, 80);
+    if (!u && !t) return null;
+    return { u, t, a };
+}
+
+function cleanAvatarFilter(item) {
+    return String(item && typeof item === 'object' ? (item.url || item.u || '') : (item || '')).trim().slice(0, 800);
+}
+
+function applyFilterPatch(box, patch) {
+    if (!patch || typeof patch !== 'object') return false;
+    let changed = false;
+    if (patch.clearUsers && box.users.length) { box.users = []; changed = true; }
+    if (patch.clearAvatars && box.avatars.length) { box.avatars = []; changed = true; }
+    for (const raw of Array.isArray(patch.addUsers) ? patch.addUsers : []) {
+        const f = cleanUserFilter(raw);
+        if (!f) continue;
+        if (f.u && box.users.some(x => x.u === f.u)) continue;
+        const legacy = f.u ? box.users.find(x => !x.u && f.t && x.t === f.t && x.a === f.a) : null;
+        if (legacy) { legacy.u = f.u; changed = true; continue; }
+        if (!f.u && box.users.some(x => !x.u && x.t === f.t && x.a === f.a)) continue;
+        if (box.users.length >= FILTER_KEEP) continue;
+        box.users.push(f);
+        changed = true;
+    }
+    for (const raw of Array.isArray(patch.removeUsers) ? patch.removeUsers : []) {
+        const f = cleanUserFilter(raw);
+        if (!f) continue;
+        const forget = !!(raw && raw.forget);
+        const next = box.users.filter(x => {
+            if (f.u && x.u === f.u) return false;
+            if (f.t && !x.u && x.t === f.t && x.a === f.a && (!f.u || forget)) return false;
+            return true;
+        });
+        if (next.length !== box.users.length) { box.users = next; changed = true; }
+    }
+    for (const raw of Array.isArray(patch.addAvatars) ? patch.addAvatars : []) {
+        const u = cleanAvatarFilter(raw);
+        if (!u || box.avatars.includes(u)) continue;
+        if (box.avatars.length >= FILTER_KEEP) continue;
+        box.avatars.push(u);
+        changed = true;
+    }
+    for (const raw of Array.isArray(patch.removeAvatars) ? patch.removeAvatars : []) {
+        const u = cleanAvatarFilter(raw);
+        if (!u) continue;
+        const next = box.avatars.filter(x => x !== u);
+        if (next.length !== box.avatars.length) { box.avatars = next; changed = true; }
+    }
+    return changed;
+}
+
+function loadFilters() {
+    try {
+        const raw = JSON.parse(fs.readFileSync(FILTER_FILE, 'utf8'));
+        applyFilterPatch(filters, { addUsers: raw.users, addAvatars: raw.avatars });
+    } catch (e) {}
+}
+
+function saveFilters() {
+    fs.writeFileSync(FILTER_FILE, JSON.stringify(filters));
 }
 
 function cleanMessages(list) {
@@ -433,6 +509,21 @@ function selfCheck() {
         || dropTalk(talks, 'user_one')) {
         throw new Error('knock relay 檢查失敗');
     }
+    const box = { users: [], avatars: [] };
+    const legacy = applyFilterPatch(box, { addUsers: [{ t: '舊', a: 'h2' }] });
+    const upgraded = applyFilterPatch(box, { addUsers: [{ u: 'user_two', t: '舊', a: 'h2' }] });
+    if (!applyFilterPatch(box, { addUsers: [{ u: 'user_one', t: '嗨', a: 'h1' }] })
+        || applyFilterPatch(box, { addUsers: [{ u: 'user_one', t: '嗨', a: 'h1' }] })
+        || !legacy || !upgraded || box.users.find(x => x.t === '舊').u !== 'user_two'
+        || !applyFilterPatch(box, { addAvatars: [' https://a/b.png '] })
+        || applyFilterPatch(box, { addAvatars: ['https://a/b.png'] })
+        || box.avatars.length !== 1
+        || !applyFilterPatch(box, { removeUsers: [{ u: 'user_one', t: '嗨', a: 'h1', forget: true }] })
+        || box.users.some(x => x.u === 'user_one')
+        || !applyFilterPatch(box, { clearAvatars: true })
+        || box.avatars.length) {
+        throw new Error('knock relay 檢查失敗');
+    }
     dropped.delete('user_one:a');
     dropped.delete('user_one:b');
 }
@@ -454,7 +545,13 @@ function pause(ms, req) {
 }
 
 let revision = 0;
+let filterRev = 0;
 const wakes = new Set();
+
+function touchFilters() {
+    filterRev += 1;
+    touch();
+}
 
 function touch() {
     revision += 1;
@@ -614,8 +711,14 @@ const PAGE = `<!DOCTYPE html>
   button, input { font:inherit; color:#eee; }
   .card, .msg { background:#1c1c1c; border:1px solid #333; border-radius:10px; }
   .card { display:block; width:100%; text-align:left; padding:12px; margin:0 0 8px; cursor:pointer; }
-  #rail .card { width:calc(100% - 16px); box-sizing:border-box; margin:0 8px 4px; padding:4px 8px; }
+  #rail .card { position:relative; width:calc(100% - 16px); box-sizing:border-box; margin:0 8px 4px; padding:4px 8px; }
   #rail .card small { margin-top:2px; }
+  #rail .fold { position:relative; }
+  .rail-btn { position:relative; }
+  .dot { position:absolute; width:8px; height:8px; border-radius:50%; background:#e53935; }
+  .rail-btn .dot { top:8px; right:8px; }
+  #rail .card .dot { top:6px; right:8px; }
+  #rail .fold .dot { top:50%; right:12px; margin-top:-4px; }
   .card small { display:block; color:#aaa; margin-top:4px; }
   .card small.preview { display:flex; gap:8px; align-items:baseline; color:#ffb74d; }
   .card small.preview .preview-text { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -807,6 +910,41 @@ function barsIcon() {
 
 function closeRail() { document.body.classList.remove('rail-open'); }
 
+const roomUnread = {};
+const roomTail = {};
+let roomTailReady = false;
+
+function redDot() {
+  const dot = document.createElement('span');
+  dot.className = 'dot';
+  return dot;
+}
+
+function unreadLeft() {
+  for (const id in roomUnread) if (roomUnread[id]) return true;
+  return false;
+}
+
+function noteRooms(list) {
+  const alive = {};
+  for (const s of list) {
+    alive[s.tabId] = true;
+    const tail = tailId(s);
+    if (!roomTailReady || roomTail[s.tabId] === undefined) {
+      const fresh = roomTailReady && tail && s.tabId !== current;
+      roomTail[s.tabId] = tail;
+      if (fresh) roomUnread[s.tabId] = true;
+      continue;
+    }
+    if (tail === roomTail[s.tabId]) continue;
+    roomTail[s.tabId] = tail;
+    if (s.tabId === current || !tail) delete roomUnread[s.tabId];
+    else roomUnread[s.tabId] = true;
+  }
+  roomTailReady = true;
+  for (const id in roomUnread) if (!alive[id]) delete roomUnread[id];
+}
+
 function paintBar(title, end) {
   clearChrome();
   const bar = document.createElement('div');
@@ -816,6 +954,7 @@ function paintBar(title, end) {
   railBtn.className = 'gear menu rail-btn';
   railBtn.setAttribute('aria-label', '列表');
   railBtn.append(barsIcon());
+  if (unreadLeft()) railBtn.append(redDot());
   railBtn.onclick = () => document.body.classList.toggle('rail-open');
   const who = document.createElement('span');
   who.className = 'who';
@@ -854,7 +993,7 @@ function trashIcon() {
   return svg;
 }
 
-function railSection(key, title, fill) {
+function railSection(key, title, fill, alert) {
   const head = document.createElement('button');
   head.type = 'button';
   head.className = 'fold';
@@ -863,6 +1002,7 @@ function railSection(key, title, fill) {
   const label = document.createElement('span');
   label.textContent = title;
   head.append(mark, label);
+  if (alert && railFold[key]) head.append(redDot());
   head.onclick = () => { railFold[key] = !railFold[key]; paint(); };
   rail.append(head);
   if (!railFold[key]) fill();
@@ -901,6 +1041,10 @@ function liveCard(s) {
     sub.append(when);
   }
   btn.append(name, sub);
+  if (roomUnread[s.tabId]) {
+    name.style.paddingRight = '14px';
+    btn.append(redDot());
+  }
   const extra = s.waiting ? '' : statusText(s);
   if (extra) {
     const st = document.createElement('small');
@@ -912,6 +1056,7 @@ function liveCard(s) {
     archiveUid = '';
     archiveTalk = null;
     current = s.tabId;
+    delete roomUnread[s.tabId];
     stickBottom = true;
     closeRail();
     paint();
@@ -978,11 +1123,11 @@ function paintRail() {
   railSection('live', '連線中', () => {
     if (!live.length) rail.append(railEmpty('沒有正在回報的對話'));
     else live.forEach(s => rail.append(liveCard(s)));
-  });
+  }, live.some(s => roomUnread[s.tabId]));
   railSection('quiet', '離線', () => {
     if (!quiet.length) rail.append(railEmpty('沒有離線的對話'));
     else quiet.forEach(s => rail.append(liveCard(s)));
-  });
+  }, quiet.some(s => roomUnread[s.tabId]));
   railSection('talks', '紀錄', () => {
     if (!talks.length) rail.append(railEmpty('還沒有對話記錄'));
     else talks.forEach(t => rail.append(talkCard(t)));
@@ -1537,6 +1682,7 @@ async function tick() {
     if (!token) return paint();
     const data = await api('/api/sessions' + (pollWait ? '?wait=1' : ''));
     sessions = data.sessions || [];
+    noteRooms(sessions);
     const freshTalks = data.talks || [];
     for (const uid of [...droppedTalks]) {
       if (!freshTalks.some(t => t.uid === uid)) droppedTalks.delete(uid);
@@ -1596,6 +1742,7 @@ loop();
 
 function main() {
     loadDropped();
+    loadFilters();
     const sessions = loadSessions();
     const talks = loadTalks();
     const server = http.createServer(async (req, res) => {
@@ -1630,6 +1777,14 @@ function main() {
                 saveDropped();
                 return send(res, 200, { ok: true });
             }
+            if (req.method === 'POST' && url.pathname === '/api/filters') {
+                const body = await readBody(req);
+                if (applyFilterPatch(filters, body)) {
+                    saveFilters();
+                    touchFilters();
+                }
+                return send(res, 200, filters);
+            }
             if (req.method === 'POST' && url.pathname === '/api/heartbeat') {
                 const body = await readBody(req);
                 const session = applyHeartbeat(sessions, body, Date.now());
@@ -1637,14 +1792,17 @@ function main() {
                 const archived = rememberTalk(talks, body, Date.now());
                 saveSessions(sessions);
                 if (archived) saveTalks(talks);
-                if (url.searchParams.get('wait') === '1') await waitUntil(POLL_MS, req, () => heartbeatReady(session));
+                if (url.searchParams.get('wait') === '1') {
+                    const seenFilters = filterRev;
+                    await waitUntil(POLL_MS, req, () => heartbeatReady(session) || filterRev !== seenFilters);
+                }
                 if (clientGone(req, res)) return;
                 const outbox = pendingOutbox(session);
                 const patch = takeControlPatch(session);
                 const avatarPatch = takeAvatarPatch(session);
                 const userPatch = takeUserPatch(session);
                 if (outbox.dirty || patch.dirty || avatarPatch.dirty || userPatch.dirty) saveSessions(sessions);
-                return send(res, 200, { ok: true, outbox: outbox.pending, controls: patch.controls, avatarOn: avatarPatch.avatarOn, userOn: userPatch.userOn });
+                return send(res, 200, { ok: true, outbox: outbox.pending, controls: patch.controls, avatarOn: avatarPatch.avatarOn, userOn: userPatch.userOn, filters });
             }
             const imgMatch = url.pathname.match(/^\/api\/images\/([a-z0-9]{8,40})$/);
             if (imgMatch && req.method === 'GET') {

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.71
+// @version      1.4.72
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -66,7 +66,7 @@
     const HINT_CODE_KEY = 'knockHintCode';
     const HINT_NOTIFIED_KEY = 'knockHintConnectedNotified';
     const HINT_WAS_WAITING_KEY = 'knockHintWasWaiting';
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.71';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.72';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -357,29 +357,37 @@
         const legacy = list.find(f => !f.u && t && f.t === t && f.a === a);
         if (legacy) legacy.u = u;
         else list.push({ u, t, a });
-        return storageSet(FIRST_MSG_FILTER_KEY, list);
+        const ok = storageSet(FIRST_MSG_FILTER_KEY, list);
+        if (ok) pushFilters({ addUsers: [{ u, t, a }] });
+        return ok;
     }
 
     function removeFirstMessageFilter(uid, text, avatarHash) {
         const u = (uid || '').trim();
         const t = (text || '').trim();
         const a = avatarHash || '';
-        return storageSet(FIRST_MSG_FILTER_KEY, getNormalizedFilters().filter(f => {
+        const next = getNormalizedFilters().filter(f => {
             if (u && f.u === u) return false;
             if (!u && t && !f.u && f.t === t && f.a === a) return false;
             return true;
-        }));
+        });
+        const ok = storageSet(FIRST_MSG_FILTER_KEY, next);
+        if (ok) pushFilters({ removeUsers: [{ u, t, a }] });
+        return ok;
     }
 
     function forgetFirstMessageFilter(uid, text, avatarHash) {
         const u = (uid || '').trim();
         const t = (text || '').trim();
         const a = avatarHash || '';
-        return storageSet(FIRST_MSG_FILTER_KEY, getNormalizedFilters().filter(f => {
+        const next = getNormalizedFilters().filter(f => {
             if (u && f.u === u) return false;
             if (t && !f.u && f.t === t && f.a === a) return false;
             return true;
-        }));
+        });
+        const ok = storageSet(FIRST_MSG_FILTER_KEY, next);
+        if (ok) pushFilters({ removeUsers: [{ u, t, a, forget: true }] });
+        return ok;
     }
 
     function stampFilterUid(text, avatarHash, uid) {
@@ -390,10 +398,13 @@
         if (!legacy || legacy.u) return;
         legacy.u = u;
         storageSet(FIRST_MSG_FILTER_KEY, list);
+        pushFilters({ addUsers: [{ u, t: legacy.t, a: legacy.a }] });
     }
 
     function clearFirstMessageFilters() {
-        return storageSet(FIRST_MSG_FILTER_KEY, []);
+        const ok = storageSet(FIRST_MSG_FILTER_KEY, []);
+        if (ok) pushFilters({ clearUsers: true });
+        return ok;
     }
 
     function exportFirstMessageFilters() {
@@ -414,7 +425,7 @@
         return list.map(normalizeFilter).filter(Boolean);
     }
 
-    function importFirstMessageFilters(incoming) {
+    function mergeStoredUsers(incoming) {
         const list = getNormalizedFilters();
         const seen = new Set(list.map(f => f.u ? `u\0${f.u}` : `t\0${f.t}\0${f.a}`));
         let added = 0;
@@ -429,6 +440,12 @@
             added++;
         }
         if (added) storageSet(FIRST_MSG_FILTER_KEY, list);
+        return added;
+    }
+
+    function importFirstMessageFilters(incoming) {
+        const added = mergeStoredUsers(incoming);
+        if (added) pushFilters({ addUsers: incoming });
         return added;
     }
 
@@ -558,16 +575,22 @@
         const list = getAvatarFilters();
         if (list.includes(u)) return false;
         list.push(u);
-        return storageSet(AVATAR_FILTER_KEY, list);
+        const ok = storageSet(AVATAR_FILTER_KEY, list);
+        if (ok) pushFilters({ addAvatars: [u] });
+        return ok;
     }
 
     function removeAvatarFilter(url) {
         const u = (url || '').trim();
-        return storageSet(AVATAR_FILTER_KEY, getAvatarFilters().filter(x => x !== u));
+        const ok = storageSet(AVATAR_FILTER_KEY, getAvatarFilters().filter(x => x !== u));
+        if (ok) pushFilters({ removeAvatars: [u] });
+        return ok;
     }
 
     function clearAvatarFilters() {
-        return storageSet(AVATAR_FILTER_KEY, []);
+        const ok = storageSet(AVATAR_FILTER_KEY, []);
+        if (ok) pushFilters({ clearAvatars: true });
+        return ok;
     }
 
     function exportAvatarFilters() {
@@ -587,7 +610,7 @@
         return list.map(normalizeAvatarFilter).filter(Boolean);
     }
 
-    function importAvatarFilters(incoming) {
+    function mergeStoredAvatars(incoming) {
         const list = getAvatarFilters();
         const seen = new Set(list);
         let added = 0;
@@ -599,6 +622,12 @@
             added++;
         }
         if (added) storageSet(AVATAR_FILTER_KEY, list);
+        return added;
+    }
+
+    function importAvatarFilters(incoming) {
+        const added = mergeStoredAvatars(incoming);
+        if (added) pushFilters({ addAvatars: incoming });
         return added;
     }
 
@@ -2988,9 +3017,94 @@
         return true;
     }
 
+    let filtersUploaded = false;
+    let filterUploadBusy = false;
+
+    function pushFilters(patch) {
+        const token = relayToken();
+        if (!token || !patch) return;
+        gmRequest({
+            method: 'POST',
+            url: `${RELAY_URL}/api/filters`,
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+            data: JSON.stringify(patch),
+            timeout: 8000
+        }).then(res => {
+            if (!res || res.status !== 200) return;
+            try { applyServerFilters(JSON.parse(res.responseText || '{}')); } catch (e) {}
+        }).catch(() => {});
+    }
+
+    function applyServerFilters(data) {
+        if (!data || typeof data !== 'object') return;
+        const users = Array.isArray(data.users) ? data.users.map(normalizeFilter).filter(Boolean) : null;
+        const avatars = Array.isArray(data.avatars) ? data.avatars.map(normalizeAvatarFilter).filter(Boolean) : null;
+        if (!filtersUploaded) {
+            const addedUsers = users && users.length ? mergeStoredUsers(users) : 0;
+            const addedAvatars = avatars && avatars.length ? mergeStoredAvatars(avatars) : 0;
+            if (addedUsers || addedAvatars) {
+                syncRememberButtons();
+                syncAvatarFilterButtons();
+                maybeLeaveOnFirstMessageFilter();
+                maybeLeaveOnAvatarFilter();
+            }
+            return;
+        }
+        let changed = false;
+        if (users && JSON.stringify(users) !== JSON.stringify(getNormalizedFilters())) {
+            storageSet(FIRST_MSG_FILTER_KEY, users);
+            changed = true;
+            syncRememberButtons();
+            if (el('knock-first-filter-manager')) refreshFirstFilterManager();
+        }
+        if (avatars && JSON.stringify(avatars) !== JSON.stringify(getAvatarFilters())) {
+            storageSet(AVATAR_FILTER_KEY, avatars);
+            changed = true;
+            syncAvatarFilterButtons();
+            if (el('knock-avatar-filter-manager')) refreshAvatarFilterManager();
+        }
+        if (changed) {
+            maybeLeaveOnFirstMessageFilter();
+            maybeLeaveOnAvatarFilter();
+        }
+    }
+
+    function uploadLocalFilters() {
+        if (filtersUploaded || filterUploadBusy) return;
+        const token = relayToken();
+        if (!token) return;
+        const addUsers = getNormalizedFilters();
+        const addAvatars = getAvatarFilters();
+        if (!addUsers.length && !addAvatars.length) { filtersUploaded = true; return; }
+        filterUploadBusy = true;
+        const steps = [];
+        for (let i = 0; i < addUsers.length || i < addAvatars.length; i += 200) {
+            steps.push({ addUsers: addUsers.slice(i, i + 200), addAvatars: addAvatars.slice(i, i + 200) });
+        }
+        let chain = Promise.resolve(null);
+        for (const patch of steps) {
+            chain = chain.then(() => gmRequest({
+                method: 'POST',
+                url: `${RELAY_URL}/api/filters`,
+                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                data: JSON.stringify(patch),
+                timeout: 8000
+            }).then(res => {
+                if (!res || res.status !== 200) throw new Error('filters');
+                return res;
+            }));
+        }
+        chain.then(res => {
+            filterUploadBusy = false;
+            filtersUploaded = true;
+            try { applyServerFilters(JSON.parse(res.responseText || '{}')); } catch (e) {}
+        }).catch(() => { filterUploadBusy = false; });
+    }
+
     async function relayTick() {
         const token = relayToken();
         if (!token || relayBusy) return;
+        uploadLocalFilters();
         saveRoomControls();
         const snap = relaySnapshot();
         if (!snap) return;
@@ -3006,6 +3120,7 @@
             if (res && res.status === 200) {
             if (snap.archive) rememberArchived(snap.archive.uid, snap.archive.messages);
             const data = JSON.parse(res.responseText || '{}');
+            if (data.filters) applyServerFilters(data.filters);
             if (data.controls) applyRelayControls(data.controls);
             if (typeof data.avatarOn === 'boolean') {
                 const first = findFirstOtherMessage();
