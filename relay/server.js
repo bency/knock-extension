@@ -369,9 +369,11 @@ function applyHeartbeat(sessions, body, now) {
         lobby: !!body.lobby,
         greeting: body.lobby ? String(body.greeting || '').trim().slice(0, 200) : (prev && prev.greeting) || '',
         greetingWanted: prev && typeof prev.greetingWanted === 'string' ? prev.greetingWanted : null,
-        startWanted: !!(prev && prev.startWanted && body.lobby),
+        startWanted: !!(prev && prev.startWanted),
         status: body.status === 'left' ? 'left' : 'live',
-        messages: keepRecalled(cleanMessages(body.messages), prev && prev.messages),
+        messages: body.lobby && !(body.messages && body.messages.length) && prev && prev.messages && prev.messages.length
+            ? prev.messages
+            : keepRecalled(cleanMessages(body.messages), prev && prev.messages),
         seen: now,
         openings: body.openings
             ? cleanOpenings(body.openings, sameChannel ? prev.openings : null, now)
@@ -697,6 +699,19 @@ function selfCheck() {
         || greet.greeting !== '在嗎' || !started.start || lobby.startWanted
         || greetDone.greeting !== null || lobby.greetingWanted !== null
         || !leftLobby || leftLobby.startWanted || leftLobby.greeting !== '在嗎') {
+        throw new Error('knock relay 檢查失敗');
+    }
+    sessions.get('abc12345').startWanted = true;
+    const heldStart = applyHeartbeat(sessions, {
+        tabId: 'abc12345', title: '離開', canType: false, status: 'left', lobby: false,
+        messages: [{ id: 'm1', text: '嗨', mine: false }]
+    }, 18500);
+    if (!heldStart || !heldStart.startWanted || heldStart.messages.length !== 1) throw new Error('knock relay 檢查失敗');
+    heldStart.startWanted = false;
+    const keptLobby = applyHeartbeat(sessions, {
+        tabId: 'abc12345', title: '大廳', canType: false, lobby: true, greeting: '你好', messages: []
+    }, 18600);
+    if (!keptLobby || !keptLobby.lobby || keptLobby.messages.length !== 1 || keptLobby.messages[0].text !== '嗨') {
         throw new Error('knock relay 檢查失敗');
     }
     const noted = applyHeartbeat(sessions, {
@@ -1846,7 +1861,7 @@ function paint() {
   if (focused && current) {
     const s = sessions.find(x => x.tabId === current);
     paintThread(s, follow, y);
-    if (s && s.lobby) return;
+    if (s && (s.lobby || s.status === 'left')) return;
     const input = document.querySelector('form input');
     if (input) input.disabled = !canSend(s);
     document.querySelectorAll('form button').forEach(btn => { btn.disabled = sending || !canSend(s); });
@@ -1872,7 +1887,7 @@ function paint() {
   const s = sessions.find(x => x.tabId === current);
   paintThread(s, follow, y);
   if (!s) return;
-  if (s.lobby) {
+  if (s.lobby || s.status === 'left') {
     const form = document.createElement('form');
     const input = document.createElement('input');
     input.maxLength = 200;
@@ -2211,7 +2226,7 @@ function main() {
             if (req.method === 'POST' && startPost) {
                 const session = sessions.get(startPost[1]);
                 if (!session) return send(res, 404, { error: 'gone' });
-                if (!session.lobby) return send(res, 409, { error: 'cannot start' });
+                if (!session.lobby && session.status !== 'left') return send(res, 409, { error: 'cannot start' });
                 session.startWanted = true;
                 touch();
                 saveSessions(sessions);

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.84
+// @version      1.4.85
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -1923,6 +1923,11 @@
         if (typeof data.greeting === 'string') stepGreeting(data.greeting);
         if (data.start) pendingRemoteStart = true;
         if (!pendingRemoteStart || document.querySelector('[role="dialog"]')) return;
+        const rematch = findButtons().find(isRematchButton);
+        if (rematch && !rematch.disabled) {
+            simulateMouseClick(rematch);
+            return;
+        }
         if (typeof data.greeting === 'string' && lobbyGreeting() !== data.greeting.trim()) return;
         const btn = findButtons().find(isStartChatButton);
         if (!btn || btn.disabled) return;
@@ -1933,8 +1938,23 @@
 
     function relaySnapshot() {
         const list = document.querySelector('ul[data-test="messages"]');
-        if (!list) return null;
+        const lobby = findButtons().some(isStartChatButton);
         const left = findButtons().some(isRematchButton);
+        if (!list && !lobby && !left) return null;
+        const base = {
+            tabId: relayTabId(),
+            channelId: currentConversation.id || '',
+            title: currentPartnerName() || '未命名',
+            canType: false,
+            lobby,
+            greeting: lobby ? lobbyGreeting() : '',
+            status: left ? 'left' : 'live',
+            messages: [],
+            openings: null,
+            controls: relayControls(),
+            archive: relayArchive()
+        };
+        if (!list) return base;
         const canType = !left && !!document.querySelector('[data-test="input-message"] textarea');
         const dateByLi = listMessageDates(list);
         const messages = [];
@@ -1959,17 +1979,10 @@
             messages.push({ id, text: text.slice(0, 500), quote, image, mine: isMyMessageLi(li), time });
         }
         return {
-            tabId: relayTabId(),
-            channelId: currentConversation.id || '',
-            title: currentPartnerName() || '未命名',
+            ...base,
             canType,
-            lobby: findButtons().some(isStartChatButton),
-            greeting: findButtons().some(isStartChatButton) ? lobbyGreeting() : '',
-            status: left ? 'left' : 'live',
             messages: messages.slice(-40),
-            openings: relayOpenings(),
-            controls: relayControls(),
-            archive: relayArchive()
+            openings: relayOpenings()
         };
     }
 
