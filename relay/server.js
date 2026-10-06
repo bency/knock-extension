@@ -906,6 +906,10 @@ const PAGE = `<!DOCTYPE html>
   .card, .msg { background:#1c1c1c; border:1px solid #333; border-radius:10px; }
   .card { display:block; width:100%; text-align:left; padding:12px; margin:0 0 8px; cursor:pointer; }
   #rail .card { position:relative; width:calc(100% - 16px); box-sizing:border-box; margin:0 8px 4px; padding:4px 8px; }
+  #rail .card.has-face { display:flex; align-items:center; gap:8px; }
+  #rail .card.has-face .face-box { flex:none; width:calc(2lh + 2px); height:calc(2lh + 2px); }
+  #rail .card.has-face .face { width:100%; height:100%; }
+  #rail .card.has-face .card-body { flex:1; min-width:0; }
   #rail .card small { margin-top:2px; }
   #rail .fold { position:relative; }
   .rail-btn { position:relative; }
@@ -1229,7 +1233,6 @@ function liveCard(s) {
   btn.type = 'button';
   const name = document.createElement('div');
   name.className = 'who';
-  if (s.openings && s.openings.avatar) name.append(faceNode(s.openings.avatar));
   const title = document.createElement('span');
   title.textContent = s.title || '未命名';
   name.append(title);
@@ -1248,7 +1251,17 @@ function liveCard(s) {
     when.textContent = last.time;
     sub.append(when);
   }
-  btn.append(name, sub);
+  const body = document.createElement('div');
+  body.className = 'card-body';
+  body.append(name, sub);
+  if (s.openings && s.openings.avatar) {
+    btn.classList.add('has-face');
+    const box = document.createElement('span');
+    box.className = 'face-box';
+    box.append(faceNode(s.openings.avatar));
+    btn.append(box);
+  }
+  btn.append(body);
   if (roomUnread[s.tabId]) {
     name.style.paddingRight = '14px';
     btn.append(redDot());
@@ -1257,7 +1270,7 @@ function liveCard(s) {
   if (extra) {
     const st = document.createElement('small');
     st.textContent = extra;
-    btn.append(st);
+    body.append(st);
   }
   btn.onclick = () => {
     showControls = false;
