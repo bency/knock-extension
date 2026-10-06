@@ -31,12 +31,73 @@ function cleanUid(raw) {
     return s;
 }
 
+function pad2(n) {
+    return (n < 10 ? '0' : '') + n;
+}
+
+function taipeiNow() {
+    return new Date(Date.now() + 8 * 60 * 60 * 1000);
+}
+
+// 沒有年份的月日補上今年。昨天、前天寫成那天的日期，之後就不再跟著今天移動。
+function withYear(text) {
+    const raw = String(text || '').trim();
+    if (!raw) return '';
+    let rest = raw;
+    let dayShift = 0;
+    if (rest.indexOf('前天') === 0) { dayShift = -2; rest = rest.slice(2).trim(); }
+    else if (rest.indexOf('昨天') === 0) { dayShift = -1; rest = rest.slice(2).trim(); }
+    const space = rest.lastIndexOf(' ');
+    const datePart = space > 0 ? rest.slice(0, space) : '';
+    const clockPart = space > 0 ? rest.slice(space + 1) : rest;
+    const colon = clockPart.indexOf(':');
+    if (colon < 1) {
+        const only = (datePart || raw).split('/').filter(s => s !== '');
+        if (only.length >= 2 && only.length <= 3 && !clockPart.includes(':')) {
+            const y = only.length >= 3 ? parseInt(only[0], 10) : taipeiNow().getUTCFullYear();
+            const month = parseInt(only[only.length - 2], 10);
+            const day = parseInt(only[only.length - 1], 10);
+            if (y === y && y > 1900 && month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+                return y + '/' + pad2(month) + '/' + pad2(day);
+            }
+        }
+        return raw.slice(0, 32);
+    }
+    const hh = parseInt(clockPart.slice(0, colon), 10);
+    const mm = parseInt(clockPart.slice(colon + 1), 10);
+    if (hh !== hh || mm !== mm || hh > 23 || mm > 59) return raw.slice(0, 32);
+    const bits = datePart.split('/').filter(s => s !== '');
+    const today = taipeiNow();
+    let y = today.getUTCFullYear();
+    let month = 0;
+    let day = 0;
+    let known = false;
+    if (bits.length >= 3) {
+        y = parseInt(bits[0], 10);
+        month = parseInt(bits[1], 10);
+        day = parseInt(bits[2], 10);
+        known = y === y && month === month && day === day;
+    } else if (bits.length === 2) {
+        month = parseInt(bits[0], 10);
+        day = parseInt(bits[1], 10);
+        known = month === month && day === day;
+    } else if (dayShift) {
+        const base = new Date(Date.UTC(y, today.getUTCMonth(), today.getUTCDate()) + dayShift * 86400000);
+        y = base.getUTCFullYear();
+        month = base.getUTCMonth() + 1;
+        day = base.getUTCDate();
+        known = true;
+    }
+    if (!known || month < 1 || month > 12 || day < 1 || day > 31) return raw.slice(0, 32);
+    return y + '/' + pad2(month) + '/' + pad2(day) + ' ' + pad2(hh) + ':' + pad2(mm);
+}
+
 function archiveMessage(m) {
     const id = String(m && m.id || '').slice(0, 80);
     const text = String(m && m.text || '').slice(0, 500);
     const quote = String(m && m.quote || '').slice(0, 200);
     const image = /^[a-z0-9]{8,40}$/.test(m && m.image) ? m.image : '';
-    const time = String(m && m.time || '').slice(0, 32);
+    const time = withYear(m && m.time);
     if (!id || !(text || quote || image)) return null;
     return { id, text, quote, image, mine: !!(m && m.mine), time };
 }
@@ -87,51 +148,52 @@ function rememberTalk(talks, body, now) {
 }
 
 function messageTimeMs(text) {
-    const raw = String(text || '').trim();
-    const space = raw.lastIndexOf(' ');
-    const datePart = space > 0 ? raw.slice(0, space) : '';
-    const clockPart = space > 0 ? raw.slice(space + 1) : raw;
-    const colon = clockPart.indexOf(':');
-    if (colon < 1) return 0;
-    const hh = parseInt(clockPart.slice(0, colon), 10);
-    const mm = parseInt(clockPart.slice(colon + 1), 10);
-    if (hh !== hh || mm !== mm) return 0;
-    const slash = datePart.indexOf('/');
-    const now = new Date();
-    let month = parseInt(slash > 0 ? datePart.slice(0, slash) : '', 10);
-    let day = parseInt(slash > 0 ? datePart.slice(slash + 1) : '', 10);
-    const dated = month === month && day === day;
-    if (!dated) { month = now.getMonth() + 1; day = now.getDate(); }
-    let at = new Date(now.getFullYear(), month - 1, day, hh, mm).getTime();
-    if (at > Date.now() + 60000) {
-        at = dated ? new Date(now.getFullYear() - 1, month - 1, day, hh, mm).getTime() : at - 86400000;
-    }
-    return at;
+    const stamped = withYear(text);
+    const space = stamped.lastIndexOf(' ');
+    if (space < 1) return 0;
+    const bits = stamped.slice(0, space).split('/');
+    const clock = stamped.slice(space + 1);
+    const colon = clock.indexOf(':');
+    if (bits.length < 3 || colon < 1) return 0;
+    const y = parseInt(bits[0], 10);
+    const month = parseInt(bits[1], 10);
+    const day = parseInt(bits[2], 10);
+    const hh = parseInt(clock.slice(0, colon), 10);
+    const mm = parseInt(clock.slice(colon + 1), 10);
+    if (y !== y || month !== month || day !== day) return 0;
+    return Date.UTC(y, month - 1, day, hh, mm) - 8 * 60 * 60 * 1000;
 }
 
 function talkLastAt(messages) {
-    let best = 0;
+    let dated = 0;
+    let any = 0;
     for (const m of messages || []) {
-        const at = messageTimeMs(m && m.time);
-        if (at > best) best = at;
+        const raw = String(m && m.time || '');
+        const at = messageTimeMs(raw);
+        if (!at) continue;
+        if (at > any) any = at;
+        if ((raw.indexOf('/') > 0 || raw.indexOf('昨天') === 0 || raw.indexOf('前天') === 0) && at > dated) dated = at;
     }
-    return best;
+    return dated || any;
 }
 
 function visibleTalks(talks) {
     return [...talks.values()]
-        .map(t => ({ uid: t.uid, title: t.title, updated: t.updated, lastAt: t.lastAt || talkLastAt(t.messages) || t.updated, count: t.messages.length }))
+        .map(t => ({ uid: t.uid, title: t.title, updated: t.updated, lastAt: talkLastAt(t.messages) || t.lastAt || t.updated || 0, count: t.messages.length }))
         .sort((a, b) => b.lastAt - a.lastAt || b.updated - a.updated || (a.uid < b.uid ? -1 : 1));
 }
 
 function loadTalks() {
+    talksNeedYear = false;
     try {
         const raw = JSON.parse(fs.readFileSync(TALK_FILE, 'utf8'));
         const map = new Map();
         for (const t of raw || []) {
             const uid = cleanUid(t && t.uid);
             if (!uid) continue;
-            const messages = (Array.isArray(t.messages) ? t.messages : []).map(archiveMessage).filter(Boolean).slice(-TALK_KEEP);
+            const src = Array.isArray(t.messages) ? t.messages : [];
+            if (src.some(m => m && withYear(m.time) !== String(m.time || '').trim())) talksNeedYear = true;
+            const messages = src.map(archiveMessage).filter(Boolean).slice(-TALK_KEEP);
             if (!messages.length) continue;
             const updated = Number(t.updated) || 0;
             map.set(uid, {
@@ -149,6 +211,7 @@ function loadTalks() {
 }
 
 const dropped = new Set();
+let talksNeedYear = false;
 
 function loadDropped() {
     try {
@@ -615,6 +678,25 @@ function selfCheck() {
     if (order[0].uid !== 'user_new1' || order[1].uid !== 'user_two' || !(order[0].lastAt > order[1].lastAt)) {
         throw new Error('knock relay 檢查失敗');
     }
+    const wall = new Date(Date.now() + 8 * 60 * 60 * 1000);
+    const pad = n => String(n).padStart(2, '0');
+    const stamp = (wall.getUTCMonth() + 1) + '/' + wall.getUTCDate() + ' ' + wall.getUTCHours() + ':' + pad(wall.getUTCMinutes());
+    if (Math.abs(messageTimeMs(stamp) - Date.now()) > 120000) throw new Error('knock relay 檢查失敗');
+    if (Math.abs(messageTimeMs('昨天 ' + wall.getUTCHours() + ':' + pad(wall.getUTCMinutes())) - (Date.now() - 86400000)) > 120000) {
+        throw new Error('knock relay 檢查失敗');
+    }
+    const datedOnly = new Map();
+    rememberTalk(datedOnly, { archive: { uid: 'user_old9', title: '舊', messages: [{ id: 'd1', text: '一', time: '1/2 08:00' }, { id: 'd2', text: '二', time: '23:59' }] } }, 3);
+    if (visibleTalks(datedOnly)[0].lastAt !== messageTimeMs('1/2 08:00')) throw new Error('knock relay 檢查失敗');
+    const thisYear = String(taipeiNow().getUTCFullYear());
+    if (withYear('10/6 11:51') !== thisYear + '/10/06 11:51'
+        || withYear(thisYear + '/10/06 11:51') !== thisYear + '/10/06 11:51'
+        || withYear('2024/3/4 5:06') !== '2024/03/04 05:06'
+        || withYear('9/25') !== thisYear + '/09/25'
+        || withYear('2024/9/25') !== '2024/09/25'
+        || messageTimeMs('2024/03/04 05:06') !== Date.UTC(2024, 2, 4, 5, 6) - 8 * 60 * 60 * 1000) {
+        throw new Error('knock relay 檢查失敗');
+    }
     dropped.delete('user_one:a');
     dropped.delete('user_one:b');
 }
@@ -983,7 +1065,7 @@ function talkClock(ms) {
   const d = new Date(ms);
   if (!ms || isNaN(d.getTime())) return '';
   const p = (n) => (n < 10 ? '0' : '') + n;
-  return (d.getMonth() + 1) + '/' + d.getDate() + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+  return d.getFullYear() + '/' + p(d.getMonth() + 1) + '/' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
 }
 
 function loadArchive(uid) {
@@ -1283,16 +1365,25 @@ function stampToMs(text) {
   const hh = parseInt(clockPart.slice(0, colon), 10);
   const mm = parseInt(clockPart.slice(colon + 1), 10);
   if (hh !== hh || mm !== mm) return 0;
-  const slash = datePart.indexOf('/');
+  const bits = datePart.split('/').filter(function (s) { return s !== ''; });
   const now = new Date();
-  let month = parseInt(slash > 0 ? datePart.slice(0, slash) : '', 10);
-  let day = parseInt(slash > 0 ? datePart.slice(slash + 1) : '', 10);
-  const dated = month === month && day === day;
-  if (!dated) { month = now.getMonth() + 1; day = now.getDate(); }
-  let at = new Date(now.getFullYear(), month - 1, day, hh, mm).getTime();
-  if (at > Date.now() + 60000) {
-    at = dated ? new Date(now.getFullYear() - 1, month - 1, day, hh, mm).getTime() : at - 86400000;
+  let year = now.getFullYear();
+  let month = 0;
+  let day = 0;
+  let dated = false;
+  if (bits.length >= 3) {
+    year = parseInt(bits[0], 10);
+    month = parseInt(bits[1], 10);
+    day = parseInt(bits[2], 10);
+    dated = year === year && month === month && day === day;
+  } else if (bits.length === 2) {
+    month = parseInt(bits[0], 10);
+    day = parseInt(bits[1], 10);
+    dated = month === month && day === day;
   }
+  if (!dated) { month = now.getMonth() + 1; day = now.getDate(); }
+  let at = new Date(year, month - 1, day, hh, mm).getTime();
+  if (!dated && at > Date.now() + 60000) at -= 86400000;
   return at;
 }
 
@@ -1848,6 +1939,7 @@ function main() {
     loadFilters();
     const sessions = loadSessions();
     const talks = loadTalks();
+    if (talksNeedYear) saveTalks(talks);
     const server = http.createServer(async (req, res) => {
         const url = new URL(req.url, 'http://localhost');
         if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname === '/') {

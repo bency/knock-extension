@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.74
+// @version      1.4.76
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -41,10 +41,6 @@
     const AVATAR_FILTER_ENABLED_KEY = 'knockAvatarFilterEnabled';
     const BROWSER_NOTIFY_ENABLED_KEY = 'knockBrowserNotifyEnabled';
     const NTFY_ENABLED_KEY = 'knockNtfyEnabled';
-    const PARTNER_LABEL_KEY = 'knockPartnerLabels';
-    const SAVED_CONV_KEY = 'knockSavedConversations';
-    const AUTO_CONV_KEY = 'knockAutoConversations';
-    const AUTO_CONV_MIN_MS = 50 * 1000;
     const NTFY_TOPIC_KEY = 'knockNtfyTopic';
     const NTFY_TITLE_KEY = 'knockNtfyTitle';
     const NTFY_TITLE_DEFAULT = 'Knock 新訊息';
@@ -66,7 +62,7 @@
     const HINT_CODE_KEY = 'knockHintCode';
     const HINT_NOTIFIED_KEY = 'knockHintConnectedNotified';
     const HINT_WAS_WAITING_KEY = 'knockHintWasWaiting';
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.74';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.76';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -138,7 +134,7 @@
     }
 
     function emptyConversation() {
-        return { id: null, messages: [], startTime: null, endTime: null, saved: false, promptShown: false, pinned: false, keepOrder: false, skipAdopt: false, partnerUid: null, label: '' };
+        return { id: null, messages: [], startTime: null, endTime: null, ended: false, partnerUid: null, label: '' };
     }
 
     // --- 狀態 ---
@@ -156,7 +152,6 @@
     const checkedMessages = new Set();
     let myAvatarUrl = null;
     let currentConversation = emptyConversation();
-    let processedConversationIds = new Set(storageGet('knockProcessedConversationIds', []));
     let notificationsArmed = false;
     let pendingForcedLeave = false;
     let forceAutoUntilIdle = false;
@@ -167,38 +162,10 @@
     let cooldownUntil = 0;
     let cooldownLabel = '';
     let cooldownTick = null;
-    let persistLiveTimer = null;
-    let conversationManagerTab = 'auto';
-    let openFolderKeys = new Set();
     let lastBoundAt = 0;
     let otherPartySeen = false;
-    const imageEncodeJobs = new Set();
 
     // --- 對話生命週期 ---
-    function saveProcessedIds() {
-        storageSet('knockProcessedConversationIds', Array.from(processedConversationIds));
-    }
-
-    function markProcessed(conversation) {
-        conversation.promptShown = true;
-        conversation.saved = true;
-        if (conversation.id) {
-            processedConversationIds.add(conversation.id);
-            saveProcessedIds();
-        }
-    }
-
-    function isConversationProcessed(conversationId) {
-        if (!conversationId) return false;
-        if (processedConversationIds.has(conversationId)) return true;
-        const isSaved = getSavedConversations().some(conv => conv.id === conversationId);
-        if (isSaved) {
-            processedConversationIds.add(conversationId);
-            saveProcessedIds();
-        }
-        return isSaved;
-    }
-
     function hashString(str) {
         let hash = 0;
         for (let i = 0; i < str.length; i++) {
@@ -229,34 +196,10 @@
 
     function bindChannel(id) {
         if (!id || currentConversation.id === id) return;
-        if (isChannelId(currentConversation.id)) {
-            if (currentConversation.messages.length) persistLiveConversation();
-            initNewConversation();
-        }
-        const oldId = currentConversation.id;
+        if (isChannelId(currentConversation.id)) initNewConversation();
         currentConversation.id = id;
         if (!currentConversation.startTime) currentConversation.startTime = new Date().toISOString();
-        const stored = findStoredConversation(id);
-        if (stored) {
-            currentConversation.pinned = currentConversation.pinned || stored.pinned
-                || getSavedConversations().some(c => c.id === id);
-            if (stored.startTime && stored.startTime < currentConversation.startTime) {
-                currentConversation.startTime = stored.startTime;
-            }
-            currentConversation.messages = mergeMessagesByHash(stored.messages, currentConversation.messages);
-            currentConversation.keepOrder = currentConversation.keepOrder || stored.keepOrder;
-            if (stored.partnerUid) currentConversation.partnerUid = stored.partnerUid;
-            if (stored.label) currentConversation.label = stored.label;
-            if (currentConversation.partnerUid && currentConversation.label) {
-                setPartnerLabel(currentConversation.partnerUid, currentConversation.label);
-            }
-        }
-        syncPastPartnerButton();
-        if (oldId && oldId.startsWith('conv_')) {
-            storageSet(AUTO_CONV_KEY, getAutoConversations().filter(c => c.id !== oldId));
-        }
         lastBoundAt = Date.now();
-        persistLiveConversationSoon();
         console.log('對話 channel:', id);
     }
 
@@ -287,10 +230,6 @@
             console.log('沿用剛綁定的 channel:', currentConversation.id);
             return;
         }
-        if (currentConversation.id && currentConversation.messages.length) {
-            currentConversation.endTime = currentConversation.endTime || new Date().toISOString();
-            persistLiveConversation();
-        }
         currentConversation = {
             ...emptyConversation(),
             id: newConvId(),
@@ -312,7 +251,6 @@
         noteActivity();
         otherPartySeen = false;
         syncUnnamedChip();
-        syncPastPartnerButton();
         console.log('初始化新對話:', currentConversation.id);
     }
 
@@ -508,50 +446,18 @@
         return name;
     }
 
-    function applyPartnerDisplayName(uid, name) {
-        setPartnerLabel(uid, name);
-        const apply = (key) => {
-            const list = storageGet(key, []);
-            let changed = false;
-            for (const c of list) {
-                if (!c || c.partnerUid !== uid || c.label === name) continue;
-                c.label = name;
-                changed = true;
-            }
-            if (changed) storageSet(key, list);
-        };
-        apply(SAVED_CONV_KEY);
-        apply(AUTO_CONV_KEY);
-        if (currentConversation.partnerUid === uid) {
-            currentConversation.label = name;
-            paintPartnerCaption();
-        }
-    }
-
     function namePartnerFromOpening(uid, text) {
-        const name = openingLineName(text, partnerLabel(uid));
+        const name = openingLineName(text, currentConversation.label);
         if (!uid || !name) return;
         if (!currentConversation.partnerUid) {
             const first = findFirstOtherMessage();
             if (first && first.uid === uid) currentConversation.partnerUid = uid;
         }
-        applyPartnerDisplayName(uid, name);
-        renderConversationList();
-    }
-
-    function renameFilteredUser(uid) {
-        const u = (uid || '').trim();
-        if (!u) return;
-        const note = (getNormalizedFilters().find(f => f.u === u) || {}).t || '';
-        const next = prompt('修改顯示名稱。空白表示清除。', partnerLabel(u) || note);
-        if (next == null) return;
-        const name = next.trim().slice(0, 40);
-        applyPartnerDisplayName(u, name);
-        renderConversationList();
-        refreshFirstFilterManager();
-        const title = el('knock-detail-title');
-        if (title && title.dataset.partnerUid === u) title.textContent = name || note || title.dataset.plain || title.textContent;
-        showToast(name ? '已更新顯示名稱' : '已清除顯示名稱');
+        if (!currentConversation.partnerUid || currentConversation.partnerUid === uid) {
+            currentConversation.partnerUid = currentConversation.partnerUid || uid;
+            currentConversation.label = name;
+            paintPartnerCaption();
+        }
     }
 
     // --- 大頭貼過濾（只記網址；勾選疊在頭像上，不包頭像） ---
@@ -744,8 +650,6 @@
             const uid = TYPING_RE.test(text) ? (typingSentBy(li) || messageSentBy(li)) : messageSentBy(li);
             if (!uid) continue;
             currentConversation.partnerUid = uid;
-            if (currentConversation.label) setPartnerLabel(uid, currentConversation.label);
-            syncPastPartnerButton();
             break;
         }
         syncUnnamedChip();
@@ -768,32 +672,22 @@
             e.preventDefault();
             e.stopPropagation();
             if (!currentConversation.id) return;
-            nameConversation(currentConversation.id);
+            nameCurrentPartner();
         });
         document.body.appendChild(chip);
     }
 
-    function getPartnerLabels() {
-        const raw = storageGet(PARTNER_LABEL_KEY, {});
-        return raw && typeof raw === 'object' ? raw : {};
-    }
-
-    function partnerLabel(uid) {
-        if (!uid) return '';
-        return String(getPartnerLabels()[uid] || '').trim();
-    }
-
-    function setPartnerLabel(uid, name) {
-        if (!uid) return;
-        const labels = getPartnerLabels();
-        const n = String(name || '').trim().slice(0, 40);
-        if (!n) delete labels[uid];
-        else labels[uid] = n;
-        storageSet(PARTNER_LABEL_KEY, labels);
-    }
-
     function currentPartnerName() {
-        return partnerLabel(currentConversation.partnerUid) || String(currentConversation.label || '').trim();
+        return String(currentConversation.label || '').trim();
+    }
+
+    function nameCurrentPartner() {
+        if (!currentConversation.id) return;
+        const next = prompt('替這位命名。空白表示清除。', currentConversation.label || '');
+        if (next == null) return;
+        currentConversation.label = next.trim().slice(0, 40);
+        paintPartnerCaption();
+        showToast(currentConversation.label ? `已命名為 ${currentConversation.label}` : '已清除命名');
     }
 
     function paintPartnerCaption() {
@@ -822,7 +716,7 @@
                     e.preventDefault();
                     e.stopPropagation();
                     if (!currentConversation.id) return;
-                    nameConversation(currentConversation.id);
+                    nameCurrentPartner();
                 });
                 host.appendChild(tag);
             }
@@ -877,17 +771,6 @@
         return Array.from(root.querySelectorAll('[data-test="message-image"] img'))
             .map(img => img.currentSrc || img.src)
             .filter(src => src && /^https?:\/\//.test(src));
-    }
-
-    function quoteHtml(msg) {
-        if (!msg || !msg.quote) return '';
-        return `<div style="font-size:12px;color:rgba(255,255,255,.65);border-left:2px solid rgba(255,255,255,.35);padding-left:6px;margin-bottom:6px;">${escapeHtml(msg.quote)}</div>`;
-    }
-
-    function messagePreviewText(msg) {
-        if (msg.text) return msg.text;
-        if (msg.imageUrls && msg.imageUrls.length) return '[圖片]';
-        return '';
     }
 
     function ymd(d) {
@@ -988,10 +871,6 @@
         return dateFromKnockLabel(msg.timestamp);
     }
 
-    function messageContentKey(msg) {
-        return `${msg.text || ''}|${(msg.imageUrls || []).join(',')}|${!!msg.isMyMessage}`;
-    }
-
     function hashMessage(text, imageUrls, isMyMessage, clockOrDate) {
         return hashString(`${text || ''}|${(imageUrls || []).join(',')}|${!!isMyMessage}|${clockOrDate ?? ''}`);
     }
@@ -1064,7 +943,7 @@
     }
 
     async function blobToDataUrl(blob) {
-        // ponytail: 超過約 400KB 才縮成寬 960 的 jpeg，避免 localStorage 寫不進去
+        // ponytail: 超過約 400KB 才縮成寬 960 的 jpeg，遠端才收得下
         if (blob.size > 400 * 1024 && typeof createImageBitmap === 'function') {
             try {
                 const bitmap = await createImageBitmap(blob);
@@ -1092,27 +971,6 @@
         const arr = new Uint8Array(bin.length);
         for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
         return new Blob([arr], { type: mime });
-    }
-
-    function attachImages(message, urls) {
-        const keys = (urls || []).map(stableImageKey).filter(Boolean);
-        if (keys.length) message.imageKeys = keys;
-        const needs = (urls || []).filter(u => u && !String(u).startsWith('data:'));
-        if (!needs.length || !message.id) return;
-        const job = `${message.id}|${keys.join(',')}`;
-        if (imageEncodeJobs.has(job)) return;
-        imageEncodeJobs.add(job);
-        Promise.all(needs.map(async (url) => {
-            try { return await blobToDataUrl(await fetchImageBlob(url)); }
-            catch (e) { return url; }
-        })).then(dataUrls => {
-            imageEncodeJobs.delete(job);
-            if (!dataUrls.some(u => String(u).startsWith('data:'))) return;
-            const msg = currentConversation.messages.find(m => m.id === message.id) || message;
-            msg.imageUrls = dataUrls;
-            msg.imageKeys = keys;
-            persistLiveConversationSoon();
-        });
     }
 
     function collectMessage(messageLi, date) {
@@ -1146,10 +1004,6 @@
                 existingImg.imageKeys = imageKeys;
                 if (date && existingImg.date !== date) existingImg.date = date;
                 currentConversation.messages = dropDuplicateImages(currentConversation.messages);
-                const kept = currentConversation.messages.find(m =>
-                    (domId && (m.domId === domId || m.id === domId)) || imageMessageSig(m) === imageSig
-                ) || existingImg;
-                attachImages(kept, imageUrls);
                 return;
             }
         }
@@ -1160,10 +1014,7 @@
             );
             if (existingByContent) {
                 if (quote) existingByContent.quote = quote;
-                if (date && existingByContent.date !== date) {
-                    existingByContent.date = date;
-                    persistLiveConversationSoon();
-                }
+                if (date && existingByContent.date !== date) existingByContent.date = date;
                 return;
             }
         }
@@ -1175,11 +1026,7 @@
             if (quote) existing.quote = quote;
             if (domId) existing.domId = domId;
             if (imageKeys.length) existing.imageKeys = imageKeys;
-            if (date && existing.date !== date) {
-                existing.date = date;
-                persistLiveConversationSoon();
-            }
-            if (imageKeys.length) attachImages(existing, imageUrls);
+            if (date && existing.date !== date) existing.date = date;
             return;
         }
 
@@ -1198,233 +1045,8 @@
             collectedAt: new Date().toISOString()
         };
         currentConversation.messages.push(message);
-        if (imageKeys.length) attachImages(message, imageUrls);
         console.log('收集訊息:', messageText || '[圖片]', imageKeys.length);
         noteActivity();
-        persistLiveConversationSoon();
-    }
-
-    // --- 儲存與合併 ---
-    function getSavedConversations() {
-        return storageGet(SAVED_CONV_KEY, []);
-    }
-
-    function getAutoConversations() {
-        return storageGet(AUTO_CONV_KEY, []);
-    }
-
-    function findStoredConversation(conversationId) {
-        return getSavedConversations().find(conv => conv.id === conversationId)
-            || getAutoConversations().find(conv => conv.id === conversationId)
-            || null;
-    }
-
-    function upsertConversationList(key, conversation, limit) {
-        if (!conversation.id || !conversation.messages.length) return false;
-        const list = storageGet(key, []);
-        const snap = {
-            ...conversation,
-            messages: sortMessages(dropDuplicateImages(conversation.messages.slice()), conversation.startTime, conversation.keepOrder),
-            endTime: conversation.endTime || new Date().toISOString()
-        };
-        const i = list.findIndex(c => c.id === conversation.id);
-        if (i >= 0) list[i] = snap;
-        else list.unshift(snap);
-        if (list.length > limit) list.length = limit;
-        return storageSet(key, list);
-    }
-
-    function conversationDurationMs(conversation) {
-        const start = conversation.startTime ? Date.parse(conversation.startTime) : NaN;
-        if (!Number.isFinite(start)) return 0;
-        const end = conversation.endTime ? Date.parse(conversation.endTime) : Date.now();
-        return Math.max(0, end - start);
-    }
-
-    function messageIdSet(messages) {
-        // ponytail: 開場句沒時間且常重複；拿來重疊會合併錯人，還會清掉其他自動儲存
-        return new Set((messages || []).filter(m => m.id && m.timestamp).map(m => m.id));
-    }
-
-    function hashOverlapCount(conv, ids) {
-        let n = 0;
-        for (const m of conv.messages || []) {
-            if (ids.has(m.id)) n++;
-        }
-        return n;
-    }
-
-    function timedOverlap(aMessages, bMessages) {
-        const a = messageIdSet(aMessages);
-        const b = messageIdSet(bMessages);
-        let n = 0;
-        for (const id of a) if (b.has(id)) n++;
-        return { n, a: a.size, b: b.size };
-    }
-
-    function isSameConversation(curMessages, otherMessages, otherIsSaved) {
-        const { n, a, b } = timedOverlap(curMessages, otherMessages);
-        if (!a || !b) return false;
-        // 已儲存那包被併過之後很大，一句「你好」對上就會再寫進去
-        if (otherIsSaved) return n >= 5 && n === a;
-        return n >= Math.max(2, Math.ceil(Math.min(a, b) * 2 / 3));
-    }
-
-    function findConversationByHashes(messages) {
-        const savedIds = new Set(getSavedConversations().map(c => c.id));
-        let best = null;
-        let bestN = 0;
-        for (const conv of [...getSavedConversations(), ...getAutoConversations()]) {
-            if (!isSameConversation(messages, conv.messages, savedIds.has(conv.id))) continue;
-            const n = timedOverlap(messages, conv.messages).n;
-            if (n > bestN) {
-                bestN = n;
-                best = conv;
-            }
-        }
-        return best;
-    }
-
-    function mergeMessagesByHash(a, b) {
-        const map = new Map();
-        for (const m of [...(a || []), ...(b || [])]) {
-            if (m && m.id && !map.has(m.id)) map.set(m.id, m);
-        }
-        return Array.from(map.values());
-    }
-
-    function collectOnScreenMessages() {
-        const list = document.querySelector('ul[data-test="messages"]');
-        if (!list) return [];
-        const dateByLi = listMessageDates(list);
-        const messages = [];
-        for (const li of list.querySelectorAll('li.message-li')) {
-            const messageDiv = li.querySelector('div[data-test="message"]');
-            if (!messageDiv) continue;
-            const text = getMessageText(messageDiv);
-            const imageUrls = getMessageImages(messageDiv);
-            if (TYPING_RE.test(text) || (!text && !imageUrls.length)) continue;
-            const timeEl = messageDiv.querySelector('span[data-test="date"]');
-            const timestamp = timeEl ? timeEl.textContent.trim() : null;
-            const date = dateByLi.get(li) || parseKnockDateLabel(timestamp) || '';
-            const clock = clockMinutesOnly(timestamp);
-            const isMy = isMyMessageLi(li);
-            const domId = (String(li.className || '').match(/message-li-(\S+)/) || [])[1] || '';
-            const imageKeys = imageUrls.map(stableImageKey).filter(Boolean);
-            messages.push({
-                id: imageKeys.length
-                    ? (domId || hashMessage(text, imageKeys, isMy, clock ?? date ?? `seq${messages.length}`))
-                    : hashMessage(text, [], isMy, clock ?? date ?? `seq${messages.length}`),
-                text,
-                imageUrls,
-                imageKeys,
-                domId,
-                isMyMessage: isMy,
-                avatarUrl: getAvatarUrl(li),
-                timestamp,
-                date,
-                seq: messages.length,
-                collectedAt: new Date().toISOString()
-            });
-        }
-        return messages;
-    }
-
-    function snapshotOnScreenConversation() {
-        const messages = collectOnScreenMessages();
-        if (!messages.length) {
-            showToast('畫面上沒有對話');
-            return false;
-        }
-        const id = isChannelId(currentConversation.id) ? currentConversation.id : newConvId();
-        const startTime = (id === currentConversation.id && currentConversation.startTime)
-            ? currentConversation.startTime
-            : new Date().toISOString();
-        currentConversation = {
-            ...emptyConversation(),
-            id,
-            startTime,
-            messages,
-            keepOrder: true,
-            skipAdopt: true
-        };
-        notePartnerFromList();
-        currentConversation.messages.forEach(m => {
-            if ((m.imageKeys || []).length) attachImages(m, m.imageUrls);
-        });
-        upsertConversationList(AUTO_CONV_KEY, currentConversation, 200);
-        console.log('依畫面順序重建對話:', currentConversation.id, messages.length);
-        showToast(`已依畫面順序重建 ${messages.length} 則訊息`);
-        return true;
-    }
-
-    function adoptOverlappingConversation() {
-        const found = findConversationByHashes(currentConversation.messages);
-        if (!found || found.id === currentConversation.id) return;
-        const inSaved = getSavedConversations().some(c => c.id === found.id);
-        currentConversation.id = found.id;
-        currentConversation.pinned = currentConversation.pinned || found.pinned || inSaved;
-        if (found.startTime && (!currentConversation.startTime || found.startTime < currentConversation.startTime)) {
-            currentConversation.startTime = found.startTime;
-        }
-        currentConversation.messages = mergeMessagesByHash(found.messages, currentConversation.messages);
-        if (!currentConversation.partnerUid && found.partnerUid) currentConversation.partnerUid = found.partnerUid;
-        console.log('同一對話（訊息 hash 重疊），合併到', found.id);
-    }
-
-    function dropOverlappingAutoDuplicates() {
-        const keep = currentConversation.id;
-        storageSet(AUTO_CONV_KEY, getAutoConversations().filter(c =>
-            c.id === keep || !isSameConversation(currentConversation.messages, c.messages, false)
-        ));
-    }
-
-    function persistLiveConversation() {
-        if (!currentConversation.id || !currentConversation.messages.length) return;
-        const byChannel = isChannelId(currentConversation.id);
-        if (!currentConversation.skipAdopt && !byChannel) adoptOverlappingConversation();
-        if (currentConversation.pinned) {
-            upsertConversationList(SAVED_CONV_KEY, currentConversation, 100);
-            if (!currentConversation.skipAdopt && !byChannel) dropOverlappingAutoDuplicates();
-            return;
-        }
-        if (conversationDurationMs(currentConversation) < AUTO_CONV_MIN_MS) return;
-        upsertConversationList(AUTO_CONV_KEY, currentConversation, 200);
-        if (!currentConversation.skipAdopt && !byChannel) dropOverlappingAutoDuplicates();
-    }
-
-    function persistLiveConversationSoon() {
-        clearTimeout(persistLiveTimer);
-        persistLiveTimer = setTimeout(persistLiveConversation, 400);
-    }
-
-    function pinConversation(conversationId) {
-        const conv = findStoredConversation(conversationId)
-            || (currentConversation.id === conversationId ? currentConversation : null);
-        if (!conv) return false;
-        conv.pinned = true;
-        if (currentConversation.id === conversationId) currentConversation.pinned = true;
-        storageSet(AUTO_CONV_KEY, getAutoConversations().filter(c => c.id !== conversationId));
-        return upsertConversationList(SAVED_CONV_KEY, conv, 100);
-    }
-
-    function saveConversation(conversation) {
-        if (!conversation.id || !conversation.messages.length) return false;
-        conversation.pinned = true;
-        conversation.saved = true;
-        conversation.endTime = conversation.endTime || new Date().toISOString();
-        if (currentConversation.id === conversation.id) currentConversation.pinned = true;
-        storageSet(AUTO_CONV_KEY, getAutoConversations().filter(c => c.id !== conversation.id));
-        if (!upsertConversationList(SAVED_CONV_KEY, conversation, 100)) return false;
-        markProcessed(conversation);
-        console.log('對話已儲存:', conversation.id);
-        return true;
-    }
-
-    function deleteConversations(ids) {
-        const set = new Set(ids);
-        return storageSet(SAVED_CONV_KEY, getSavedConversations().filter(c => !set.has(c.id)))
-            && storageSet(AUTO_CONV_KEY, getAutoConversations().filter(c => !set.has(c.id)));
     }
 
     // --- 離開與重連 ---
@@ -1513,18 +1135,11 @@
     }
 
     function checkConversationEnd() {
-        if (currentConversation.promptShown || currentConversation.saved) return;
-        if (currentConversation.id && isConversationProcessed(currentConversation.id)) {
-            currentConversation.saved = true;
-            return;
-        }
-
+        if (currentConversation.ended) return;
         const conversationEnded = findButtons().some(b => isRematchButton(b) || isConfirmExitButton(b));
         if (!conversationEnded || currentConversation.messages.length === 0) return;
-
+        currentConversation.ended = true;
         currentConversation.endTime = currentConversation.endTime || new Date().toISOString();
-        persistLiveConversation();
-        markProcessed(currentConversation);
         if (isAutoClicking()) {
             markPendingStartChat(findButtons().some(isRematchButton) ? 'otherLeft' : pendingForcedLeave ? undefined : 'selfLeft');
         }
@@ -1638,9 +1253,8 @@
     }
 
     function filterPromptName(uid, text) {
-        const named = (uid && partnerLabel(uid)) || '';
         const note = uid ? String((getNormalizedFilters().find(f => f.u === uid) || {}).t || '') : '';
-        const raw = (named || note || text || '').trim().replace(/\s+/g, ' ');
+        const raw = (note || text || '').trim().replace(/\s+/g, ' ');
         if (!raw || /^https?:\/\//.test(raw)) return '';
         return raw.slice(0, 40);
     }
@@ -2018,7 +1632,7 @@
 
         const dateByLi = listMessageDates(messagesList);
         const messageElements = messagesList.querySelectorAll('li.message-li');
-        if (!currentConversation.id || (currentConversation.saved && currentConversation.messages.length === 0)) {
+        if (!currentConversation.id) {
             if (messageElements.length === 0) return;
             console.log('Initializing new conversation...');
             initNewConversation();
@@ -2209,82 +1823,6 @@
         return keepAliveWaitMs;
     }
 
-    function pastTalks(conversations, uid, currentId) {
-        if (!uid) return [];
-        return conversations
-            .filter(c => c && c.partnerUid === uid && c.id !== currentId && (c.messages || []).length)
-            .sort((a, b) => String(b.endTime || b.startTime || '').localeCompare(String(a.endTime || a.startTime || '')));
-    }
-
-    function pastPartnerConversations() {
-        const seen = new Set();
-        const all = [];
-        for (const c of [...getSavedConversations(), ...getAutoConversations()]) {
-            if (!c || seen.has(c.id)) continue;
-            seen.add(c.id);
-            all.push(c);
-        }
-        return pastTalks(all, currentConversation.partnerUid, currentConversation.id);
-    }
-
-    function syncPastPartnerButton() {
-        const btn = el('knock-past-partner');
-        if (!btn) return;
-        const uid = currentConversation.partnerUid || '';
-        const key = `${currentConversation.id || ''}|${uid}`;
-        if (btn.dataset.pastKey === key) return;
-        btn.dataset.pastKey = key;
-        const past = pastPartnerConversations();
-        btn.style.display = past.length ? 'flex' : 'none';
-        const label = btn.querySelector('span');
-        if (label) label.textContent = past.length > 1 ? `之前的對話（${past.length}）` : '之前的對話';
-    }
-
-    function pastMessageBubbles(conversation) {
-        const sorted = sortMessages(conversation.messages, conversation.startTime, conversation.keepOrder);
-        return sorted.map(msg => `
-            <div style="display:flex;align-items:flex-start;gap:8px;flex-direction:${msg.isMyMessage ? 'row-reverse' : 'row'};margin-bottom:12px;">
-                <div style="width:40px;height:40px;border-radius:50%;flex-shrink:0;background:#333;overflow:hidden;display:flex;align-items:center;justify-content:center;">
-                    ${msg.avatarUrl
-                        ? `<img src="${escapeHtml(msg.avatarUrl)}" alt="" style="width:100%;height:100%;object-fit:cover;">`
-                        : `<div style="color:#888;font-size:18px;">${msg.isMyMessage ? '我' : '對'}</div>`}
-                </div>
-                <div style="background:${msg.isMyMessage ? '#2d5a3d' : '#2d2d3d'};border-radius:8px;padding:8px 10px;max-width:70%;">
-                    ${quoteHtml(msg)}
-                    ${msg.text ? `<div style="font-size:14px;line-height:1.4;word-wrap:break-word;">${escapeHtml(msg.text)}</div>` : ''}
-                    ${(msg.imageUrls || []).map(src => `
-                        <a href="${escapeHtml(src)}" target="_blank" rel="noreferrer">
-                            <img src="${escapeHtml(src)}" alt="圖片" style="max-width:180px;max-height:240px;border-radius:6px;display:block;margin-top:6px;">
-                        </a>`).join('')}
-                    ${msg.timestamp ? `<div style="font-size:11px;color:rgba(255,255,255,0.5);margin-top:4px;">${escapeHtml(formatMessageStamp(msg))}</div>` : ''}
-                </div>
-            </div>`).join('');
-    }
-
-    function showPastPartnerConversations() {
-        const past = pastPartnerConversations();
-        if (!past.length) {
-            showToast('沒有這位的舊對話');
-            return;
-        }
-        const panel = toggleOverlay('knock-past-partner-view', () => makeOverlay('knock-past-partner-view', 800, `
-            <div style="flex-shrink:0;display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;">
-                <h2 style="margin:0;font-size:20px;">之前的對話${past.length > 1 ? `（${past.length}）` : ''}</h2>
-                <button id="knock-past-close" style="${cssBtn('#444')}">關閉</button>
-            </div>
-            <div style="flex:1;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:20px;">
-                ${past.map(conversation => {
-                    const startDate = getMessageTime(conversation, true);
-                    return `<section>
-                        <div style="font-size:13px;color:#888;margin-bottom:12px;">${startDate.toLocaleString('zh-TW')} · ${conversation.messages.length} 條訊息</div>
-                        ${pastMessageBubbles(conversation)}
-                    </section>`;
-                }).join('')}
-            </div>`, 10004, true));
-        if (!panel) return;
-        el('knock-past-close').onclick = () => panel.remove();
-    }
-
     function createDock() {
         if (el('knock-dock')) return;
         OLD_FLOAT_IDS.forEach(id => el(id)?.remove());
@@ -2367,12 +1905,6 @@
         keepWrap.style.cssText = 'display:flex;flex-direction:column;gap:6px;';
         keepWrap.append(keepRow, keepExtra);
 
-        const convBtn = dockRow('<span>對話記錄</span>', { button: true });
-        convBtn.addEventListener('click', (e) => { e.stopPropagation(); createConversationManager(); });
-
-        const rebuildBtn = dockRow('<span>重建此對話</span>', { button: true });
-        rebuildBtn.addEventListener('click', (e) => { e.stopPropagation(); snapshotOnScreenConversation(); });
-
         const relayBtn = dockRow('<span>遠端對話</span>', { button: true });
         relayBtn.addEventListener('click', (e) => {
             e.stopPropagation();
@@ -2383,11 +1915,6 @@
             else localStorage.removeItem(RELAY_TOKEN_KEY);
             showToast(token ? '已開啟遠端對話' : '已關閉遠端對話');
         });
-
-        const pastBtn = dockRow('<span>之前的對話</span>', { button: true });
-        pastBtn.id = 'knock-past-partner';
-        pastBtn.style.display = 'none';
-        pastBtn.addEventListener('click', (e) => { e.stopPropagation(); showPastPartnerConversations(); });
 
         const filterRow = dockRow(
             `<span>使用者過濾</span><span id="knock-filter-count" style="background:#ff9800;border-radius:10px;padding:0 6px;font-size:12px;min-width:1.2em;text-align:center;">${getNormalizedFilters().length}</span>`
@@ -2423,7 +1950,7 @@
         }, true);
         ntfyRow.addEventListener('click', (e) => { e.stopPropagation(); createNtfySettings(); });
 
-        body.append(autoRow, keepWrap, filterRow, avatarRow, browserRow, ntfyRow, convBtn, rebuildBtn, relayBtn, pastBtn);
+        body.append(autoRow, keepWrap, filterRow, avatarRow, browserRow, ntfyRow, relayBtn);
 
         const paintOpen = () => {
             body.style.display = open ? 'flex' : 'none';
@@ -2443,7 +1970,6 @@
         dock.append(header, body);
         document.body.appendChild(dock);
         paintOpen();
-        syncPastPartnerButton();
     }
 
     // --- 持續連線 ---
@@ -2664,30 +2190,13 @@
     }
 
     function archiveTitleOf(conv) {
-        const named = conv && conv.partnerUid ? partnerLabel(conv.partnerUid) : '';
-        return String(named || (conv && conv.label) || '').trim().slice(0, 40) || '未命名';
+        return String((conv && conv.label) || '').trim().slice(0, 40) || '未命名';
     }
 
-    // 同一位使用者的本地紀錄併成一份。沒有使用者 id 的，用該次對話 id。
-    function archiveSources(live, stored, liveTitle) {
-        const order = [];
-        const byUid = new Map();
-        const add = (conv, title) => {
-            const uid = archiveUidOf(conv);
-            if (!uid) return;
-            let row = byUid.get(uid);
-            if (!row) {
-                row = { uid, title: title || '未命名', messages: [] };
-                byUid.set(uid, row);
-                order.push(row);
-            } else if (title && title !== '未命名' && row.title === '未命名') {
-                row.title = title;
-            }
-            for (const m of (conv && conv.messages) || []) row.messages.push(m);
-        };
-        for (const conv of stored || []) add(conv, archiveTitleOf(conv));
-        if (live && (live.messages || []).length) add(live, liveTitle || archiveTitleOf(live));
-        return order;
+    function archiveSources(live, liveTitle) {
+        const uid = archiveUidOf(live);
+        if (!uid || !(live && live.messages || []).length) return [];
+        return [{ uid, title: liveTitle || archiveTitleOf(live), messages: live.messages.slice() }];
     }
 
     function nextArchive(sources, done) {
@@ -2708,7 +2217,7 @@
     // 只送目前這場。舊的本地紀錄已同步過，不再每輪重讀。
     function relayArchive() {
         notePartnerFromList();
-        const next = nextArchive(archiveSources(currentConversation, [], currentPartnerName() || ''), relayArchived);
+        const next = nextArchive(archiveSources(currentConversation, currentPartnerName() || ''), relayArchived);
         if (!next) return null;
         const messages = [];
         const skip = [];
@@ -2783,7 +2292,6 @@
             if (quote) prev.quote = quote;
             if (date) prev.date = date;
             forgetArchivedMessage(prev.id);
-            persistLiveConversationSoon();
         }
         return true;
     }
@@ -3228,7 +2736,7 @@
         if (pendingForcedLeave) return;
         if (!document.querySelector('ul[data-test="messages"]')) return;
         if (findButtons().some(b => isRematchButton(b) || isConfirmExitButton(b))) return;
-        if (!currentConversation.id || currentConversation.saved) initNewConversation();
+        if (!currentConversation.id) initNewConversation();
         const at = lastChatAt();
         const wait = currentKeepAliveWaitMs();
         if (!at || Date.now() - at < wait) return;
@@ -3242,7 +2750,6 @@
         });
     }
 
-    // --- 對話記錄 ---
     function timestampToDate(msg, startTime, now = new Date()) {
         const minutes = clockMinutesOnly(msg.timestamp);
         if (minutes == null) return null;
@@ -3252,151 +2759,6 @@
         date.setMinutes(minutes);
         if (date.getTime() > now.getTime() + 60000) date.setDate(date.getDate() - 1);
         return date;
-    }
-
-    function getMessageTime(conversation, isOldest = true) {
-        const start = conversation.startTime ? new Date(conversation.startTime) : new Date();
-        const end = conversation.endTime ? new Date(conversation.endTime) : null;
-        const dates = (conversation.messages || [])
-            .map(m => timestampToDate(m, conversation.startTime))
-            .filter(Boolean);
-        if (dates.length === 0) return isOldest ? start : end;
-        return new Date(isOldest ? Math.min(...dates) : Math.max(...dates));
-    }
-
-    function formatDuration(startDate, endDate) {
-        if (!endDate) return '';
-        const sec = Math.round((endDate - startDate) / 1000);
-        const min = Math.floor(sec / 60);
-        if (min <= 0) return `${sec} 秒`;
-        const rem = sec % 60;
-        return rem > 0 ? `${min} 分鐘 ${rem} 秒` : `${min} 分鐘`;
-    }
-
-    // 沒時間的是開頭；其餘依收集時寫入的日期 + 鐘點。keepOrder 則照畫面 seq
-    function sortMessages(messages, startTime, keepOrder) {
-        if (keepOrder) {
-            return (messages || []).slice().sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
-        }
-        return messages
-            .map((msg, index) => ({ msg, index }))
-            .sort((a, b) => {
-                const aOpen = !a.msg.timestamp;
-                const bOpen = !b.msg.timestamp;
-                if (aOpen && bOpen) return a.index - b.index;
-                if (aOpen) return -1;
-                if (bOpen) return 1;
-                const ca = clockMinutesOnly(a.msg.timestamp);
-                const cb = clockMinutesOnly(b.msg.timestamp);
-                const da = messageDate(a.msg, startTime);
-                const db = messageDate(b.msg, startTime);
-                if (da !== db) return da < db ? -1 : 1;
-                if (ca != null && cb != null && ca !== cb) return ca - cb;
-                return a.index - b.index;
-            })
-            .map(x => x.msg);
-    }
-
-    function formatMessageStamp(msg) {
-        if (!msg.timestamp) return '';
-        if (clockMinutesOnly(msg.timestamp) == null) return msg.timestamp;
-        const day = msg.date ? `${msg.date.slice(5).replace('-', '/')} ` : '';
-        return day + msg.timestamp;
-    }
-
-    function formatConversationForCopy(conversation) {
-        return sortMessages(conversation.messages, conversation.startTime, conversation.keepOrder).map(msg => {
-            const speaker = msg.isMyMessage ? '我　' : '對方';
-            const links = (msg.imageUrls || []).filter(src => src && !String(src).startsWith('data:'));
-            const content = [msg.text, ...links].filter(Boolean).join(' ')
-                || ((msg.imageUrls || []).length ? '[圖片]' : '');
-            const quoted = msg.quote ? `（回覆 ${msg.quote}）` : '';
-            return `${speaker}：${quoted}${content} （${msg.timestamp || '未知時間'}）`;
-        }).join('\n');
-    }
-
-    async function copyConversation(conversationId) {
-        const conversation = findStoredConversation(conversationId);
-        if (!conversation) {
-            alert('找不到此對話');
-            return;
-        }
-        const text = formatConversationForCopy(conversation);
-        try {
-            await navigator.clipboard.writeText(text);
-            showToast('對話內容已複製到剪貼板');
-        } catch (err) {
-            const textArea = document.createElement('textarea');
-            textArea.value = text;
-            textArea.style.cssText = 'position:fixed;left:-999999px';
-            document.body.appendChild(textArea);
-            textArea.select();
-            try {
-                document.execCommand('copy');
-                alert('對話內容已複製到剪貼板');
-            } catch (e) {
-                alert('複製失敗，請手動複製');
-            }
-            textArea.remove();
-        }
-    }
-
-    function conversationPhotos(conversation) {
-        const seen = new Set();
-        const out = [];
-        for (const msg of conversation.messages || []) {
-            for (const src of msg.imageUrls || []) {
-                if (!src || seen.has(src)) continue;
-                seen.add(src);
-                out.push(src);
-            }
-        }
-        return out;
-    }
-
-    function createDetailPhotos(conversation) {
-        const photos = conversationPhotos(conversation);
-        if (!photos.length) return '';
-        return `<div style="display:flex;gap:8px;overflow-x:auto;padding-bottom:12px;margin-bottom:16px;">
-            ${photos.map(src => `
-                <a href="${escapeHtml(src)}" target="_blank" rel="noreferrer" style="flex-shrink:0;">
-                    <img src="${escapeHtml(src)}" alt="" style="width:88px;height:88px;object-fit:cover;border-radius:8px;display:block;">
-                </a>`).join('')}
-        </div>`;
-    }
-
-    function createConversationCard(conversation) {
-        const startDate = getMessageTime(conversation, true);
-        const endDate = getMessageTime(conversation, false);
-        const durationText = formatDuration(startDate, endDate);
-        const preview = sortMessages(conversation.messages, conversation.startTime, conversation.keepOrder).slice(0, 3).map(msg => {
-            const text = messagePreviewText(msg);
-            return (msg.isMyMessage ? '我: ' : '對方: ') + text.substring(0, 50) + (text.length > 50 ? '...' : '');
-        }).join('<br>');
-
-        return `
-            <div class="knock-conv-card" style="background:#222;border-radius:8px;padding:16px;border:1px solid #444;">
-                <div style="display:flex;gap:12px;align-items:flex-start;">
-                    <input type="checkbox" class="knock-conv-check" data-conv-id="${conversation.id}" style="margin-top:4px;width:18px;height:18px;flex-shrink:0;">
-                    <div style="flex:1;min-width:0;">
-                        <div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:12px;">
-                            <div>
-                                <div style="font-size:14px;color:#888;margin-bottom:4px;">
-                                    ${startDate.toLocaleString('zh-TW')}${durationText ? ` · 持續 ${durationText}` : ''}
-                                </div>
-                                <div style="font-size:12px;color:#666;">${conversation.messages.length} 條訊息</div>
-                            </div>
-                            <div style="display:flex;gap:8px;">
-                                <button class="knock-name-btn" data-conv-id="${conversation.id}" style="${cssBtn('#ff9800', 'padding:6px 12px;border-radius:4px;font-size:12px;')}">命名</button>
-                                ${!getSavedConversations().some(c => c.id === conversation.id) ? `<button class="knock-pin-btn" data-conv-id="${conversation.id}" style="${cssBtn('#4CAF50', 'padding:6px 12px;border-radius:4px;font-size:12px;')}">儲存</button>` : ''}
-                                <button class="knock-copy-btn" data-conv-id="${conversation.id}" style="${cssBtn('#2196F3', 'padding:6px 12px;border-radius:4px;font-size:12px;')}">複製</button>
-                            </div>
-                        </div>
-                        <div style="background:#1a1a1a;border-radius:6px;padding:12px;font-size:13px;color:#ccc;line-height:1.6;max-height:150px;overflow-y:auto;">${preview}</div>
-                        <button class="knock-view-btn" data-conv-id="${conversation.id}" style="${cssBtn('#4CAF50', 'margin-top:12px;font-size:13px;width:100%;')}">查看完整對話</button>
-                    </div>
-                </div>
-            </div>`;
     }
 
     function createNtfySettings() {
@@ -3496,25 +2858,21 @@
                 </div>
                 <input type="file" id="knock-import-first-filters-file" accept="application/json,.json" hidden>
             </div>
-            <div style="font-size:13px;color:#888;margin-bottom:16px;">依使用者 id 自動離開。勾選時用當時的發語詞當顯示名稱，可在這裡修改。沒有 id 的舊項目，要發語詞與頭像都相同才會離開。</div>
+            <div style="font-size:13px;color:#888;margin-bottom:16px;">依使用者 id 自動離開。沒有 id 的舊項目，要發語詞與頭像都相同才會離開。</div>
             <input type="text" id="knock-filter-search" placeholder="搜尋已記住的人..." style="${CSS_INP}margin-bottom:16px;">
             <div id="knock-filter-list" style="display:flex;flex-direction:column;gap:8px;">
                 ${filters.length === 0
                     ? '<div style="text-align:center;padding:40px;color:#888;">尚未過濾任何人</div>'
-                    : filters.map(f => {
-                        const name = f.u ? partnerLabel(f.u) : '';
-                        return `
+                    : filters.map(f => `
                         <div class="knock-filter-card" style="display:flex;gap:8px;align-items:flex-start;background:#222;border:1px solid #444;border-radius:8px;padding:12px;">
                             <div style="flex:1;min-width:0;">
-                                <div style="font-size:14px;color:#ccc;white-space:pre-wrap;word-break:break-word;">${escapeHtml(name || f.t || '（沒有發語詞）')}</div>
+                                <div style="font-size:14px;color:#ccc;white-space:pre-wrap;word-break:break-word;">${escapeHtml(f.t || '（沒有發語詞）')}</div>
                                 <div style="font-size:12px;color:#666;margin-top:4px;">${f.u
-                                    ? `${name && f.t ? `${escapeHtml(f.t)} · ` : ''}id ${escapeHtml(f.u)}`
+                                    ? `id ${escapeHtml(f.u)}`
                                     : '舊資料沒有 id，發語詞與頭像都相同才會離開'}</div>
                             </div>
-                            ${f.u ? `<button type="button" class="knock-rename-user" data-filter-uid="${encodeURIComponent(f.u)}" style="${cssBtn('#ff9800', 'padding:6px 10px;border-radius:4px;font-size:12px;flex-shrink:0;')}">改名</button>` : ''}
                             <button type="button" class="knock-remove-first-filter" data-filter-uid="${encodeURIComponent(f.u)}" data-filter-text="${encodeURIComponent(f.t)}" data-filter-avatar="${encodeURIComponent(f.a)}" style="${cssBtn('#d32f2f', 'padding:6px 10px;border-radius:4px;font-size:12px;flex-shrink:0;')}">刪除</button>
-                        </div>`;
-                    }).join('')}
+                        </div>`).join('')}
             </div>`));
         if (!panel) return;
         el('knock-filter-manager-close').onclick = () => panel.remove();
@@ -3604,292 +2962,7 @@
         });
     }
 
-    function paintConvTabs() {
-        const savedBtn = el('knock-tab-saved');
-        const autoBtn = el('knock-tab-auto');
-        if (!savedBtn || !autoBtn) return;
-        savedBtn.style.cssText = cssBtn(conversationManagerTab === 'saved' ? '#4CAF50' : '#333', conversationManagerTab === 'saved' ? '' : 'color:#ccc;');
-        autoBtn.style.cssText = cssBtn(conversationManagerTab === 'auto' ? '#4CAF50' : '#333', conversationManagerTab === 'auto' ? '' : 'color:#ccc;');
-        savedBtn.textContent = `已儲存（${getSavedConversations().length}）`;
-        autoBtn.textContent = `自動儲存（${getAutoConversations().length}）`;
-    }
-
-    function conversationDisplayName(conv) {
-        if (!conv) return '';
-        return (conv.partnerUid && partnerLabel(conv.partnerUid)) || String(conv.label || '').trim();
-    }
-
-    function folderGroups(conversations, labels) {
-        const order = [];
-        const seen = new Map();
-        for (const conv of conversations || []) {
-            const uid = conv.partnerUid || '';
-            const name = (uid && labels[uid]) || (!uid && conv.label) || '';
-            if (!name) {
-                order.push({ type: 'loose', conv });
-                continue;
-            }
-            const key = uid || `solo:${conv.id}`;
-            let folder = seen.get(key);
-            if (!folder) {
-                folder = { key, name, items: [] };
-                seen.set(key, folder);
-                order.push({ type: 'folder', folder });
-            }
-            folder.items.push(conv);
-        }
-        return order;
-    }
-
-    function createFolderBlock(folder) {
-        const items = folder.items.slice().sort((a, b) =>
-            String(b.endTime || b.startTime || '').localeCompare(String(a.endTime || a.startTime || '')));
-        const open = openFolderKeys.has(folder.key);
-        const key = encodeURIComponent(folder.key);
-        return `<div class="knock-folder" data-folder-key="${key}" style="background:#1a1a1a;border:1px solid #444;border-radius:8px;padding:12px;">
-            <div style="display:flex;align-items:center;gap:8px;">
-                <button type="button" class="knock-folder-toggle" data-folder-key="${key}" style="${cssBtn('#333', 'flex:1;text-align:left;font-size:15px;')}">${open ? '▾' : '▸'} ${escapeHtml(folder.name)}（${items.length}）</button>
-                <button type="button" class="knock-name-btn" data-conv-id="${items[0].id}" style="${cssBtn('#ff9800', 'padding:6px 12px;border-radius:4px;font-size:12px;flex-shrink:0;')}">命名</button>
-            </div>
-            <div class="knock-folder-body" style="display:${open ? 'flex' : 'none'};flex-direction:column;gap:12px;margin-top:12px;">
-                ${items.map(createConversationCard).join('')}
-            </div>
-        </div>`;
-    }
-
-    function writeConversationLabel(conversationId, name) {
-        const apply = (key) => {
-            const list = storageGet(key, []);
-            const i = list.findIndex(c => c && c.id === conversationId);
-            if (i < 0) return;
-            list[i] = { ...list[i], label: name };
-            storageSet(key, list);
-        };
-        apply(SAVED_CONV_KEY);
-        apply(AUTO_CONV_KEY);
-        if (currentConversation.id === conversationId) currentConversation.label = name;
-    }
-
-    function nameConversation(conversationId) {
-        const conv = findStoredConversation(conversationId)
-            || (currentConversation.id === conversationId ? currentConversation : null);
-        if (!conv) {
-            alert('找不到此對話');
-            return;
-        }
-        const uid = conv.partnerUid || (currentConversation.id === conversationId ? currentConversation.partnerUid : '');
-        const current = (uid && partnerLabel(uid)) || conv.label || (currentConversation.id === conversationId ? currentConversation.label : '') || '';
-        const next = prompt('替這位命名。再遇到會收進同一個資料夾；空白表示清除。', current);
-        if (next == null) return;
-        const name = next.trim().slice(0, 40);
-        if (uid) setPartnerLabel(uid, name);
-        writeConversationLabel(conversationId, name);
-        if (currentConversation.id === conversationId || (uid && currentConversation.partnerUid === uid)) {
-            currentConversation.label = name;
-            paintPartnerCaption();
-        }
-        renderConversationList();
-        const title = el('knock-detail-title');
-        if (title && el('knock-conversation-detail')) title.textContent = name || title.dataset.plain || title.textContent;
-        showToast(name ? `已命名為 ${name}` : '已清除命名');
-    }
-
-    function renderConversationList() {
-        const listEl = el('knock-conversations-list');
-        if (!listEl) return;
-        const list = conversationManagerTab === 'saved' ? getSavedConversations() : getAutoConversations();
-        const other = conversationManagerTab === 'saved' ? getAutoConversations() : getSavedConversations();
-        const labels = getPartnerLabels();
-        const namedUids = new Set(list.map(c => c.partnerUid).filter(uid => uid && labels[uid]));
-        const seen = new Set(list.map(c => c.id));
-        const merged = list.concat(other.filter(c => c && namedUids.has(c.partnerUid) && !seen.has(c.id)));
-        const empty = conversationManagerTab === 'saved' ? '尚無已儲存的對話' : '尚無自動儲存的對話';
-        const order = folderGroups(merged, labels);
-        listEl.innerHTML = list.length === 0
-            ? `<div style="text-align:center;padding:40px;color:#888;">${empty}</div>`
-            : order.map(item => item.type === 'folder' ? createFolderBlock(item.folder) : createConversationCard(item.conv)).join('');
-        paintConvTabs();
-        const all = el('knock-conv-select-all');
-        if (all) all.checked = false;
-    }
-
-    function selectedConversationIds() {
-        return Array.from(document.querySelectorAll('#knock-conversations-list .knock-conv-check:checked'))
-            .map(el => el.dataset.convId)
-            .filter(Boolean);
-    }
-
-    function createConversationManager() {
-        const manager = toggleOverlay('knock-conversation-manager', () => {
-            persistLiveConversation();
-            return makeOverlay('knock-conversation-manager', 900, `
-            <div style="flex-shrink:0;display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;flex-wrap:wrap;">
-                <h2 style="margin:0;font-size:24px;">對話記錄</h2>
-                <button id="knock-manager-close" style="${cssBtn('#444')}">關閉</button>
-            </div>
-            <div style="flex-shrink:0;display:flex;gap:8px;margin-bottom:16px;">
-                <button type="button" id="knock-tab-saved"></button>
-                <button type="button" id="knock-tab-auto"></button>
-            </div>
-            <div style="flex-shrink:0;display:flex;gap:8px;align-items:center;margin-bottom:16px;flex-wrap:wrap;">
-                <label style="display:flex;align-items:center;gap:6px;font-size:14px;color:#ccc;cursor:pointer;">
-                    <input type="checkbox" id="knock-conv-select-all" style="width:16px;height:16px;">全選
-                </label>
-                <button id="knock-conv-delete-selected" style="${cssBtn('#d32f2f', 'padding:6px 12px;border-radius:4px;font-size:13px;')}">刪除所選</button>
-            </div>
-            <div style="flex-shrink:0;margin-bottom:16px;">
-                <input type="text" id="knock-search-input" placeholder="搜尋對話內容..." style="${CSS_INP}">
-            </div>
-            <div id="knock-conversations-list" style="flex:1;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:12px;"></div>`, 10002, true);
-        });
-        if (!manager) return;
-        renderConversationList();
-        el('knock-manager-close').onclick = () => manager.remove();
-        el('knock-tab-saved').onclick = () => {
-            conversationManagerTab = 'saved';
-            renderConversationList();
-        };
-        el('knock-tab-auto').onclick = () => {
-            conversationManagerTab = 'auto';
-            renderConversationList();
-        };
-        el('knock-conv-select-all').onchange = (e) => {
-            document.querySelectorAll('#knock-conversations-list .knock-conv-card').forEach(card => {
-                if (card.style.display === 'none') return;
-                const box = card.querySelector('.knock-conv-check');
-                if (box) box.checked = e.target.checked;
-            });
-        };
-        el('knock-conv-delete-selected').onclick = () => {
-            const ids = selectedConversationIds();
-            if (!ids.length) {
-                showToast('請先勾選要刪除的對話');
-                return;
-            }
-            if (confirm(`確定刪除 ${ids.length} 則對話？`) && deleteConversations(ids)) {
-                renderConversationList();
-                showToast(`已刪除 ${ids.length} 則`);
-            }
-        };
-        el('knock-search-input').addEventListener('input', (e) => {
-            const q = e.target.value.toLowerCase();
-            document.querySelectorAll('#knock-conversations-list .knock-folder').forEach(folder => {
-                const body = folder.querySelector('.knock-folder-body');
-                const key = decodeURIComponent(folder.dataset.folderKey || '');
-                const hit = !q || folder.textContent.toLowerCase().includes(q);
-                folder.style.display = hit ? 'block' : 'none';
-                if (body) body.style.display = q ? (hit ? 'flex' : 'none') : (openFolderKeys.has(key) ? 'flex' : 'none');
-            });
-            document.querySelectorAll('#knock-conversations-list > .knock-conv-card').forEach(card => {
-                card.style.display = !q || card.textContent.toLowerCase().includes(q) ? 'block' : 'none';
-            });
-        });
-    }
-
-    function showConversationDetail(conversationId) {
-        const conversation = findStoredConversation(conversationId);
-        if (!conversation) {
-            alert('找不到此對話');
-            return;
-        }
-        const isAuto = !getSavedConversations().some(conv => conv.id === conversationId);
-
-        const startDate = getMessageTime(conversation, true);
-        const endDate = getMessageTime(conversation, false);
-        const durationText = formatDuration(startDate, endDate);
-        const sorted = sortMessages(conversation.messages, conversation.startTime, conversation.keepOrder);
-        const firstOther = sorted.find(m => !m.isMyMessage && !m.timestamp);
-        el('knock-conversation-detail')?.remove();
-        const detail = makeOverlay('knock-conversation-detail', 800, `
-            <div style="flex-shrink:0;display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;flex-wrap:wrap;">
-                <h2 id="knock-detail-title" data-partner-uid="${escapeHtml(conversation.partnerUid || '')}" data-plain="${isAuto ? '自動儲存對話' : '已儲存對話'}" style="margin:0;font-size:20px;">${escapeHtml(conversationDisplayName(conversation) || (isAuto ? '自動儲存對話' : '已儲存對話'))}</h2>
-                <div style="display:flex;gap:8px;flex-wrap:wrap;">
-                    ${isAuto ? `<button id="knock-detail-pin" style="${cssBtn('#4CAF50')}">移到已儲存</button>` : ''}
-                    <button id="knock-detail-name" style="${cssBtn('#ff9800')}">命名</button>
-                    <button id="knock-detail-copy" style="${cssBtn('#2196F3')}">複製</button>
-                    <button id="knock-detail-delete" style="${cssBtn('#d32f2f')}">刪除</button>
-                    <button id="knock-detail-close" style="${cssBtn('#444')}">關閉</button>
-                </div>
-            </div>
-            <div style="flex:1;min-height:0;overflow-y:auto;">
-            ${createDetailPhotos(conversation)}
-            <div style="background:#222;border-radius:8px;padding:16px;margin-bottom:20px;font-size:13px;color:#888;">
-                <div>開始時間: ${startDate.toLocaleString('zh-TW')}</div>
-                ${endDate ? `<div>結束時間: ${endDate.toLocaleString('zh-TW')}</div>` : ''}
-                ${durationText ? `<div>持續時間: ${durationText}</div>` : ''}
-                <div>訊息數量: ${conversation.messages.length} 條</div>
-            </div>
-            <div style="display:flex;flex-direction:column;gap:12px;">
-                ${sorted.map(msg => {
-                    const filterKey = msg.text || (msg.imageKeys && msg.imageKeys[0]) || stableImageKey(msg.imageUrls && msg.imageUrls[0]) || '';
-                    const showRemember = msg === firstOther && filterKey;
-                    const showAvatarRemember = msg === firstOther && msg.avatarUrl;
-                    return `
-                    <div data-knock-date="${escapeHtml(msg.date || messageDate(msg, conversation.startTime))}" style="display:flex;align-items:flex-start;gap:8px;flex-direction:${msg.isMyMessage ? 'row-reverse' : 'row'};margin-bottom:12px;">
-                        <div style="width:40px;height:40px;border-radius:50%;flex-shrink:0;background:#333;display:flex;align-items:center;justify-content:center;overflow:visible;position:relative;">
-                            ${msg.avatarUrl
-                                ? `<img src="${msg.avatarUrl}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;" alt="avatar">`
-                                : `<div style="color:#888;font-size:18px;">${msg.isMyMessage ? '我' : '對'}</div>`}
-                            ${showAvatarRemember ? `<button type="button" class="knock-remember-avatar-saved" data-avatar-url="${encodeURIComponent(msg.avatarUrl)}"></button>` : ''}
-                        </div>
-                        <div style="background:${msg.isMyMessage ? '#2d5a3d' : '#2d2d3d'};border-radius:8px;padding:8px 10px;max-width:70%;display:flex;align-items:flex-start;gap:8px;">
-                            <div style="flex:1;min-width:0;">
-                                ${quoteHtml(msg)}
-                                ${msg.text ? `<div style="font-size:14px;line-height:1.4;word-wrap:break-word;">${escapeHtml(msg.text)}</div>` : ''}
-                                ${(msg.imageUrls || []).map(src => `
-                                    <a href="${escapeHtml(src)}" target="_blank" rel="noreferrer">
-                                        <img src="${escapeHtml(src)}" alt="圖片" style="max-width:180px;max-height:240px;border-radius:6px;display:block;margin-top:6px;">
-                                    </a>`).join('')}
-                                ${!msg.text && !(msg.imageUrls || []).length ? `<div style="color:#888;font-size:13px;">（空訊息）</div>` : ''}
-                            </div>
-                            ${msg.timestamp ? `<div style="font-size:11px;color:rgba(255,255,255,0.5);flex-shrink:0;white-space:nowrap;">${escapeHtml(formatMessageStamp(msg))}</div>` : ''}
-                            ${showRemember ? `<button type="button" class="knock-remember-first-saved" data-filter-uid="${encodeURIComponent(conversation.partnerUid || '')}" data-filter-text="${encodeURIComponent(filterKey)}" data-filter-avatar="${encodeURIComponent(avatarHashOf(msg.avatarUrl))}"></button>` : ''}
-                        </div>
-                    </div>`;
-                }).join('')}
-            </div>
-            </div>`, 10003, true);
-        syncRememberButtons();
-        syncAvatarFilterButtons();
-        el('knock-detail-close').onclick = () => detail.remove();
-        el('knock-detail-name').onclick = () => nameConversation(conversationId);
-        el('knock-detail-copy').onclick = () => copyConversation(conversationId);
-        el('knock-detail-delete').onclick = () => {
-            if (confirm('確定刪除這則對話？') && deleteConversations([conversationId])) {
-                detail.remove();
-                renderConversationList();
-                showToast('已刪除');
-            }
-        };
-        el('knock-detail-pin')?.addEventListener('click', () => {
-            if (pinConversation(conversationId)) {
-                showToast('已移到已儲存');
-                detail.remove();
-                conversationManagerTab = 'saved';
-                renderConversationList();
-            }
-        });
-    }
-
     document.addEventListener('click', (e) => {
-        const folderBtn = e.target.closest?.('.knock-folder-toggle');
-        if (folderBtn) {
-            const key = decodeURIComponent(folderBtn.dataset.folderKey || '');
-            if (openFolderKeys.has(key)) openFolderKeys.delete(key);
-            else openFolderKeys.add(key);
-            renderConversationList();
-            return;
-        }
-        const nameBtn = e.target.closest?.('.knock-name-btn');
-        if (nameBtn) {
-            nameConversation(nameBtn.getAttribute('data-conv-id'));
-            return;
-        }
-        const renameBtn = e.target.closest?.('.knock-rename-user');
-        if (renameBtn) {
-            renameFilteredUser(decodeURIComponent(renameBtn.dataset.filterUid || ''));
-            return;
-        }
         if (e.target.classList.contains('knock-remove-first-filter')) {
             const uid = decodeURIComponent(e.target.dataset.filterUid || '');
             const text = decodeURIComponent(e.target.dataset.filterText || '');
@@ -3940,20 +3013,6 @@
             }
             return;
         }
-
-        const hit = e.target.closest?.('[data-conv-id]');
-        const convId = hit?.getAttribute('data-conv-id');
-        if (!convId) return;
-        if (hit.classList.contains('knock-pin-btn')) {
-            if (pinConversation(convId)) {
-                showToast('已移到已儲存');
-                renderConversationList();
-            }
-        } else if (hit.classList.contains('knock-copy-btn')) {
-            copyConversation(convId);
-        } else if (hit.classList.contains('knock-view-btn')) {
-            showConversationDetail(convId);
-        }
     });
 
     // --- 啟動 ---
@@ -4000,21 +3059,11 @@
             labeled: labelDayOffset(t)
         })));
         const dates = offsets.map(o => shiftYmd(-o));
-        const out = sortMessages(times.map((timestamp, i) => ({ timestamp, date: dates[i] }))).map(m => m.timestamp);
         const afterMidnight = new Date();
         afterMidnight.setHours(0, 20, 0, 0);
         const onlyNight = dayOffsetsFromNewest([{ clock: 23 * 60 + 20, labeled: null }], afterMidnight);
-        if (offsets[0] !== 1 || offsets[1] !== 0 || dates[0] !== shiftYmd(-1) || dates[1] !== shiftYmd(0) || out.join() !== '23:59,00:00' || onlyNight[0] !== 1) {
-            console.error('knock: 由最新往回推日期檢查失敗', offsets, dates, out, onlyNight);
-        }
-        const sameBio = messageIdSet([{ id: 'bio', timestamp: null }, { id: 't1', timestamp: '14:08' }]);
-        if (sameBio.has('bio') || hashOverlapCount({ messages: [{ id: 'bio', timestamp: null }, { id: 't2', timestamp: '14:09' }] }, sameBio) !== 0) {
-            console.error('knock: 開場句不應當成同一對話');
-        }
-        const hello = [{ id: 'hi', timestamp: '14:08' }];
-        const mega = [{ id: 'hi', timestamp: '14:08' }, { id: 'a', timestamp: '14:09' }, { id: 'b', timestamp: '14:10' }];
-        if (isSameConversation(hello, mega, true)) {
-            console.error('knock: 一句對上不該併進已儲存');
+        if (offsets[0] !== 1 || offsets[1] !== 0 || dates[0] !== shiftYmd(-1) || dates[1] !== shiftYmd(0) || onlyNight[0] !== 1) {
+            console.error('knock: 由最新往回推日期檢查失敗', offsets, dates, onlyNight);
         }
         const stock = 'https://firebasestorage.googleapis.com/v0/b/knocktalk-prod.appspot.com/o/users-common%2Favatars%2Fmale-user.svg?alt=media&token=abc';
         const female = 'https://firebasestorage.googleapis.com/v0/b/knocktalk-prod.appspot.com/o/users-common/avatars/female-user.svg?alt=media';
@@ -4043,41 +3092,18 @@
             || clockMinutesOnly('9/19') != null) {
             console.error('knock: 日期標籤解析失敗');
         }
-        if (sortMessages([{ seq: 1, text: 'b' }, { seq: 0, text: 'a' }], null, true).map(m => m.text).join() !== 'a,b') {
-            console.error('knock: 畫面順序重建失敗');
-        }
         const encodedParent = 'req0___data__=%7B%22parent%22%3A%22projects%2Fknocktalk-prod%2Fdatabases%2F(default)%2Fdocuments%2Fchannels%2FekVlFOyWwL9KlwjaDgj6%22%7D';
         if (extractChannelId(encodedParent) !== 'ekVlFOyWwL9KlwjaDgj6' || isChannelId('conv_1') || !isChannelId('ekVlFOyWwL9KlwjaDgj6')) {
             console.error('knock: channel id 解析失敗');
         }
-        const storedTalks = [
-            { id: 'c1', partnerUid: 'user_one', label: '阿明', messages: [{ id: 'm1' }, { id: 'm2' }] },
-            { id: 'c2', partnerUid: 'user_two', messages: [{ id: 'x' }] },
-            { id: 'conv_old_1', messages: [{ id: 'y' }] },
-            { id: 'short', messages: [{ id: 'z' }] }
-        ];
-        const src = archiveSources(
-            { id: 'live1', partnerUid: 'user_one', messages: [{ id: 'm3' }, { id: 'm2' }] },
-            storedTalks,
-            ''
-        );
-        const batch = nextArchive(src, new Set(['user_one:m1']));
-        const later = nextArchive(src, new Set(['user_one:m1', 'user_one:m2', 'user_one:m3']));
-        if (src.length !== 3 || src[0].uid !== 'user_one' || src[0].title !== '阿明'
-            || src[0].messages.map(m => m.id).join() !== 'm1,m2,m3,m2'
-            || src[2].uid !== 'conv_old_1'
-            || !batch || batch.messages.map(m => m.id).join() !== 'm2,m3'
-            || !later || later.uid !== 'user_two') {
-            console.error('knock: 本地對話同步失敗');
-        }
-        const talks = pastTalks([
-            { id: 'a', partnerUid: 'u1', messages: [{}], endTime: '2026-01-01' },
-            { id: 'b', partnerUid: 'u1', messages: [{}], endTime: '2026-02-01' },
-            { id: 'c', partnerUid: 'u2', messages: [{}] },
-            { id: 'd', partnerUid: 'u1', messages: [] }
-        ], 'u1', 'a');
-        if (talks.length !== 1 || talks[0].id !== 'b' || pastTalks(talks, '', 'a').length) {
-            console.error('knock: 舊對象比對失敗');
+        const src = archiveSources({ id: 'live1', partnerUid: 'user_one', label: '阿明', messages: [{ id: 'm3' }, { id: 'm2' }] }, '');
+        const batch = nextArchive(src, new Set(['user_one:m2']));
+        const later = nextArchive(src, new Set(['user_one:m2', 'user_one:m3']));
+        if (src.length !== 1 || src[0].uid !== 'user_one' || src[0].title !== '阿明'
+            || src[0].messages.map(m => m.id).join() !== 'm3,m2'
+            || !batch || batch.messages.map(m => m.id).join() !== 'm3'
+            || later) {
+            console.error('knock: 目前對話上傳失敗');
         }
         const dupImages = dropDuplicateImages([
             { text: '', imageUrls: ['https://x/a.jpg?token=1'], isMyMessage: false, timestamp: '01:02' },
@@ -4091,18 +3117,6 @@
             || !String(dupImages[0].imageUrls[0]).startsWith('data:')
             || dupImages[1].text !== 'hi') {
             console.error('knock: 圖片重複紀錄判斷失敗');
-        }
-        const grouped = folderGroups([
-            { id: 'a', partnerUid: 'u1', endTime: '2026-02-01' },
-            { id: 'b', partnerUid: 'u1', endTime: '2026-01-01' },
-            { id: 'c', partnerUid: 'u2' },
-            { id: 'd', label: '路人' },
-            { id: 'e' }
-        ], { u1: '阿明' });
-        if (grouped.length !== 4 || grouped[0].type !== 'folder' || grouped[0].folder.items.length !== 2
-            || grouped[0].folder.name !== '阿明' || grouped[1].conv.id !== 'c'
-            || grouped[2].folder.key !== 'solo:d' || grouped[3].conv.id !== 'e') {
-            console.error('knock: 命名資料夾分組失敗');
         }
         const uidFilters = [
             normalizeFilter({ u: ' uid1 ', t: ' 早安 ' }),
