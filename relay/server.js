@@ -92,6 +92,14 @@ function withYear(text) {
     return y + '/' + pad2(month) + '/' + pad2(day) + ' ' + pad2(hh) + ':' + pad2(mm);
 }
 
+// 沒有明確改名時，空白或「未命名」不能蓋掉已經存過的名稱。
+function chosenTitle(archive, prev) {
+    const sent = String(archive && archive.title || '').trim().slice(0, 40);
+    if (archive && archive.named) return sent || '未命名';
+    if (sent && sent !== '未命名') return sent;
+    return (prev && prev.title) || sent || '未命名';
+}
+
 function archiveMessage(m) {
     const id = String(m && m.id || '').slice(0, 80);
     const text = String(m && m.text || '').slice(0, 500);
@@ -111,11 +119,11 @@ function rememberTalk(talks, body, now) {
     const incoming = (Array.isArray(archive.messages) ? archive.messages : []).map(archiveMessage).filter(Boolean).filter(m => !dropped.has(uid + ':' + m.id)).slice(0, 40);
     const prev = talks.get(uid);
     const avatar = cleanAvatar(body && body.openings && body.openings.avatar) || (prev && prev.avatar) || '';
-    const nextTitle = String(archive.title || '').trim().slice(0, 40);
-    if (!incoming.length && prev && prev.title === nextTitle && avatar === (prev.avatar || '')) return false;
+    const title = chosenTitle(archive, prev);
+    if (!incoming.length && prev && prev.title === title && avatar === (prev.avatar || '')) return false;
     const map = new Map();
     for (const m of (prev && prev.messages) || []) if (m && m.id) map.set(m.id, m);
-    let changed = !prev || prev.title !== String(archive.title || '').trim().slice(0, 40) || (avatar && avatar !== (prev.avatar || ''));
+    let changed = !prev || prev.title !== title || (avatar && avatar !== (prev.avatar || ''));
     for (const m of incoming) {
         const old = map.get(m.id);
         if (old && m.text === '已收回一則訊息' && !m.image) {
@@ -134,7 +142,6 @@ function rememberTalk(talks, body, now) {
     if (!changed) return false;
     let messages = [...map.values()];
     if (messages.length > TALK_KEEP) messages = messages.slice(messages.length - TALK_KEEP);
-    const title = String(archive.title || (prev && prev.title) || '').trim().slice(0, 40) || '未命名';
     if (!messages.length) return false;
     const lastAt = talkLastAt(messages) || (prev && prev.lastAt) || 0;
     talks.set(uid, { uid, title, messages, updated: now, lastAt, avatar });
@@ -694,6 +701,13 @@ function selfCheck() {
     const faced = new Map();
     if (!rememberTalk(faced, { archive: { uid: 'user_face1', title: '臉', messages: [{ id: 'f1', text: '嗨', mine: false, time: '1/2 08:00' }] }, openings: { avatar: 'abcd1234' } }, 4)
         || faced.get('user_face1').avatar !== 'abcd1234') throw new Error('knock relay 檢查失敗');
+    const named = new Map();
+    if (!rememberTalk(named, { archive: { uid: 'user_name', title: '小美', messages: [{ id: 'n1', text: '嗨', time: '1/2 08:00' }] } }, 1)
+        || !rememberTalk(named, { archive: { uid: 'user_name', title: '未命名', messages: [{ id: 'n2', text: '新', time: '1/3 09:00' }] } }, 2)
+        || named.get('user_name').title !== '小美'
+        || named.get('user_name').messages.length !== 2
+        || !rememberTalk(named, { archive: { uid: 'user_name', title: '未命名', named: true, messages: [{ id: 'n2', text: '新', time: '1/3 09:00' }] } }, 3)
+        || named.get('user_name').title !== '未命名') throw new Error('knock relay 檢查失敗');
     const thisYear = String(taipeiNow().getUTCFullYear());
     if (withYear('10/6 11:51') !== thisYear + '/10/06 11:51'
         || withYear(thisYear + '/10/06 11:51') !== thisYear + '/10/06 11:51'
@@ -2005,7 +2019,9 @@ function main() {
                 const avatarPatch = takeAvatarPatch(session);
                 const userPatch = takeUserPatch(session);
                 if (outbox.dirty || patch.dirty || avatarPatch.dirty || userPatch.dirty) saveSessions(sessions);
-                return send(res, 200, { ok: true, outbox: outbox.pending, controls: patch.controls, avatarOn: avatarPatch.avatarOn, userOn: userPatch.userOn, filters });
+                const talkUid = cleanUid(body && body.archive && body.archive.uid);
+                const savedTalk = talkUid ? talks.get(talkUid) : null;
+                return send(res, 200, { ok: true, outbox: outbox.pending, controls: patch.controls, avatarOn: avatarPatch.avatarOn, userOn: userPatch.userOn, filters, talkTitle: savedTalk ? savedTalk.title : '' });
             }
             const imgMatch = url.pathname.match(/^\/api\/images\/([a-z0-9]{8,40})$/);
             if (imgMatch && req.method === 'GET') {

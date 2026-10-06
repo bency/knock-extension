@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.77
+// @version      1.4.78
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -152,6 +152,7 @@
     const checkedMessages = new Set();
     let myAvatarUrl = null;
     let currentConversation = emptyConversation();
+    let nameSet = false;
     let notificationsArmed = false;
     let pendingForcedLeave = false;
     let forceAutoUntilIdle = false;
@@ -685,6 +686,7 @@
         if (!currentConversation.id) return;
         const next = prompt('替這位命名。空白表示清除。', currentConversation.label || '');
         if (next == null) return;
+        nameSet = true;
         currentConversation.label = next.trim().slice(0, 40);
         paintPartnerCaption();
         showToast(currentConversation.label ? `已命名為 ${currentConversation.label}` : '已清除命名');
@@ -713,14 +715,12 @@
         const shown = name || '未命名';
         const list = document.querySelector('ul[data-test="messages"]');
         if (!list) return;
-        let placed = false;
         for (const li of list.querySelectorAll('li.message-li')) {
-            const avatar = !placed && !isMyMessageLi(li) ? senderAvatar(li) : null;
+            const avatar = isMyMessageLi(li) ? null : senderAvatar(li);
             if (!avatar) {
                 clearPartnerCaption(li);
                 continue;
             }
-            placed = true;
             let host = avatar.parentElement;
             if (!host || !host.classList.contains('knock-avatar-col')) {
                 host = document.createElement('div');
@@ -810,6 +810,13 @@
         if (!timeStr) return null;
         const m = /(\d{1,2}):(\d{2})/.exec(timeStr);
         return m ? Number(m[1]) * 60 + Number(m[2]) : null;
+    }
+
+    function formatMessageStamp(msg) {
+        if (!msg || !msg.timestamp) return '';
+        if (clockMinutesOnly(msg.timestamp) == null) return String(msg.timestamp).slice(0, 32);
+        const day = msg.date ? String(msg.date).slice(0, 10).replace(/-/g, '/') + ' ' : '';
+        return (day + msg.timestamp).slice(0, 32);
     }
 
     function parseKnockDateLabel(timeStr, now = new Date()) {
@@ -2239,8 +2246,11 @@
     // 只送目前這場。舊的本地紀錄已同步過，不再每輪重讀。
     function relayArchive() {
         notePartnerFromList();
-        const next = nextArchive(archiveSources(currentConversation, currentPartnerName() || ''), relayArchived);
-        if (!next) return null;
+        const uid = archiveUidOf(currentConversation);
+        if (!uid) return null;
+        const title = currentPartnerName() || '未命名';
+        const next = nextArchive(archiveSources(currentConversation, title), relayArchived);
+        if (!next) return { uid, title, named: nameSet, messages: [] };
         const messages = [];
         const skip = [];
         for (const m of next.messages) {
@@ -2249,8 +2259,7 @@
             else skip.push(m);
         }
         if (skip.length) rememberArchived(next.uid, skip);
-        if (!messages.length) return null;
-        return { uid: next.uid, title: next.title, messages };
+        return { uid: next.uid, title: next.title, named: nameSet, messages };
     }
 
     const relaySending = new Map();
@@ -2664,7 +2673,8 @@
         if (!token || relayBusy) return;
         uploadLocalFilters();
         saveRoomControls();
-        const snap = relaySnapshot();
+        let snap = null;
+        try { snap = relaySnapshot(); } catch (e) {}
         if (!snap) return;
         relayBusy = true;
         try {
@@ -2678,6 +2688,10 @@
             if (res && res.status === 200) {
             if (snap.archive) rememberArchived(snap.archive.uid, snap.archive.messages);
             const data = JSON.parse(res.responseText || '{}');
+            if (!nameSet && data.talkTitle && data.talkTitle !== '未命名' && currentConversation.label !== data.talkTitle) {
+                currentConversation.label = String(data.talkTitle).slice(0, 40);
+                paintPartnerCaption();
+            }
             if (data.filters) applyServerFilters(data.filters);
             if (data.controls) applyRelayControls(data.controls);
             if (typeof data.avatarOn === 'boolean') {
