@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.76
+// @version      1.4.77
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -62,7 +62,7 @@
     const HINT_CODE_KEY = 'knockHintCode';
     const HINT_NOTIFIED_KEY = 'knockHintConnectedNotified';
     const HINT_WAS_WAITING_KEY = 'knockHintWasWaiting';
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.76';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.77';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -690,17 +690,39 @@
         showToast(currentConversation.label ? `已命名為 ${currentConversation.label}` : '已清除命名');
     }
 
+    function senderAvatar(li) {
+        const message = li.querySelector('div[data-test="message"]');
+        for (const avatar of li.querySelectorAll('[data-test="user-avatar"]')) {
+            if (message && message.contains(avatar)) continue;
+            return avatar;
+        }
+        return null;
+    }
+
+    function clearPartnerCaption(li) {
+        li.querySelectorAll('.knock-partner-name').forEach(tag => tag.remove());
+        for (const host of li.querySelectorAll('.knock-avatar-col')) {
+            const avatar = host.querySelector('[data-test="user-avatar"]');
+            if (avatar) host.replaceWith(avatar);
+            else host.remove();
+        }
+    }
+
     function paintPartnerCaption() {
         const name = currentPartnerName();
         const shown = name || '未命名';
         const list = document.querySelector('ul[data-test="messages"]');
         if (!list) return;
+        let placed = false;
         for (const li of list.querySelectorAll('li.message-li')) {
-            if (isMyMessageLi(li)) continue;
-            const avatar = li.querySelector('[data-test="user-avatar"]');
-            if (!avatar) continue;
-            let host = avatar.closest('.knock-avatar-col');
-            if (!host) {
+            const avatar = !placed && !isMyMessageLi(li) ? senderAvatar(li) : null;
+            if (!avatar) {
+                clearPartnerCaption(li);
+                continue;
+            }
+            placed = true;
+            let host = avatar.parentElement;
+            if (!host || !host.classList.contains('knock-avatar-col')) {
                 host = document.createElement('div');
                 host.className = 'knock-avatar-col';
                 host.style.cssText = 'display:flex;flex-direction:column;align-items:center;flex:0 0 auto;width:3em;max-width:4.2em;';

@@ -110,10 +110,12 @@ function rememberTalk(talks, body, now) {
     if (!uid) return false;
     const incoming = (Array.isArray(archive.messages) ? archive.messages : []).map(archiveMessage).filter(Boolean).filter(m => !dropped.has(uid + ':' + m.id)).slice(0, 40);
     const prev = talks.get(uid);
-    if (!incoming.length && (!prev || prev.title === String(archive.title || '').trim().slice(0, 40))) return false;
+    const avatar = cleanAvatar(body && body.openings && body.openings.avatar) || (prev && prev.avatar) || '';
+    const nextTitle = String(archive.title || '').trim().slice(0, 40);
+    if (!incoming.length && prev && prev.title === nextTitle && avatar === (prev.avatar || '')) return false;
     const map = new Map();
     for (const m of (prev && prev.messages) || []) if (m && m.id) map.set(m.id, m);
-    let changed = !prev || prev.title !== String(archive.title || '').trim().slice(0, 40);
+    let changed = !prev || prev.title !== String(archive.title || '').trim().slice(0, 40) || (avatar && avatar !== (prev.avatar || ''));
     for (const m of incoming) {
         const old = map.get(m.id);
         if (old && m.text === '已收回一則訊息' && !m.image) {
@@ -135,7 +137,7 @@ function rememberTalk(talks, body, now) {
     const title = String(archive.title || (prev && prev.title) || '').trim().slice(0, 40) || '未命名';
     if (!messages.length) return false;
     const lastAt = talkLastAt(messages) || (prev && prev.lastAt) || 0;
-    talks.set(uid, { uid, title, messages, updated: now, lastAt });
+    talks.set(uid, { uid, title, messages, updated: now, lastAt, avatar });
     if (talks.size > 300) {
         let oldest = null;
         for (const t of talks.values()) {
@@ -201,7 +203,8 @@ function loadTalks() {
                 title: String(t.title || '未命名').slice(0, 40) || '未命名',
                 messages,
                 updated,
-                lastAt: talkLastAt(messages) || Number(t.lastAt) || updated
+                lastAt: talkLastAt(messages) || Number(t.lastAt) || updated,
+                avatar: cleanAvatar(t.avatar) || ''
             });
         }
         return map;
@@ -688,6 +691,9 @@ function selfCheck() {
     const datedOnly = new Map();
     rememberTalk(datedOnly, { archive: { uid: 'user_old9', title: '舊', messages: [{ id: 'd1', text: '一', time: '1/2 08:00' }, { id: 'd2', text: '二', time: '23:59' }] } }, 3);
     if (visibleTalks(datedOnly)[0].lastAt !== messageTimeMs('1/2 08:00')) throw new Error('knock relay 檢查失敗');
+    const faced = new Map();
+    if (!rememberTalk(faced, { archive: { uid: 'user_face1', title: '臉', messages: [{ id: 'f1', text: '嗨', mine: false, time: '1/2 08:00' }] }, openings: { avatar: 'abcd1234' } }, 4)
+        || faced.get('user_face1').avatar !== 'abcd1234') throw new Error('knock relay 檢查失敗');
     const thisYear = String(taipeiNow().getUTCFullYear());
     if (withYear('10/6 11:51') !== thisYear + '/10/06 11:51'
         || withYear(thisYear + '/10/06 11:51') !== thisYear + '/10/06 11:51'
@@ -877,8 +883,9 @@ const PAGE = `<!DOCTYPE html>
   .topbar .gear { position:relative; z-index:1; flex:none; width:auto; height:48px; padding:0 12px; border-radius:0; border:1px solid #333; background:#1c1c1c; cursor:pointer; }
   .topbar .gear.menu { width:48px; padding:0; }
   .topbar .end { margin-left:auto; }
-  .topbar .who { position:absolute; left:0; right:0; top:0; height:48px; display:flex; align-items:center; justify-content:center; padding:0 72px; pointer-events:none; overflow:hidden; }
+  .topbar .who { position:absolute; left:0; right:0; top:0; height:48px; display:flex; align-items:center; justify-content:center; gap:8px; padding:0 72px; pointer-events:none; overflow:hidden; }
   .topbar .who span { min-width:0; max-width:100%; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+  .topbar .who .face { width:1em; height:1em; }
   .topbar .del { background:#e53935; border-color:#e53935; color:#fff; }
   main { flex:1; min-height:0; overflow:auto; padding:12px; }
   button, input { font:inherit; color:#eee; }
@@ -1131,7 +1138,7 @@ function noteRooms(list) {
   for (const id in roomUnread) if (!alive[id]) delete roomUnread[id];
 }
 
-function paintBar(title, end) {
+function paintBar(title, end, avatar) {
   clearChrome();
   const bar = document.createElement('div');
   bar.className = 'topbar';
@@ -1144,6 +1151,7 @@ function paintBar(title, end) {
   railBtn.onclick = () => document.body.classList.toggle('rail-open');
   const who = document.createElement('span');
   who.className = 'who';
+  if (avatar) who.append(faceNode(avatar));
   const whoText = document.createElement('span');
   whoText.textContent = title || 'Knock 遠端';
   who.append(whoText);
@@ -1329,7 +1337,7 @@ function paintArchive(talk, follow, y) {
   del.type = 'button';
   del.textContent = '刪除';
   del.onclick = () => { if (uid) deleteTalk(uid); };
-  paintBar((talk && talk.title) || '對話記錄', del);
+  paintBar((talk && talk.title) || '對話記錄', del, talk && talk.avatar);
   app.replaceChildren();
   if (!talk) {
     const p = document.createElement('p');
@@ -1690,7 +1698,7 @@ function paintOpening(s) {
 }
 
 function paintThread(s, follow, y) {
-  paintBar((s && s.title) || '未命名', controlsGear());
+  paintBar((s && s.title) || '未命名', controlsGear(), s && s.openings && s.openings.avatar);
   app.replaceChildren();
   if (!s) {
     const p = document.createElement('p');
