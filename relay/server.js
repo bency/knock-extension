@@ -366,6 +366,10 @@ function applyHeartbeat(sessions, body, now) {
         channelId,
         title,
         canType: !!body.canType,
+        lobby: !!body.lobby,
+        greeting: body.lobby ? String(body.greeting || '').trim().slice(0, 200) : (prev && prev.greeting) || '',
+        greetingWanted: prev && typeof prev.greetingWanted === 'string' ? prev.greetingWanted : null,
+        startWanted: !!(prev && prev.startWanted && body.lobby),
         status: body.status === 'left' ? 'left' : 'live',
         messages: keepRecalled(cleanMessages(body.messages), prev && prev.messages),
         seen: now,
@@ -391,6 +395,8 @@ function visibleSessions(sessions, now, waitMs) {
             channelId: s.channelId,
             title: s.title,
             canType: s.canType,
+            lobby: !!s.lobby,
+            greeting: s.greeting || '',
             status: s.status,
             seen: s.seen,
             waiting: now - s.seen > waitMs,
@@ -415,6 +421,10 @@ function loadSessions() {
                 channelId: String(s.channelId || '').slice(0, 80),
                 title: String(s.title || '未命名').slice(0, 40),
                 canType: !!s.canType,
+                lobby: !!s.lobby,
+                greeting: String(s.greeting || '').slice(0, 200),
+                greetingWanted: typeof s.greetingWanted === 'string' ? String(s.greetingWanted).slice(0, 200) : null,
+                startWanted: !!s.startWanted,
                 status: s.status === 'left' ? 'left' : 'live',
                 messages: cleanMessages(s.messages),
                 seen: Number(s.seen) || 0,
@@ -459,11 +469,16 @@ function pendingOutbox(session) {
 // 頁面上的 packControls 要跟這份欄位一致。
 function cleanControls(raw) {
     if (!raw || typeof raw !== 'object') return null;
+    const phoneTopic = String(raw.phoneTopic || '').trim();
+    if (phoneTopic && !/^[A-Za-z0-9_-]{1,64}$/.test(phoneTopic)) return null;
     return {
         auto: !!raw.auto,
         userFilter: !!raw.userFilter,
         avatarFilter: !!raw.avatarFilter,
-        browser: !!raw.browser
+        browser: !!raw.browser,
+        phone: !!raw.phone,
+        phoneTopic,
+        phoneTitle: String(raw.phoneTitle || '').trim().slice(0, 80) || 'Knock 新訊息'
     };
 }
 
@@ -528,6 +543,22 @@ function takeUserPatch(session) {
     return { userOn: session.userWanted, dirty: false };
 }
 
+function takeGreetingPatch(session) {
+    if (typeof session.greetingWanted !== 'string') return { greeting: null, dirty: false };
+    if (session.greeting === session.greetingWanted) {
+        session.greetingWanted = null;
+        return { greeting: null, dirty: true };
+    }
+    if (!session.lobby) return { greeting: null, dirty: false };
+    return { greeting: session.greetingWanted, dirty: false };
+}
+
+function takeStartPatch(session) {
+    if (!session.startWanted) return { start: false, dirty: false };
+    session.startWanted = false;
+    return { start: true, dirty: true };
+}
+
 function enqueue(session, text, now, image) {
     const item = {
         id: crypto.randomBytes(8).toString('hex'),
@@ -577,13 +608,14 @@ function selfCheck() {
         || kept.length !== 2) {
         throw new Error('knock relay 檢查失敗');
     }
-    const wanted = cleanControls({ auto: 1, userFilter: 1, avatarFilter: 0, browser: 1, keep: 1, phone: 1 });
+    const wanted = cleanControls({ auto: 1, userFilter: 1, avatarFilter: 0, browser: 1, keep: 1, phone: 1, phoneTopic: 'knock-room', phoneTitle: '' });
     sessions.get('abc12345').controlWanted = wanted;
     applyHeartbeat(sessions, { tabId: 'abc12345', title: '阿明', canType: true, messages: [{ id: 'm1', text: '嗨', mine: false }] }, 11000);
     const keptWanted = sessions.get('abc12345').controlWanted;
     if (!wanted || !wanted.auto || !wanted.userFilter || wanted.avatarFilter || !wanted.browser
-        || wanted.keep || wanted.phone
+        || wanted.keep || !wanted.phone || wanted.phoneTopic !== 'knock-room' || wanted.phoneTitle !== 'Knock 新訊息'
         || !keptWanted || !sameControls(wanted, keptWanted)
+        || cleanControls({ phoneTopic: 'bad topic' })
         || cleanControls(null)) {
         throw new Error('knock relay 檢查失敗');
     }
@@ -624,6 +656,24 @@ function selfCheck() {
     }, 16000);
     if (!keptMark || keptMark.avatarWanted !== true || keptMark.userWanted !== true
         || !droppedMark || droppedMark.avatarWanted !== null || droppedMark.userWanted !== null) {
+        throw new Error('knock relay 檢查失敗');
+    }
+    const lobby = applyHeartbeat(sessions, {
+        tabId: 'abc12345', title: '大廳', canType: false, lobby: true, greeting: '你好'
+    }, 17000);
+    lobby.greetingWanted = '在嗎';
+    lobby.startWanted = true;
+    const greet = takeGreetingPatch(lobby);
+    const started = takeStartPatch(lobby);
+    lobby.greeting = '在嗎';
+    const greetDone = takeGreetingPatch(lobby);
+    const leftLobby = applyHeartbeat(sessions, {
+        tabId: 'abc12345', title: '大廳', canType: false, lobby: false
+    }, 18000);
+    if (!heartbeatReady({ startWanted: true, greeting: '你好', greetingWanted: '在嗎', outbox: [] })
+        || greet.greeting !== '在嗎' || !started.start || lobby.startWanted
+        || greetDone.greeting !== null || lobby.greetingWanted !== null
+        || !leftLobby || leftLobby.startWanted || leftLobby.greeting !== '在嗎') {
         throw new Error('knock relay 檢查失敗');
     }
     const talks = new Map();
@@ -776,6 +826,8 @@ function heartbeatReady(session) {
     if (typeof session.avatarWanted === 'boolean' && session.avatarWanted !== avatarOn) return true;
     const userOn = !!(session.openings && session.openings.userOn);
     if (typeof session.userWanted === 'boolean' && session.userWanted !== userOn) return true;
+    if (session.startWanted) return true;
+    if (typeof session.greetingWanted === 'string' && session.greetingWanted !== session.greeting) return true;
     return false;
 }
 
@@ -952,6 +1004,8 @@ const PAGE = `<!DOCTYPE html>
   .group button:only-child { border-radius:8px; }
   .group button + button { border-left:1px solid rgba(0,0,0,.2); }
   .ctrl { display:flex; align-items:center; justify-content:space-between; gap:8px; width:100%; box-sizing:border-box; text-align:left; padding:10px 12px; margin:0 0 8px; background:#1c1c1c; border:1px solid #333; border-radius:10px; cursor:pointer; }
+  .extra { display:flex; flex-direction:column; gap:8px; margin:-2px 0 8px; }
+  .extra input { width:100%; box-sizing:border-box; padding:8px 10px; border:1px solid #444; border-radius:8px; background:#1a1a1a; color:#eee; }
   .sw { width:40px; height:22px; border-radius:11px; background:#555; position:relative; flex:none; }
   .sw.on { background:#4CAF50; }
   .sw i { width:18px; height:18px; border-radius:50%; background:#fff; position:absolute; top:2px; left:2px; }
@@ -984,6 +1038,7 @@ let sending = false;
 let lastSentText = '';
 let lastSentAt = 0;
 const composeDrafts = {};
+const greetingDrafts = {};
 let formTab = '';
 const relayFile = document.createElement('input');
 relayFile.type = 'file';
@@ -999,6 +1054,7 @@ document.body.append(relayFile);
 const picUrls = {};
 let stickBottom = false;
 let showControls = false;
+let phoneOpen = false;
 let controlDraft = null;
 let avatarDraft = null;
 let userDraft = null;
@@ -1044,6 +1100,7 @@ function gate() {
 }
 
 function statusText(s) {
+  if (s.lobby) return '';
   if (s.status === 'left') return '對方已離開';
   if (s.waiting) return '等待連線';
   if (!s.canType) return '現在不能回';
@@ -1474,13 +1531,27 @@ function placeThread(s, follow, y) {
   stage.append(chip);
 }
 
+function topicOk(s) {
+  if (!s) return true;
+  if (s.length > 64) return false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s.charAt(i);
+    const ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch === '_' || ch === '-';
+    if (!ok) return false;
+  }
+  return true;
+}
+
 function packControls(c) {
   c = c || {};
   return {
     auto: !!c.auto,
     userFilter: !!c.userFilter,
     avatarFilter: !!c.avatarFilter,
-    browser: !!c.browser
+    browser: !!c.browser,
+    phone: !!c.phone,
+    phoneTopic: String(c.phoneTopic || '').trim(),
+    phoneTitle: String(c.phoneTitle || '').trim().slice(0, 80) || 'Knock 新訊息'
   };
 }
 
@@ -1493,6 +1564,7 @@ function shownControls() {
 function postControls(next) {
   if (!current) return;
   const packed = packControls(next);
+  if (!topicOk(packed.phoneTopic)) { alert('主題只接受英文、數字、底線和減號'); return; }
   const tabId = current;
   controlDraft = { tabId: tabId, controls: packed };
   paint();
@@ -1522,6 +1594,14 @@ function controlRow(label, on, onToggle) {
   return row;
 }
 
+function fieldInput(value, placeholder) {
+  const input = document.createElement('input');
+  input.value = value || '';
+  input.placeholder = placeholder || '';
+  input.onkeydown = (e) => e.stopPropagation();
+  return input;
+}
+
 function paintControls() {
   app.replaceChildren();
   clearForm();
@@ -1543,7 +1623,19 @@ function paintControls() {
   avatarRow.onclick = () => flip('avatarFilter');
   const browserRow = controlRow('瀏覽器通知', c.browser, () => flip('browser'));
   browserRow.onclick = () => flip('browser');
-  app.append(autoRow, userRow, avatarRow, browserRow);
+  const phoneRow = controlRow('手機通知', c.phone, () => flip('phone'));
+  phoneRow.onclick = () => { phoneOpen = !phoneOpen; paint(); };
+  app.append(autoRow, userRow, avatarRow, browserRow, phoneRow);
+  if (phoneOpen) {
+    const extra = document.createElement('div');
+    extra.className = 'extra';
+    const topic = fieldInput(c.phoneTopic, 'ntfy 主題');
+    topic.onchange = () => postControls(Object.assign({}, c, { phoneTopic: topic.value }));
+    const title = fieldInput(c.phoneTitle, 'Knock 新訊息');
+    title.onchange = () => postControls(Object.assign({}, c, { phoneTitle: title.value }));
+    extra.append(topic, title);
+    app.append(extra);
+  }
 }
 
 function openingClock(ms) {
@@ -1695,13 +1787,17 @@ function paint() {
   if (focused && current) {
     const s = sessions.find(x => x.tabId === current);
     paintThread(s, follow, y);
+    if (s && s.lobby) return;
     const input = document.querySelector('form input');
     if (input) input.disabled = !canSend(s);
     document.querySelectorAll('form button').forEach(btn => { btn.disabled = sending || !canSend(s); });
     return;
   }
   const keepInput = document.querySelector('form input:not([type=file])');
-  if (keepInput && formTab) composeDrafts[formTab] = keepInput.value;
+  if (keepInput && formTab) {
+    if (keepInput.dataset.kind === 'greeting') greetingDrafts[formTab] = keepInput.value;
+    else composeDrafts[formTab] = keepInput.value;
+  }
   const draft = composeDrafts[current] || '';
   if (!current) {
     paintBar('Knock 遠端');
@@ -1717,6 +1813,45 @@ function paint() {
   const s = sessions.find(x => x.tabId === current);
   paintThread(s, follow, y);
   if (!s) return;
+  if (s.lobby) {
+    const form = document.createElement('form');
+    const input = document.createElement('input');
+    input.maxLength = 200;
+    input.placeholder = '發語詞';
+    input.dataset.kind = 'greeting';
+    input.value = greetingDrafts[s.tabId] != null ? greetingDrafts[s.tabId] : (s.greeting || '');
+    const saveBtn = document.createElement('button');
+    saveBtn.type = 'submit';
+    saveBtn.textContent = '設定';
+    const startBtn = document.createElement('button');
+    startBtn.type = 'button';
+    startBtn.textContent = '開始';
+    startBtn.title = '開始聊天';
+    form.append(input, saveBtn, startBtn);
+    form.onsubmit = (e) => {
+      e.preventDefault();
+      const text = input.value.trim();
+      if (!text || text === (s.greeting || '')) return;
+      greetingDrafts[s.tabId] = text;
+      api('/api/sessions/' + encodeURIComponent(s.tabId) + '/greeting', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: text })
+      }).catch(err => alert(err.message || '設定失敗'));
+    };
+    startBtn.onclick = () => {
+      api('/api/sessions/' + encodeURIComponent(s.tabId) + '/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}'
+      }).catch(err => alert(err.message || '開始失敗'));
+    };
+    stage.append(form);
+    formTab = s.tabId;
+    if (keepInput && document.activeElement === keepInput) input.focus();
+    if (follow) scrollBottom();
+    return;
+  }
   const form = document.createElement('form');
   const input = document.createElement('input');
   input.maxLength = 2000;
@@ -1963,10 +2098,12 @@ function main() {
                 const patch = takeControlPatch(session);
                 const avatarPatch = takeAvatarPatch(session);
                 const userPatch = takeUserPatch(session);
-                if (outbox.dirty || patch.dirty || avatarPatch.dirty || userPatch.dirty) saveSessions(sessions);
+                const greetingPatch = takeGreetingPatch(session);
+                const startPatch = takeStartPatch(session);
+                if (outbox.dirty || patch.dirty || avatarPatch.dirty || userPatch.dirty || greetingPatch.dirty || startPatch.dirty) saveSessions(sessions);
                 const talkUid = cleanUid(body && body.archive && body.archive.uid);
                 const savedTalk = talkUid ? talks.get(talkUid) : null;
-                return send(res, 200, { ok: true, outbox: outbox.pending, controls: patch.controls, avatarOn: avatarPatch.avatarOn, userOn: userPatch.userOn, filters, talkTitle: savedTalk ? savedTalk.title : '' });
+                return send(res, 200, { ok: true, outbox: outbox.pending, controls: patch.controls, avatarOn: avatarPatch.avatarOn, userOn: userPatch.userOn, greeting: greetingPatch.greeting, start: startPatch.start, filters, talkTitle: savedTalk ? savedTalk.title : '' });
             }
             const imgMatch = url.pathname.match(/^\/api\/images\/([a-z0-9]{8,40})$/);
             if (imgMatch && req.method === 'GET') {
@@ -1997,6 +2134,28 @@ function main() {
                 if (!item) return send(res, 400, { error: 'empty' });
                 saveSessions(sessions);
                 return send(res, 200, { ok: true, id: item.id });
+            }
+            const greetPost = url.pathname.match(/^\/api\/sessions\/([a-z0-9]{8,40})\/greeting$/);
+            if (req.method === 'POST' && greetPost) {
+                const session = sessions.get(greetPost[1]);
+                if (!session) return send(res, 404, { error: 'gone' });
+                const body = await readBody(req);
+                const text = String(body && body.text || '').trim().slice(0, 200);
+                if (!text) return send(res, 400, { error: 'empty' });
+                session.greetingWanted = text;
+                touch();
+                saveSessions(sessions);
+                return send(res, 200, { ok: true });
+            }
+            const startPost = url.pathname.match(/^\/api\/sessions\/([a-z0-9]{8,40})\/start$/);
+            if (req.method === 'POST' && startPost) {
+                const session = sessions.get(startPost[1]);
+                if (!session) return send(res, 404, { error: 'gone' });
+                if (!session.lobby) return send(res, 409, { error: 'cannot start' });
+                session.startWanted = true;
+                touch();
+                saveSessions(sessions);
+                return send(res, 200, { ok: true });
             }
             const sendMatch = url.pathname.match(/^\/api\/sessions\/([a-z0-9]{8,40})\/send$/);
             if (req.method === 'POST' && sendMatch) {

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.81
+// @version      1.4.83
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -14,6 +14,7 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_notification
 // @connect      knock.bency.org
+// @connect      ntfy.sh
 // @connect      *
 // ==/UserScript==
 
@@ -36,6 +37,11 @@
     const AVATAR_FILTER_KEY = 'knockAvatarFilters';
     const AVATAR_FILTER_ENABLED_KEY = 'knockAvatarFilterEnabled';
     const BROWSER_NOTIFY_ENABLED_KEY = 'knockBrowserNotifyEnabled';
+    const NTFY_ENABLED_KEY = 'knockNtfyEnabled';
+    const NTFY_TOPIC_KEY = 'knockNtfyTopic';
+    const NTFY_TITLE_KEY = 'knockNtfyTitle';
+    const NTFY_TITLE_DEFAULT = 'Knock 新訊息';
+    const NTFY_SERVER = 'https://ntfy.sh';
     const RELAY_URL = 'https://knock.bency.org';
     const RELAY_TOKEN_KEY = 'knockRelayToken';
     const RELAY_TAB_KEY = 'knockRelayTabId';
@@ -120,6 +126,7 @@
     let firstFilterEnabled = storedOn(FIRST_FILTER_ENABLED_KEY, true);
     let avatarFilterEnabled = storedOn(AVATAR_FILTER_ENABLED_KEY, true);
     let browserNotifyEnabled = storedOn(BROWSER_NOTIFY_ENABLED_KEY, true);
+    let ntfyEnabled = storedOn(NTFY_ENABLED_KEY, true);
 
     const checkedMessages = new Set();
     let myAvatarUrl = null;
@@ -127,6 +134,8 @@
     let nameSet = false;
     let relayRecordUser = false;
     let relayRecordAvatar = false;
+    let pendingRemoteStart = false;
+    let greetingSaveAt = 0;
     let notificationsArmed = false;
     let pendingForcedLeave = false;
     let forceAutoUntilIdle = false;
@@ -1401,10 +1410,91 @@
         showToast(`送不出通知（${perm}）。請允許 Tampermonkey 與 Chrome 的通知權限`);
     }
 
+    function getNtfyTopic() {
+        return (localStorage.getItem(NTFY_TOPIC_KEY) || '').trim();
+    }
+
+    function setNtfyTopic(topic) {
+        const t = (topic || '').trim();
+        if (!t) {
+            localStorage.removeItem(NTFY_TOPIC_KEY);
+            return '';
+        }
+        if (!/^[A-Za-z0-9_-]{1,64}$/.test(t)) return null;
+        localStorage.setItem(NTFY_TOPIC_KEY, t);
+        return t;
+    }
+
+    function getNtfyTitle() {
+        return (localStorage.getItem(NTFY_TITLE_KEY) || '').trim() || NTFY_TITLE_DEFAULT;
+    }
+
+    function setNtfyTitle(title) {
+        const t = (title || '').trim().slice(0, 80);
+        if (!t) {
+            localStorage.removeItem(NTFY_TITLE_KEY);
+            return NTFY_TITLE_DEFAULT;
+        }
+        localStorage.setItem(NTFY_TITLE_KEY, t);
+        return t;
+    }
+
+    let lastNtfyAt = 0;
+    let ntfyBackoffUntil = 0;
+
+    function ntfyStatusDetail(status) {
+        if (status === 429) return 'HTTP 429：ntfy.sh 公開伺服器限流，請隔一分鐘再試';
+        return `HTTP ${status}`;
+    }
+
+    function sendNtfy(body, title) {
+        return new Promise((resolve) => {
+            const topic = getNtfyTopic();
+            if (!topic) {
+                resolve({ ok: false, detail: '尚未設定主題' });
+                return;
+            }
+            if (Date.now() < ntfyBackoffUntil) {
+                resolve({ ok: false, detail: 'HTTP 429：還在冷卻，請稍候再送' });
+                return;
+            }
+            const data = JSON.stringify({
+                topic,
+                title: title || getNtfyTitle(),
+                message: body || '你有一則新訊息'
+            });
+            const finish = (ok, detail, status) => {
+                if (status === 429) ntfyBackoffUntil = Date.now() + 60000;
+                if (ok) lastNtfyAt = Date.now();
+                resolve({ ok, detail });
+            };
+            const xhr = (typeof GM !== 'undefined' && GM.xmlHttpRequest)
+                || (typeof GM_xmlhttpRequest === 'function' && GM_xmlhttpRequest);
+            if (xhr) {
+                xhr({
+                    method: 'POST',
+                    url: `${NTFY_SERVER}/`,
+                    headers: { 'Content-Type': 'application/json' },
+                    data,
+                    onload: (r) => finish(r.status >= 200 && r.status < 300, ntfyStatusDetail(r.status), r.status),
+                    onerror: () => finish(false, '連線失敗：請允許腳本存取 ntfy.sh')
+                });
+                return;
+            }
+            fetch(`${NTFY_SERVER}/`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: data
+            }).then((r) => finish(r.ok, ntfyStatusDetail(r.status), r.status))
+                .catch((e) => finish(false, e.message || 'fetch 被網頁擋住'));
+        });
+    }
+
     function notifyNewMessage(text) {
-        if (!notificationsArmed || !browserNotifyEnabled || (document.hasFocus() && !document.hidden)) return;
+        if (!notificationsArmed || (document.hasFocus() && !document.hidden)) return;
         const body = (text || '你有一則新訊息').replace(/\s+/g, ' ').trim().slice(0, 80) || '你有一則新訊息';
-        showBrowserNotification(body);
+        if (ntfyEnabled && Date.now() - lastNtfyAt > 15000) sendNtfy(body);
+        if (browserNotifyEnabled) showBrowserNotification(body);
     }
 
     function checkNewMessages() {
@@ -1778,6 +1868,69 @@
         };
     }
 
+    function lobbyGreeting() {
+        for (const el of document.querySelectorAll('[data-test="message"]')) {
+            if (el.closest('ul[data-test="messages"]')) continue;
+            const text = (el.textContent || '').trim();
+            if (text) return text.slice(0, 200);
+        }
+        return '';
+    }
+
+    function openProfileCard() {
+        for (const el of document.querySelectorAll('span')) {
+            if (el.textContent.trim() !== '你的匿名身分') continue;
+            let node = el;
+            for (let i = 0; i < 6 && node; i++, node = node.parentElement) {
+                if (node.querySelector('[data-test="message"]')) {
+                    node.click();
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // 發語詞是個人簡介。點身分卡、再點簡介的編輯、填進「變更簡介」後按確定。一次只走一步。
+    function stepGreeting(want) {
+        const text = String(want || '').trim().slice(0, 200);
+        if (!text || lobbyGreeting() === text) return;
+        if (Date.now() - greetingSaveAt < 2500 && !document.querySelector('[role="dialog"]')) return;
+        const title = document.getElementById('form-dialog-title');
+        if (title && title.textContent.trim() === '變更簡介') {
+            const dialog = title.closest('[role="dialog"]');
+            const box = dialog && dialog.querySelector('textarea, input');
+            if (box && box.value.trim() !== text) fillReactInput(box, text);
+            const ok = dialog && Array.from(dialog.querySelectorAll('button')).find(b => b.textContent.trim() === '確定' && !b.disabled);
+            if (ok) {
+                ok.click();
+                greetingSaveAt = Date.now();
+            }
+            return;
+        }
+        const dialog = document.querySelector('[role="dialog"]');
+        if (dialog && dialog.textContent.includes('大頭貼照')) {
+            const edits = Array.from(dialog.querySelectorAll('button[aria-label="edit"]'));
+            const edit = edits[edits.length - 1];
+            if (edit) edit.click();
+            return;
+        }
+        if (dialog) return;
+        openProfileCard();
+    }
+
+    function applyRemoteLobby(data) {
+        if (typeof data.greeting === 'string') stepGreeting(data.greeting);
+        if (data.start) pendingRemoteStart = true;
+        if (!pendingRemoteStart || document.querySelector('[role="dialog"]')) return;
+        if (typeof data.greeting === 'string' && lobbyGreeting() !== data.greeting.trim()) return;
+        const btn = findButtons().find(isStartChatButton);
+        if (!btn || btn.disabled) return;
+        pendingRemoteStart = false;
+        simulateMouseClick(btn);
+        initNewConversation();
+    }
+
     function relaySnapshot() {
         const list = document.querySelector('ul[data-test="messages"]');
         if (!list) return null;
@@ -1810,6 +1963,8 @@
             channelId: currentConversation.id || '',
             title: currentPartnerName() || '未命名',
             canType,
+            lobby: findButtons().some(isStartChatButton),
+            greeting: findButtons().some(isStartChatButton) ? lobbyGreeting() : '',
             status: left ? 'left' : 'live',
             messages: messages.slice(-40),
             openings: relayOpenings(),
@@ -1957,16 +2112,23 @@
             auto: autoClickEnabled,
             userFilter: firstFilterEnabled,
             avatarFilter: avatarFilterEnabled,
-            browser: browserNotifyEnabled
+            browser: browserNotifyEnabled,
+            phone: ntfyEnabled,
+            phoneTopic: getNtfyTopic(),
+            phoneTitle: getNtfyTitle()
         };
     }
 
     function relayControlsMatch(cur, next) {
         if (!cur || !next) return false;
+        const title = String(next.phoneTitle || '').trim() || 'Knock 新訊息';
         return !!next.auto === !!cur.auto
             && !!next.userFilter === !!cur.userFilter
             && !!next.avatarFilter === !!cur.avatarFilter
-            && !!next.browser === !!cur.browser;
+            && !!next.browser === !!cur.browser
+            && !!next.phone === !!cur.phone
+            && String(next.phoneTopic || '').trim() === String(cur.phoneTopic || '')
+            && title === (String(cur.phoneTitle || '').trim() || 'Knock 新訊息');
     }
 
     function applyRelayControls(c) {
@@ -1980,6 +2142,10 @@
         browserNotifyEnabled = !!c.browser;
         localStorage.setItem(BROWSER_NOTIFY_ENABLED_KEY, String(browserNotifyEnabled));
         if (browserNotifyEnabled) requestNotifyPermission();
+        ntfyEnabled = !!c.phone;
+        localStorage.setItem(NTFY_ENABLED_KEY, String(ntfyEnabled));
+        if (typeof c.phoneTopic === 'string') setNtfyTopic(c.phoneTopic);
+        if (typeof c.phoneTitle === 'string') setNtfyTitle(c.phoneTitle);
         const dock = el('knock-dock');
         if (dock) {
             dock.remove();
@@ -2289,6 +2455,7 @@
                 currentConversation.label = String(data.talkTitle).slice(0, 40);
                 paintPartnerCaption();
             }
+            applyRemoteLobby(data);
             if (data.filters) applyServerFilters(data.filters);
             if (data.controls) applyRelayControls(data.controls);
             if (typeof data.avatarOn === 'boolean') {
@@ -2628,8 +2795,11 @@
             || relayImagePlan('new', imageDone, true) !== 'send') {
             console.error('knock: 遠端圖片只送一次失敗');
         }
-        const ctrl = { auto: true, userFilter: true, avatarFilter: false, browser: true };
-        if (!relayControlsMatch(ctrl, ctrl) || relayControlsMatch(ctrl, Object.assign({}, ctrl, { browser: false }))) {
+        const ctrl = { auto: true, userFilter: true, avatarFilter: false, browser: true, phone: true, phoneTopic: 'abc', phoneTitle: 'Knock 新訊息' };
+        if (!relayControlsMatch(ctrl, ctrl)
+            || relayControlsMatch(ctrl, Object.assign({}, ctrl, { browser: false }))
+            || relayControlsMatch(ctrl, Object.assign({}, ctrl, { phone: false }))
+            || relayControlsMatch(ctrl, Object.assign({}, ctrl, { phoneTopic: 'other' }))) {
             console.error('knock: 遠端控制比對失敗');
         }
         if (cooldownReasonText('firstFilter', '阿明') !== '開始聊天 · 過濾了 阿明'
