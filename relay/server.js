@@ -610,7 +610,7 @@ function selfCheck() {
     }
     const ordered = new Map();
     rememberTalk(ordered, { archive: { uid: 'user_two', title: '舊', messages: [{ id: 'oldmsg1', text: '早', time: '1/2 08:00' }] } }, 1);
-    rememberTalk(ordered, { archive: { uid: 'user_new1', title: '新', messages: [{ id: 'newmsg1', text: '晚', time: '10/6 01:02' }] } }, 2);
+    rememberTalk(ordered, { archive: { uid: 'user_new1', title: '新', messages: [{ id: 'newmsg1', text: '晚', time: '1/3 09:00' }] } }, 2);
     const order = visibleTalks(ordered);
     if (order[0].uid !== 'user_new1' || order[1].uid !== 'user_two' || !(order[0].lastAt > order[1].lastAt)) {
         throw new Error('knock relay 檢查失敗');
@@ -882,6 +882,19 @@ const droppedTalks = new Set();
 let sending = false;
 let lastSentText = '';
 let lastSentAt = 0;
+const composeDrafts = {};
+let formTab = '';
+const relayFile = document.createElement('input');
+relayFile.type = 'file';
+relayFile.accept = 'image/png,image/jpeg,image/gif,image/heic,image/heif';
+relayFile.hidden = true;
+relayFile.onchange = () => {
+  const chosen = relayFile.files && relayFile.files[0];
+  relayFile.value = '';
+  const room = sessions.find(x => x.tabId === current);
+  if (chosen && room) sendImage(room, chosen);
+};
+document.body.append(relayFile);
 const picUrls = {};
 let stickBottom = false;
 let showControls = false;
@@ -1631,8 +1644,9 @@ function paint() {
     document.querySelectorAll('form button').forEach(btn => { btn.disabled = sending || !canSend(s); });
     return;
   }
-  const keepInput = document.querySelector('form input');
-  const draft = keepInput && document.activeElement === keepInput ? keepInput.value : '';
+  const keepInput = document.querySelector('form input:not([type=file])');
+  if (keepInput && formTab) composeDrafts[formTab] = keepInput.value;
+  const draft = composeDrafts[current] || '';
   if (!current) {
     paintBar('Knock 遠端');
     app.replaceChildren();
@@ -1663,6 +1677,7 @@ function paint() {
     if (!text || !canSend(s) || sending) return;
     if (text === lastSentText && Date.now() - lastSentAt < 2000) {
       input.value = '';
+      composeDrafts[s.tabId] = '';
       return;
     }
     sending = true;
@@ -1673,6 +1688,7 @@ function paint() {
       body: JSON.stringify({ text })
     }).then(() => {
       input.value = '';
+      composeDrafts[s.tabId] = '';
       lastSentText = text;
       lastSentAt = Date.now();
     }).catch(err => { alert(err.message); }).finally(() => {
@@ -1680,23 +1696,16 @@ function paint() {
       document.querySelectorAll('form button').forEach(btn => { btn.disabled = !canSend(s); });
     });
   };
-  const file = document.createElement('input');
-  file.type = 'file';
-  file.accept = 'image/png,image/jpeg,image/gif';
   const pick = document.createElement('button');
   pick.type = 'button';
   pick.className = 'pick';
   pick.textContent = '圖片';
   pick.disabled = sending || !canSend(s);
-  pick.onclick = () => file.click();
-  file.onchange = () => {
-    const chosen = file.files && file.files[0];
-    file.value = '';
-    if (chosen) sendImage(s, chosen);
-  };
-  form.append(file, pick);
+  pick.onclick = () => relayFile.click();
+  form.append(pick);
   stage.append(form);
-  if (draft) input.focus();
+  formTab = s.tabId;
+  if (keepInput && document.activeElement === keepInput) input.focus();
   if (follow) scrollBottom();
 }
 
@@ -1731,23 +1740,26 @@ function showPic(id, img) {
 }
 
 function shrinkFile(file) {
-  if (file.type === 'image/gif') {
+  const type = file.type || '';
+  if (type === 'image/gif') {
     if (file.size > 1200000) return Promise.reject(new Error('GIF 太大'));
     return Promise.resolve(file);
   }
-  if (file.type !== 'image/jpeg' && file.type !== 'image/png' && file.type !== 'image/jpg') {
-    return Promise.reject(new Error('只收 png、jpeg、gif'));
-  }
-  if (file.size <= 400000) return Promise.resolve(file);
-  return createImageBitmap(file).then(bitmap => new Promise(resolve => {
+  const plain = type === 'image/jpeg' || type === 'image/jpg' || type === 'image/png';
+  if (plain && file.size <= 400000) return Promise.resolve(file);
+  if (type && type.indexOf('image/') !== 0) return Promise.reject(new Error('只收圖片'));
+  return createImageBitmap(file).then(bitmap => new Promise((resolve, reject) => {
     const scale = Math.min(1, 960 / bitmap.width);
     const canvas = document.createElement('canvas');
     canvas.width = Math.max(1, Math.round(bitmap.width * scale));
     canvas.height = Math.max(1, Math.round(bitmap.height * scale));
     canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
     if (bitmap.close) bitmap.close();
-    canvas.toBlob(blob => resolve(blob ? new File([blob], 'relay.jpg', { type: 'image/jpeg' }) : file), 'image/jpeg', 0.8);
-  }));
+    canvas.toBlob(blob => {
+      if (!blob) reject(new Error('圖片無法讀取'));
+      else resolve(new File([blob], 'relay.jpg', { type: 'image/jpeg' }));
+    }, 'image/jpeg', 0.8);
+  })).catch(() => Promise.reject(new Error('圖片無法讀取')));
 }
 
 function sendImage(s, file) {
