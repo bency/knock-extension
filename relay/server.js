@@ -372,8 +372,8 @@ function applyHeartbeat(sessions, body, now) {
         openings: body.openings
             ? cleanOpenings(body.openings, sameChannel ? prev.openings : null, now)
             : (sameChannel && prev && prev.openings) || null,
-        avatarWanted: prev && typeof prev.avatarWanted === 'boolean' ? prev.avatarWanted : null,
-        userWanted: prev && typeof prev.userWanted === 'boolean' ? prev.userWanted : null,
+        avatarWanted: sameChannel && prev && typeof prev.avatarWanted === 'boolean' ? prev.avatarWanted : null,
+        userWanted: sameChannel && prev && typeof prev.userWanted === 'boolean' ? prev.userWanted : null,
         controls: cleanControls(body.controls) || (prev && prev.controls) || null,
         controlWanted: prev ? prev.controlWanted : null,
         outbox: prev ? prev.outbox : []
@@ -608,6 +608,22 @@ function selfCheck() {
         || cleanOpenings({ them: '嗨', avatar: 'https://firebasestorage.googleapis.com/v0/b/knocktalk-prod.appspot.com/o/users-common%2Favatars%2Fmale-user.svg?alt=media' }, null, 1).avatar
         || cleanOpenings({ them: '嗨', avatar: 'plain' }, null, 1).avatar !== 'plain'
         || cleanOpenings({ them: '' }, null, 1)) {
+        throw new Error('knock relay 檢查失敗');
+    }
+    sessions.get('abc12345').avatarWanted = true;
+    sessions.get('abc12345').userWanted = true;
+    const keptMark = applyHeartbeat(sessions, {
+        tabId: 'abc12345', title: '阿明', canType: true, channelId: 'c2',
+        messages: [{ id: 'm1', text: '嗨', mine: false }],
+        openings: { them: '嗨', avatarOn: false, userOn: false }
+    }, 15000);
+    const droppedMark = applyHeartbeat(sessions, {
+        tabId: 'abc12345', title: '阿明', canType: true, channelId: 'c3',
+        messages: [{ id: 'm1', text: '嗨', mine: false }],
+        openings: { them: '嗨', avatarOn: false, userOn: false }
+    }, 16000);
+    if (!keptMark || keptMark.avatarWanted !== true || keptMark.userWanted !== true
+        || !droppedMark || droppedMark.avatarWanted !== null || droppedMark.userWanted !== null) {
         throw new Error('knock relay 檢查失敗');
     }
     const talks = new Map();
@@ -927,8 +943,9 @@ const PAGE = `<!DOCTYPE html>
   svg.face { display:block; fill:#9a9a9a; }
   .open { display:flex; gap:12px; align-items:center; margin:0 0 12px; }
   .open .face { width:64px; height:64px; }
-  .group { margin-left:auto; flex:none; display:flex; width:calc((100% - 76px) / 4); }
-  .group button { flex:1; min-width:0; padding:6px 2px; border:1px solid #666; background:transparent; color:#eee; cursor:pointer; font-size:12px; white-space:nowrap; }
+  .group { margin-left:auto; flex:none; display:flex; }
+  .group button { width:36px; height:36px; padding:0; border:1px solid #666; background:transparent; color:#eee; cursor:pointer; display:flex; align-items:center; justify-content:center; }
+  .group button svg { width:18px; height:18px; display:block; }
   .group button.on { background:#e53935; color:#fff; border-color:#e53935; }
   .group button:first-child { border-radius:8px 0 0 8px; }
   .group button:last-child { border-radius:0 8px 8px 0; }
@@ -1079,6 +1096,17 @@ function loadArchive(uid) {
   }).catch(() => {}).finally(() => {
     if (archiveLoading === uid) archiveLoading = '';
   });
+}
+
+function glyph(d) {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('aria-hidden', 'true');
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('fill', 'currentColor');
+  path.setAttribute('d', d);
+  svg.append(path);
+  return svg;
 }
 
 function barsIcon() {
@@ -1527,7 +1555,7 @@ function openingClock(ms) {
 
 function postAvatar(s, on) {
   if (!s || !s.openings) return;
-  avatarDraft = { tabId: s.tabId, on: !!on };
+  avatarDraft = { tabId: s.tabId, channelId: s.channelId, on: !!on };
   paint();
   api('/api/sessions/' + encodeURIComponent(s.tabId) + '/avatar', {
     method: 'POST',
@@ -1538,7 +1566,7 @@ function postAvatar(s, on) {
 
 function postUser(s, on) {
   if (!s || !s.openings) return;
-  userDraft = { tabId: s.tabId, on: !!on };
+  userDraft = { tabId: s.tabId, channelId: s.channelId, on: !!on };
   paint();
   api('/api/sessions/' + encodeURIComponent(s.tabId) + '/user', {
     method: 'POST',
@@ -1550,8 +1578,8 @@ function postUser(s, on) {
 function shownOpenings(s) {
   let o = s && s.openings;
   if (!o) return null;
-  if (avatarDraft && avatarDraft.tabId === s.tabId) o = Object.assign({}, o, { avatarOn: avatarDraft.on });
-  if (userDraft && userDraft.tabId === s.tabId) o = Object.assign({}, o, { userOn: userDraft.on });
+  if (avatarDraft && avatarDraft.tabId === s.tabId && avatarDraft.channelId === s.channelId) o = Object.assign({}, o, { avatarOn: avatarDraft.on });
+  if (userDraft && userDraft.tabId === s.tabId && userDraft.channelId === s.channelId) o = Object.assign({}, o, { userOn: userDraft.on });
   return o;
 }
 
@@ -1603,14 +1631,18 @@ function paintOpening(s) {
   if (o.avatar) {
     const row = document.createElement('button');
     row.type = 'button';
-    row.textContent = '過濾大頭貼';
+    row.title = '記錄這張大頭貼';
+    row.setAttribute('aria-label', '記錄這張大頭貼');
+    row.append(glyph('M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z'));
     if (o.avatarOn) row.className = 'on';
     row.onclick = () => postAvatar(s, !o.avatarOn);
     toggles.append(row);
   }
   const userRow = document.createElement('button');
   userRow.type = 'button';
-  userRow.textContent = '過濾使用者';
+  userRow.title = '記錄這位使用者';
+  userRow.setAttribute('aria-label', '記錄這位使用者');
+  userRow.append(glyph('M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z'));
   if (o.userOn) userRow.className = 'on';
   userRow.onclick = () => postUser(s, !o.userOn);
   toggles.append(userRow);
@@ -1825,11 +1857,13 @@ async function tick() {
     }
     if (avatarDraft) {
       const hit = sessions.find(s => s.tabId === avatarDraft.tabId);
-      if (hit && hit.openings && !!hit.openings.avatarOn === avatarDraft.on) avatarDraft = null;
+      if (!hit || hit.channelId !== avatarDraft.channelId) avatarDraft = null;
+      else if (hit.openings && !!hit.openings.avatarOn === avatarDraft.on) avatarDraft = null;
     }
     if (userDraft) {
       const hit = sessions.find(s => s.tabId === userDraft.tabId);
-      if (hit && hit.openings && !!hit.openings.userOn === userDraft.on) userDraft = null;
+      if (!hit || hit.channelId !== userDraft.channelId) userDraft = null;
+      else if (hit.openings && !!hit.openings.userOn === userDraft.on) userDraft = null;
     }
     paint();
   } catch (e) {

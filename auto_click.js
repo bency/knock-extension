@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.80
+// @version      1.4.81
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -125,6 +125,8 @@
     let myAvatarUrl = null;
     let currentConversation = emptyConversation();
     let nameSet = false;
+    let relayRecordUser = false;
+    let relayRecordAvatar = false;
     let notificationsArmed = false;
     let pendingForcedLeave = false;
     let forceAutoUntilIdle = false;
@@ -167,8 +169,14 @@
         return id;
     }
 
+    function clearRelayRecord() {
+        relayRecordUser = false;
+        relayRecordAvatar = false;
+    }
+
     function bindChannel(id) {
         if (!id || currentConversation.id === id) return;
+        clearRelayRecord();
         if (isChannelId(currentConversation.id)) initNewConversation();
         currentConversation.id = id;
         if (!currentConversation.startTime) currentConversation.startTime = new Date().toISOString();
@@ -208,6 +216,7 @@
             id: newConvId(),
             startTime: new Date().toISOString()
         };
+        clearRelayRecord();
         pendingForcedLeave = false;
         forceAutoUntilIdle = false;
         lastExitClickAt = 0;
@@ -1764,8 +1773,8 @@
             them,
             mine,
             avatar,
-            avatarOn: !!(avatarUrl && isAvatarFiltered(avatarUrl)),
-            userOn: !!(uid && isFirstMessageFiltered(uid, filterKey, avatarHash))
+            avatarOn: relayRecordAvatar,
+            userOn: relayRecordUser
         };
     }
 
@@ -2283,11 +2292,13 @@
             if (data.filters) applyServerFilters(data.filters);
             if (data.controls) applyRelayControls(data.controls);
             if (typeof data.avatarOn === 'boolean') {
+                relayRecordAvatar = data.avatarOn;
                 const first = findFirstOtherMessage();
                 const url = first && first.avatarUrl;
                 if (url && isAvatarFiltered(url) !== data.avatarOn) toggleAvatarFilter(url);
             }
             if (typeof data.userOn === 'boolean') {
+                relayRecordUser = data.userOn;
                 const first = findFirstOtherMessage();
                 if (first && first.uid && isFirstMessageFiltered(first.uid, first.filterKey, first.avatarHash) !== data.userOn) {
                     toggleFirstMessageFilter(first.uid, first.filterKey, first.avatarHash);
