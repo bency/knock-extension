@@ -380,6 +380,7 @@ function applyHeartbeat(sessions, body, now) {
         userWanted: sameChannel && prev && typeof prev.userWanted === 'boolean' ? prev.userWanted : null,
         controls: cleanControls(body.controls) || (prev && prev.controls) || null,
         controlWanted: prev ? prev.controlWanted : null,
+        notifyWanted: prev && typeof prev.notifyWanted === 'string' ? prev.notifyWanted : null,
         outbox: prev ? prev.outbox : []
     };
     sessions.set(tabId, session);
@@ -559,6 +560,28 @@ function takeStartPatch(session) {
     return { start: true, dirty: true };
 }
 
+function latestThemText(session) {
+    const list = session && session.messages || [];
+    for (let i = list.length - 1; i >= 0; i--) {
+        const m = list[i];
+        if (!m || m.mine) continue;
+        const text = String(m.text || '').trim();
+        if (text) return text.slice(0, 80);
+        if (m.image) return '圖片';
+        const quote = String(m.quote || '').trim();
+        if (quote) return quote.slice(0, 80);
+    }
+    const opening = session && session.openings && session.openings.them && session.openings.them.text;
+    return String(opening || '').trim().slice(0, 80);
+}
+
+function takeNotifyPatch(session) {
+    if (typeof session.notifyWanted !== 'string' || !session.notifyWanted) return { notify: null, dirty: false };
+    const notify = session.notifyWanted;
+    session.notifyWanted = null;
+    return { notify, dirty: true };
+}
+
 function enqueue(session, text, now, image) {
     const item = {
         id: crypto.randomBytes(8).toString('hex'),
@@ -674,6 +697,16 @@ function selfCheck() {
         || greet.greeting !== '在嗎' || !started.start || lobby.startWanted
         || greetDone.greeting !== null || lobby.greetingWanted !== null
         || !leftLobby || leftLobby.startWanted || leftLobby.greeting !== '在嗎') {
+        throw new Error('knock relay 檢查失敗');
+    }
+    const noted = applyHeartbeat(sessions, {
+        tabId: 'abc12345', title: '阿明', canType: true,
+        messages: [{ id: 'mine1', text: '我的', mine: true }, { id: 'them1', text: '對方這句', mine: false }]
+    }, 19000);
+    noted.notifyWanted = latestThemText(noted);
+    const once = takeNotifyPatch(noted);
+    if (latestThemText(noted) !== '對方這句' || !heartbeatReady({ notifyWanted: '對方這句', outbox: [] })
+        || once.notify !== '對方這句' || takeNotifyPatch(noted).notify) {
         throw new Error('knock relay 檢查失敗');
     }
     const talks = new Map();
@@ -828,6 +861,7 @@ function heartbeatReady(session) {
     if (typeof session.userWanted === 'boolean' && session.userWanted !== userOn) return true;
     if (session.startWanted) return true;
     if (typeof session.greetingWanted === 'string' && session.greetingWanted !== session.greeting) return true;
+    if (typeof session.notifyWanted === 'string' && session.notifyWanted) return true;
     return false;
 }
 
@@ -1006,6 +1040,7 @@ const PAGE = `<!DOCTYPE html>
   .ctrl { display:flex; align-items:center; justify-content:space-between; gap:8px; width:100%; box-sizing:border-box; text-align:left; padding:10px 12px; margin:0 0 8px; background:#1c1c1c; border:1px solid #333; border-radius:10px; cursor:pointer; }
   .extra { display:flex; flex-direction:column; gap:8px; margin:-2px 0 8px; }
   .extra input { width:100%; box-sizing:border-box; padding:8px 10px; border:1px solid #444; border-radius:8px; background:#1a1a1a; color:#eee; }
+  .extra button { padding:8px 12px; border:none; border-radius:8px; background:#2d4a6d; color:#eee; cursor:pointer; }
   .sw { width:40px; height:22px; border-radius:11px; background:#555; position:relative; flex:none; }
   .sw.on { background:#4CAF50; }
   .sw i { width:18px; height:18px; border-radius:50%; background:#fff; position:absolute; top:2px; left:2px; }
@@ -1633,7 +1668,31 @@ function paintControls() {
     topic.onchange = () => postControls(Object.assign({}, c, { phoneTopic: topic.value }));
     const title = fieldInput(c.phoneTitle, 'Knock 新訊息');
     title.onchange = () => postControls(Object.assign({}, c, { phoneTitle: title.value }));
-    extra.append(topic, title);
+    const test = document.createElement('button');
+    test.type = 'button';
+    test.textContent = '測試';
+    test.onclick = () => {
+      const room = sessions.find(x => x.tabId === current);
+      if (!room) return;
+      const topicText = topic.value.trim();
+      if (!topicOk(topicText)) { alert('主題只接受英文、數字、底線和減號'); return; }
+      if (!topicText) { alert('請先設定主題'); return; }
+      const packed = packControls(Object.assign({}, c, { phoneTopic: topicText, phoneTitle: title.value }));
+      const sendTest = () => api('/api/sessions/' + encodeURIComponent(room.tabId) + '/notify-test', { method: 'POST' }).then(data => {
+        if (data && data.error) alert(data.error);
+      });
+      if (JSON.stringify(packed) === JSON.stringify(packControls(c))) {
+        sendTest().catch(err => alert(err.message || '測試失敗'));
+        return;
+      }
+      controlDraft = { tabId: room.tabId, controls: packed };
+      api('/api/sessions/' + encodeURIComponent(room.tabId) + '/controls', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(packed)
+      }).then(sendTest).catch(err => { controlDraft = null; alert(err.message || '測試失敗'); paint(); });
+    };
+    extra.append(topic, title, test);
     app.append(extra);
   }
 }
@@ -2100,10 +2159,11 @@ function main() {
                 const userPatch = takeUserPatch(session);
                 const greetingPatch = takeGreetingPatch(session);
                 const startPatch = takeStartPatch(session);
-                if (outbox.dirty || patch.dirty || avatarPatch.dirty || userPatch.dirty || greetingPatch.dirty || startPatch.dirty) saveSessions(sessions);
+                const notifyPatch = takeNotifyPatch(session);
+                if (outbox.dirty || patch.dirty || avatarPatch.dirty || userPatch.dirty || greetingPatch.dirty || startPatch.dirty || notifyPatch.dirty) saveSessions(sessions);
                 const talkUid = cleanUid(body && body.archive && body.archive.uid);
                 const savedTalk = talkUid ? talks.get(talkUid) : null;
-                return send(res, 200, { ok: true, outbox: outbox.pending, controls: patch.controls, avatarOn: avatarPatch.avatarOn, userOn: userPatch.userOn, greeting: greetingPatch.greeting, start: startPatch.start, filters, talkTitle: savedTalk ? savedTalk.title : '' });
+                return send(res, 200, { ok: true, outbox: outbox.pending, controls: patch.controls, avatarOn: avatarPatch.avatarOn, userOn: userPatch.userOn, greeting: greetingPatch.greeting, start: startPatch.start, notify: notifyPatch.notify, filters, talkTitle: savedTalk ? savedTalk.title : '' });
             }
             const imgMatch = url.pathname.match(/^\/api\/images\/([a-z0-9]{8,40})$/);
             if (imgMatch && req.method === 'GET') {
@@ -2153,6 +2213,17 @@ function main() {
                 if (!session) return send(res, 404, { error: 'gone' });
                 if (!session.lobby) return send(res, 409, { error: 'cannot start' });
                 session.startWanted = true;
+                touch();
+                saveSessions(sessions);
+                return send(res, 200, { ok: true });
+            }
+            const notifyPost = url.pathname.match(/^\/api\/sessions\/([a-z0-9]{8,40})\/notify-test$/);
+            if (req.method === 'POST' && notifyPost) {
+                const session = sessions.get(notifyPost[1]);
+                if (!session) return send(res, 404, { error: 'gone' });
+                const text = latestThemText(session);
+                if (!text) return send(res, 200, { ok: false, error: '對方還沒有訊息' });
+                session.notifyWanted = text;
                 touch();
                 saveSessions(sessions);
                 return send(res, 200, { ok: true });

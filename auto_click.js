@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.83
+// @version      1.4.84
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -2458,6 +2458,7 @@
             applyRemoteLobby(data);
             if (data.filters) applyServerFilters(data.filters);
             if (data.controls) applyRelayControls(data.controls);
+            if (typeof data.notify === 'string' && data.notify) sendNtfy(data.notify);
             if (typeof data.avatarOn === 'boolean') {
                 relayRecordAvatar = data.avatarOn;
                 const first = findFirstOtherMessage();
