@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.85
+// @version      1.4.86
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -46,7 +46,7 @@
     const RELAY_TOKEN_KEY = 'knockRelayToken';
     const RELAY_TAB_KEY = 'knockRelayTabId';
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.80';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.86';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -127,6 +127,13 @@
     let avatarFilterEnabled = storedOn(AVATAR_FILTER_ENABLED_KEY, true);
     let browserNotifyEnabled = storedOn(BROWSER_NOTIFY_ENABLED_KEY, true);
     let ntfyEnabled = storedOn(NTFY_ENABLED_KEY, true);
+    let keepAliveEnabled = false;
+    let keepAliveText = '';
+    let keepMin = 1.5;
+    let keepMax = 2.5;
+    let keepAliveWaitMs = 0;
+    let lastKeepAliveTryAt = 0;
+    let lastKeepAliveSentAt = 0;
 
     const checkedMessages = new Set();
     let myAvatarUrl = null;
@@ -226,6 +233,8 @@
             startTime: new Date().toISOString()
         };
         clearRelayRecord();
+        keepAliveWaitMs = 0;
+        lastKeepAliveSentAt = 0;
         pendingForcedLeave = false;
         forceAutoUntilIdle = false;
         lastExitClickAt = 0;
@@ -1797,6 +1806,73 @@
         return true;
     }
 
+    function keepRange(minVal, maxVal) {
+        let min = Number(minVal);
+        let max = Number(maxVal);
+        if (!(min >= 0.1)) min = 1.5;
+        if (!(max >= 0.1)) max = 2.5;
+        if (min > 48) min = 48;
+        if (max > 48) max = 48;
+        min = Math.round(min * 10) / 10;
+        max = Math.round(max * 10) / 10;
+        if (max < min) { const t = min; min = max; max = t; }
+        return { min, max };
+    }
+
+    function messageAtMs(date, timestamp, now = new Date()) {
+        const clock = clockMinutesOnly(timestamp);
+        if (clock == null) return 0;
+        const labeled = date && /^\d{4}-\d{2}-\d{2}$/.test(String(date)) ? String(date) : parseKnockDateLabel(timestamp, now);
+        const d = labeled
+            ? new Date(+labeled.slice(0, 4), +labeled.slice(5, 7) - 1, +labeled.slice(8, 10))
+            : new Date(now);
+        d.setHours(0, 0, 0, 0);
+        d.setMinutes(clock);
+        if (!labeled && d.getTime() > now.getTime() + 60000) d.setDate(d.getDate() - 1);
+        return d.getTime();
+    }
+
+    function lastChatAt() {
+        let latest = lastKeepAliveSentAt || 0;
+        for (const m of currentConversation.messages) latest = Math.max(latest, messageAtMs(m.date, m.timestamp));
+        const list = document.querySelector('ul[data-test="messages"]');
+        if (list) {
+            const dates = listMessageDates(list);
+            for (const li of list.querySelectorAll('li.message-li')) {
+                const timeEl = li.querySelector('span[data-test="date"]');
+                if (!timeEl) continue;
+                latest = Math.max(latest, messageAtMs(dates.get(li) || '', timeEl.textContent.trim()));
+            }
+        }
+        if (!latest && currentConversation.startTime) {
+            const start = Date.parse(currentConversation.startTime);
+            if (Number.isFinite(start)) latest = start;
+        }
+        return latest;
+    }
+
+    function rollKeepAliveWaitMs() {
+        const range = keepRange(keepMin, keepMax);
+        keepAliveWaitMs = (range.min + Math.random() * (range.max - range.min)) * 3600000;
+        return keepAliveWaitMs;
+    }
+
+    function tryKeepAlive() {
+        if (!keepAliveEnabled || !keepAliveText) return;
+        if (pendingForcedLeave) return;
+        if (!document.querySelector('ul[data-test="messages"]')) return;
+        if (findButtons().some(b => isRematchButton(b) || isConfirmExitButton(b))) return;
+        const at = lastChatAt();
+        if (!keepAliveWaitMs) rollKeepAliveWaitMs();
+        if (!at || Date.now() - at < keepAliveWaitMs) return;
+        if (Date.now() - lastKeepAliveTryAt < 60000) return;
+        lastKeepAliveTryAt = Date.now();
+        sendChatMessage(keepAliveText, () => {
+            lastKeepAliveSentAt = Date.now();
+            rollKeepAliveWaitMs();
+        });
+    }
+
     function relayToken() {
         return (localStorage.getItem(RELAY_TOKEN_KEY) || '').trim();
     }
@@ -2128,20 +2204,30 @@
             browser: browserNotifyEnabled,
             phone: ntfyEnabled,
             phoneTopic: getNtfyTopic(),
-            phoneTitle: getNtfyTitle()
+            phoneTitle: getNtfyTitle(),
+            keep: keepAliveEnabled,
+            keepText: keepAliveText,
+            keepMin,
+            keepMax
         };
     }
 
     function relayControlsMatch(cur, next) {
         if (!cur || !next) return false;
         const title = String(next.phoneTitle || '').trim() || 'Knock 新訊息';
+        const hours = keepRange(next.keepMin, next.keepMax);
+        const curHours = keepRange(cur.keepMin, cur.keepMax);
         return !!next.auto === !!cur.auto
             && !!next.userFilter === !!cur.userFilter
             && !!next.avatarFilter === !!cur.avatarFilter
             && !!next.browser === !!cur.browser
             && !!next.phone === !!cur.phone
             && String(next.phoneTopic || '').trim() === String(cur.phoneTopic || '')
-            && title === (String(cur.phoneTitle || '').trim() || 'Knock 新訊息');
+            && title === (String(cur.phoneTitle || '').trim() || 'Knock 新訊息')
+            && !!next.keep === !!cur.keep
+            && String(next.keepText || '').trim() === String(cur.keepText || '').trim()
+            && hours.min === curHours.min
+            && hours.max === curHours.max;
     }
 
     function applyRelayControls(c) {
@@ -2159,6 +2245,13 @@
         localStorage.setItem(NTFY_ENABLED_KEY, String(ntfyEnabled));
         if (typeof c.phoneTopic === 'string') setNtfyTopic(c.phoneTopic);
         if (typeof c.phoneTitle === 'string') setNtfyTitle(c.phoneTitle);
+        const nextKeep = keepRange(c.keepMin, c.keepMax);
+        const hoursChanged = nextKeep.min !== keepMin || nextKeep.max !== keepMax;
+        keepAliveEnabled = !!c.keep;
+        keepAliveText = String(c.keepText || '').trim().slice(0, 200);
+        keepMin = nextKeep.min;
+        keepMax = nextKeep.max;
+        if (hoursChanged) keepAliveWaitMs = 0;
         const dock = el('knock-dock');
         if (dock) {
             dock.remove();
@@ -2708,6 +2801,7 @@
         tryForcedLeave();
         checkForButtonAndClick();
         checkConversationEnd();
+        tryKeepAlive();
     }, 200);
 
     keepRelayAwake();
@@ -2809,11 +2903,17 @@
             || relayImagePlan('new', imageDone, true) !== 'send') {
             console.error('knock: 遠端圖片只送一次失敗');
         }
-        const ctrl = { auto: true, userFilter: true, avatarFilter: false, browser: true, phone: true, phoneTopic: 'abc', phoneTitle: 'Knock 新訊息' };
+        const ctrl = { auto: true, userFilter: true, avatarFilter: false, browser: true, phone: true, phoneTopic: 'abc', phoneTitle: 'Knock 新訊息', keep: false, keepText: '在嗎', keepMin: 1.5, keepMax: 2.5 };
+        const quietNight = new Date(2026, 9, 6, 0, 20);
         if (!relayControlsMatch(ctrl, ctrl)
             || relayControlsMatch(ctrl, Object.assign({}, ctrl, { browser: false }))
             || relayControlsMatch(ctrl, Object.assign({}, ctrl, { phone: false }))
-            || relayControlsMatch(ctrl, Object.assign({}, ctrl, { phoneTopic: 'other' }))) {
+            || relayControlsMatch(ctrl, Object.assign({}, ctrl, { phoneTopic: 'other' }))
+            || relayControlsMatch(ctrl, Object.assign({}, ctrl, { keep: true }))
+            || keepRange(2.5, 1.5).min !== 1.5
+            || keepRange(2.5, 1.5).max !== 2.5
+            || messageAtMs('2026-10-06', '11:51', quietNight) !== new Date(2026, 9, 6, 11, 51).getTime()
+            || messageAtMs('', '23:59', quietNight) !== new Date(2026, 9, 5, 23, 59).getTime()) {
             console.error('knock: 遠端控制比對失敗');
         }
         if (cooldownReasonText('firstFilter', '阿明') !== '開始聊天 · 過濾了 阿明'
