@@ -456,33 +456,14 @@ function pendingOutbox(session) {
     return { pending, dirty };
 }
 
-function controlHours(n, fallback) {
-    let v = Number(n);
-    if (!Number.isFinite(v) || v < 0.1) v = fallback;
-    if (v > 48) v = 48;
-    return Math.round(v * 10) / 10;
-}
-
-// 頁面上的 packControls 要跟這份欄位、順序一致。
+// 頁面上的 packControls 要跟這份欄位一致。
 function cleanControls(raw) {
     if (!raw || typeof raw !== 'object') return null;
-    const phoneTopic = String(raw.phoneTopic || '').trim();
-    if (phoneTopic && !/^[A-Za-z0-9_-]{1,64}$/.test(phoneTopic)) return null;
-    let keepMin = controlHours(raw.keepMin, 1.5);
-    let keepMax = controlHours(raw.keepMax, 2.5);
-    if (keepMax < keepMin) [keepMin, keepMax] = [keepMax, keepMin];
     return {
         auto: !!raw.auto,
-        keep: !!raw.keep,
-        keepText: String(raw.keepText || '').trim().slice(0, 200),
-        keepMin,
-        keepMax,
         userFilter: !!raw.userFilter,
         avatarFilter: !!raw.avatarFilter,
-        browser: !!raw.browser,
-        phone: !!raw.phone,
-        phoneTopic,
-        phoneTitle: String(raw.phoneTitle || '').trim().slice(0, 80) || 'Knock 新訊息'
+        browser: !!raw.browser
     };
 }
 
@@ -596,14 +577,14 @@ function selfCheck() {
         || kept.length !== 2) {
         throw new Error('knock relay 檢查失敗');
     }
-    const wanted = cleanControls({ auto: 1, keep: 0, keepText: ' 嗨 ', keepMin: 2, keepMax: 1, phoneTopic: 'topic', phoneTitle: '' });
+    const wanted = cleanControls({ auto: 1, userFilter: 1, avatarFilter: 0, browser: 1, keep: 1, phone: 1 });
     sessions.get('abc12345').controlWanted = wanted;
     applyHeartbeat(sessions, { tabId: 'abc12345', title: '阿明', canType: true, messages: [{ id: 'm1', text: '嗨', mine: false }] }, 11000);
     const keptWanted = sessions.get('abc12345').controlWanted;
-    if (!wanted || wanted.keepMin !== 1 || wanted.keepMax !== 2 || wanted.keepText !== '嗨' || wanted.phoneTitle !== 'Knock 新訊息'
-        || !keptWanted || keptWanted.phoneTopic !== 'topic'
-        || cleanControls({ phoneTopic: 'a b' })
-        || !sameControls(wanted, keptWanted)) {
+    if (!wanted || !wanted.auto || !wanted.userFilter || wanted.avatarFilter || !wanted.browser
+        || wanted.keep || wanted.phone
+        || !keptWanted || !sameControls(wanted, keptWanted)
+        || cleanControls(null)) {
         throw new Error('knock relay 檢查失敗');
     }
     const firstOpen = applyHeartbeat(sessions, {
@@ -958,10 +939,6 @@ const PAGE = `<!DOCTYPE html>
   .sw.on { background:#4CAF50; }
   .sw i { width:18px; height:18px; border-radius:50%; background:#fff; position:absolute; top:2px; left:2px; }
   .sw.on i { left:20px; }
-  .extra { display:flex; flex-direction:column; gap:8px; margin:-2px 0 8px; }
-  .extra input { width:100%; box-sizing:border-box; padding:8px 10px; border:1px solid #444; border-radius:8px; background:#1a1a1a; }
-  .hours { display:flex; align-items:center; gap:6px; color:#aaa; font-size:13px; }
-  .hours input { width:64px; }
 </style>
 </head>
 <body>
@@ -1008,8 +985,6 @@ let showControls = false;
 let controlDraft = null;
 let avatarDraft = null;
 let userDraft = null;
-let keepOpen = false;
-let phoneOpen = false;
 const railFold = { live: false, quiet: true, talks: true };
 const seenTail = {};
 
@@ -1471,40 +1446,13 @@ function placeThread(s, follow, y) {
   stage.append(chip);
 }
 
-function topicOk(s) {
-  if (!s) return true;
-  if (s.length > 64) return false;
-  for (let i = 0; i < s.length; i++) {
-    const ch = s.charAt(i);
-    const ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch === '_' || ch === '-';
-    if (!ok) return false;
-  }
-  return true;
-}
-
 function packControls(c) {
   c = c || {};
-  let min = Number(c.keepMin);
-  let max = Number(c.keepMax);
-  if (!(min >= 0.1)) min = 1.5;
-  if (!(max >= 0.1)) max = 2.5;
-  if (min > 48) min = 48;
-  if (max > 48) max = 48;
-  min = Math.round(min * 10) / 10;
-  max = Math.round(max * 10) / 10;
-  if (max < min) { const t = min; min = max; max = t; }
   return {
     auto: !!c.auto,
-    keep: !!c.keep,
-    keepText: String(c.keepText || '').trim().slice(0, 200),
-    keepMin: min,
-    keepMax: max,
     userFilter: !!c.userFilter,
     avatarFilter: !!c.avatarFilter,
-    browser: !!c.browser,
-    phone: !!c.phone,
-    phoneTopic: String(c.phoneTopic || '').trim(),
-    phoneTitle: String(c.phoneTitle || '').trim().slice(0, 80) || 'Knock 新訊息'
+    browser: !!c.browser
   };
 }
 
@@ -1517,7 +1465,6 @@ function shownControls() {
 function postControls(next) {
   if (!current) return;
   const packed = packControls(next);
-  if (!topicOk(packed.phoneTopic)) { alert('主題只接受英文、數字、底線和減號'); return; }
   const tabId = current;
   controlDraft = { tabId: tabId, controls: packed };
   paint();
@@ -1547,14 +1494,6 @@ function controlRow(label, on, onToggle) {
   return row;
 }
 
-function fieldInput(value, placeholder) {
-  const input = document.createElement('input');
-  input.value = value || '';
-  input.placeholder = placeholder || '';
-  input.onkeydown = (e) => e.stopPropagation();
-  return input;
-}
-
 function paintControls() {
   app.replaceChildren();
   clearForm();
@@ -1570,54 +1509,13 @@ function paintControls() {
   const flip = (key) => { const next = packControls(c); next[key] = !c[key]; postControls(next); };
   const autoRow = controlRow('自動開啟新對話', c.auto, () => flip('auto'));
   autoRow.onclick = () => flip('auto');
-  const keepRow = controlRow('持續連線', c.keep, () => flip('keep'));
-  keepRow.onclick = () => { keepOpen = !keepOpen; paint(); };
   const userRow = controlRow('使用者過濾', c.userFilter, () => flip('userFilter'));
   userRow.onclick = () => flip('userFilter');
   const avatarRow = controlRow('大頭貼過濾', c.avatarFilter, () => flip('avatarFilter'));
   avatarRow.onclick = () => flip('avatarFilter');
   const browserRow = controlRow('瀏覽器通知', c.browser, () => flip('browser'));
   browserRow.onclick = () => flip('browser');
-  const phoneRow = controlRow('手機通知', c.phone, () => flip('phone'));
-  phoneRow.onclick = () => { phoneOpen = !phoneOpen; paint(); };
-  app.append(autoRow, keepRow);
-  if (keepOpen) {
-    const extra = document.createElement('div');
-    extra.className = 'extra';
-    const sentence = fieldInput(c.keepText, '沒說話就送這句');
-    sentence.onchange = () => postControls(Object.assign({}, c, { keepText: sentence.value }));
-    const hours = document.createElement('div');
-    hours.className = 'hours';
-    const minInp = fieldInput(String(c.keepMin), '');
-    minInp.type = 'number';
-    minInp.min = '0.1';
-    minInp.step = '0.1';
-    const maxInp = fieldInput(String(c.keepMax), '');
-    maxInp.type = 'number';
-    maxInp.min = '0.1';
-    maxInp.step = '0.1';
-    const saveHours = () => postControls(Object.assign({}, c, { keepMin: minInp.value, keepMax: maxInp.value }));
-    minInp.onchange = saveHours;
-    maxInp.onchange = saveHours;
-    const tilde = document.createElement('span');
-    tilde.textContent = '～';
-    const unit = document.createElement('span');
-    unit.textContent = '小時';
-    hours.append(minInp, tilde, maxInp, unit);
-    extra.append(sentence, hours);
-    app.append(extra);
-  }
-  app.append(userRow, avatarRow, browserRow, phoneRow);
-  if (phoneOpen) {
-    const extra = document.createElement('div');
-    extra.className = 'extra';
-    const topic = fieldInput(c.phoneTopic, 'ntfy 主題');
-    topic.onchange = () => postControls(Object.assign({}, c, { phoneTopic: topic.value }));
-    const title = fieldInput(c.phoneTitle, 'Knock 新訊息');
-    title.onchange = () => postControls(Object.assign({}, c, { phoneTitle: title.value }));
-    extra.append(topic, title);
-    app.append(extra);
-  }
+  app.append(autoRow, userRow, avatarRow, browserRow);
 }
 
 function openingClock(ms) {

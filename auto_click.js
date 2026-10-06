@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.79
+// @version      1.4.80
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -13,7 +13,6 @@
 // @grant        GM.xmlHttpRequest
 // @grant        GM_xmlhttpRequest
 // @grant        GM_notification
-// @connect      ntfy.sh
 // @connect      knock.bency.org
 // @connect      *
 // ==/UserScript==
@@ -22,9 +21,6 @@
     'use strict';
 
     // --- 常數 ---
-    const BLACKLIST_PATTERNS = [
-        /is\.gd\/[a-zA-Z0-9]+/i,
-    ];
     const PENDING_START_CHAT_KEY = 'knockPendingStartChat';
     const PENDING_START_CHAT_REASON_KEY = 'knockPendingStartChatReason';
     const PENDING_FILTER_NAME_KEY = 'knockPendingFilterName';
@@ -40,29 +36,11 @@
     const AVATAR_FILTER_KEY = 'knockAvatarFilters';
     const AVATAR_FILTER_ENABLED_KEY = 'knockAvatarFilterEnabled';
     const BROWSER_NOTIFY_ENABLED_KEY = 'knockBrowserNotifyEnabled';
-    const NTFY_ENABLED_KEY = 'knockNtfyEnabled';
-    const NTFY_TOPIC_KEY = 'knockNtfyTopic';
-    const NTFY_TITLE_KEY = 'knockNtfyTitle';
-    const NTFY_TITLE_DEFAULT = 'Knock 新訊息';
-    const NTFY_SERVER = 'https://ntfy.sh';
     const RELAY_URL = 'https://knock.bency.org';
     const RELAY_TOKEN_KEY = 'knockRelayToken';
     const RELAY_TAB_KEY = 'knockRelayTabId';
-    const KEEP_ALIVE_ENABLED_KEY = 'knockKeepAliveEnabled';
-    const KEEP_ALIVE_TEXT_KEY = 'knockKeepAliveText';
-    const KEEP_ALIVE_AT_KEY = 'knockKeepAliveAt';
-    const KEEP_ALIVE_MIN_H_KEY = 'knockKeepAliveMinHours';
-    const KEEP_ALIVE_MAX_H_KEY = 'knockKeepAliveMaxHours';
-    const KEEP_ALIVE_WAIT_KEY = 'knockKeepAliveWait';
-    const KEEP_ALIVE_MIN_H_DEFAULT = 1.5;
-    const KEEP_ALIVE_MAX_H_DEFAULT = 2.5;
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const HINT_WAIT_RE = /等待也想聊聊\s+(.+?)\s+的人上線/;
-    const COMMON_TOPICS = new Set(['時事娛樂', '感情', '工作學業', '同性', '純聊', '生活']);
-    const HINT_CODE_KEY = 'knockHintCode';
-    const HINT_NOTIFIED_KEY = 'knockHintConnectedNotified';
-    const HINT_WAS_WAITING_KEY = 'knockHintWasWaiting';
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.77';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.80';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -139,15 +117,9 @@
 
     // --- 狀態 ---
     let autoClickEnabled = storedOn(AUTO_CLICK_ENABLED_KEY, true);
-    let keepAliveEnabled = storedOn(KEEP_ALIVE_ENABLED_KEY, false);
     let firstFilterEnabled = storedOn(FIRST_FILTER_ENABLED_KEY, true);
     let avatarFilterEnabled = storedOn(AVATAR_FILTER_ENABLED_KEY, true);
     let browserNotifyEnabled = storedOn(BROWSER_NOTIFY_ENABLED_KEY, true);
-    let ntfyEnabled = storedOn(NTFY_ENABLED_KEY, true);
-    let lastActivityAt = 0;
-    let lastKeepAliveTryAt = 0;
-    let lastKeepAliveSentAt = 0;
-    let keepAliveWaitMs = 0;
 
     const checkedMessages = new Set();
     let myAvatarUrl = null;
@@ -243,13 +215,6 @@
         rematchScheduled = false;
         startChatScheduled = false;
         hideCooldown();
-        lastActivityAt = 0;
-        lastKeepAliveTryAt = 0;
-        lastKeepAliveSentAt = 0;
-        keepAliveWaitMs = 0;
-        sessionStorage.removeItem(KEEP_ALIVE_AT_KEY);
-        sessionStorage.removeItem(KEEP_ALIVE_WAIT_KEY);
-        noteActivity();
         otherPartySeen = false;
         syncUnnamedChip();
         console.log('初始化新對話:', currentConversation.id);
@@ -346,24 +311,6 @@
         return ok;
     }
 
-    function exportFirstMessageFilters() {
-        const list = getNormalizedFilters();
-        const blob = new Blob([JSON.stringify(list, null, 2)], { type: 'application/json' });
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(blob);
-        a.download = `knock-使用者過濾-${new Date().toISOString().slice(0, 10)}.json`;
-        a.click();
-        URL.revokeObjectURL(a.href);
-        return list.length;
-    }
-
-    function parseImportedFilters(raw) {
-        const data = JSON.parse(raw);
-        const list = Array.isArray(data) ? data : data && data.filters;
-        if (!Array.isArray(list)) throw new Error('格式不對');
-        return list.map(normalizeFilter).filter(Boolean);
-    }
-
     function mergeStoredUsers(incoming) {
         const list = getNormalizedFilters();
         const seen = new Set(list.map(f => f.u ? `u\0${f.u}` : `t\0${f.t}\0${f.a}`));
@@ -379,12 +326,6 @@
             added++;
         }
         if (added) storageSet(FIRST_MSG_FILTER_KEY, list);
-        return added;
-    }
-
-    function importFirstMessageFilters(incoming) {
-        const added = mergeStoredUsers(incoming);
-        if (added) pushFilters({ addUsers: incoming });
         return added;
     }
 
@@ -500,23 +441,6 @@
         return ok;
     }
 
-    function exportAvatarFilters() {
-        const list = getAvatarFilters();
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(new Blob([JSON.stringify(list, null, 2)], { type: 'application/json' }));
-        a.download = `knock-大頭貼過濾-${new Date().toISOString().slice(0, 10)}.json`;
-        a.click();
-        URL.revokeObjectURL(a.href);
-        return list.length;
-    }
-
-    function parseImportedAvatarFilters(raw) {
-        const data = JSON.parse(raw);
-        const list = Array.isArray(data) ? data : data && data.filters;
-        if (!Array.isArray(list)) throw new Error('格式不對');
-        return list.map(normalizeAvatarFilter).filter(Boolean);
-    }
-
     function mergeStoredAvatars(incoming) {
         const list = getAvatarFilters();
         const seen = new Set(list);
@@ -529,12 +453,6 @@
             added++;
         }
         if (added) storageSet(AVATAR_FILTER_KEY, list);
-        return added;
-    }
-
-    function importAvatarFilters(incoming) {
-        const added = mergeStoredAvatars(incoming);
-        if (added) pushFilters({ addAvatars: incoming });
         return added;
     }
 
@@ -848,10 +766,6 @@
         return '';
     }
 
-    function dateFromKnockLabel(timeStr, now = new Date()) {
-        return parseKnockDateLabel(timeStr, now) || ymd(now);
-    }
-
     function labelDayOffset(timeStr) {
         if (!timeStr) return null;
         if (timeStr.includes('前天')) return 2;
@@ -898,14 +812,6 @@
             else if (row.parsedDate) dates.set(row.li, row.parsedDate);
         }
         return dates;
-    }
-
-    function messageDate(msg, startTime) {
-        if (msg.date) return msg.date;
-        const parsed = parseKnockDateLabel(msg.timestamp);
-        if (parsed) return parsed;
-        if (startTime) return ymd(new Date(startTime));
-        return dateFromKnockLabel(msg.timestamp);
     }
 
     function hashMessage(text, imageUrls, isMyMessage, clockOrDate) {
@@ -1083,7 +989,6 @@
         };
         currentConversation.messages.push(message);
         console.log('收集訊息:', messageText || '[圖片]', imageKeys.length);
-        noteActivity();
     }
 
     // --- 離開與重連 ---
@@ -1101,74 +1006,6 @@
 
     function isStartChatButton(button) {
         return button.textContent.includes('開始聊天');
-    }
-
-    function parseHintWaitText(text) {
-        const m = String(text || '').replace(/\s+/g, ' ').trim().match(HINT_WAIT_RE);
-        return m ? m[1].trim() : '';
-    }
-
-    function isHintCode(code) {
-        return !!(code && !COMMON_TOPICS.has(code));
-    }
-
-    function readWaitCode() {
-        for (const p of document.querySelectorAll('p')) {
-            const code = parseHintWaitText(p.textContent);
-            if (code) return code;
-        }
-        return '';
-    }
-
-    function getRememberedHint() {
-        return (sessionStorage.getItem(HINT_CODE_KEY) || '').trim();
-    }
-
-    function hintInputOnLobby() {
-        return document.querySelector('input[placeholder="輸入自訂暗號配對"]');
-    }
-
-    function clearHintSession() {
-        sessionStorage.removeItem(HINT_CODE_KEY);
-        sessionStorage.removeItem(HINT_NOTIFIED_KEY);
-        sessionStorage.removeItem(HINT_WAS_WAITING_KEY);
-    }
-
-    function rememberHintFromPage() {
-        const waiting = readWaitCode();
-        if (waiting) {
-            if (!isHintCode(waiting)) {
-                clearHintSession();
-                return '';
-            }
-            sessionStorage.setItem(HINT_CODE_KEY, waiting);
-            sessionStorage.setItem(HINT_WAS_WAITING_KEY, '1');
-            sessionStorage.removeItem(HINT_NOTIFIED_KEY);
-            return waiting;
-        }
-        if (document.querySelector('ul[data-test="messages"]')) {
-            sessionStorage.removeItem(HINT_WAS_WAITING_KEY);
-            return getRememberedHint();
-        }
-        const inp = hintInputOnLobby();
-        if (inp) {
-            const typed = inp.value.trim();
-            if (typed && isHintCode(typed)) sessionStorage.setItem(HINT_CODE_KEY, typed);
-            return getRememberedHint();
-        }
-        if (findButtons().some(b => b.value === '暗號')) {
-            clearHintSession();
-            return '';
-        }
-        return getRememberedHint();
-    }
-
-    function shouldAutoStartHint() {
-        return autoClickEnabled
-            && sessionStorage.getItem(HINT_WAS_WAITING_KEY) === '1'
-            && !!hintInputOnLobby()
-            && !readWaitCode()
-            && !document.querySelector('ul[data-test="messages"]');
     }
 
     function checkConversationEnd() {
@@ -1332,14 +1169,14 @@
         if (!isAutoClicking()) return;
 
         for (const button of findButtons()) {
-            if (isStartChatButton(button) && (isPendingStartChat() || shouldAutoStartHint())) {
+            if (isStartChatButton(button) && isPendingStartChat()) {
                 if (!startChatScheduled) {
                     startChatScheduled = true;
-                    showCooldown(isPendingStartChat() ? startChatCooldownLabel() : '開始聊天', 2000);
+                    showCooldown(startChatCooldownLabel(), 2000);
                     setTimeout(() => {
                         startChatScheduled = false;
                         hideCooldown();
-                        if (!isAutoClicking() || !(isPendingStartChat() || shouldAutoStartHint())) return;
+                        if (!isAutoClicking() || !isPendingStartChat()) return;
                         const btn = findButtons().find(isStartChatButton);
                         if (btn) {
                             console.log('倒數結束，點擊「開始聊天」...');
@@ -1381,11 +1218,6 @@
                 return;
             }
         }
-    }
-
-    function checkMessageAgainstBlacklist(messageElement) {
-        const messageText = messageElement.textContent || '';
-        return BLACKLIST_PATTERNS.some(pattern => pattern.test(messageText));
     }
 
     function isAutoClicking() {
@@ -1512,7 +1344,7 @@
     }
 
     function showBrowserNotification(body) {
-        const title = getNtfyTitle();
+        const title = 'Knock 新訊息';
         const text = (body || '你有一則新訊息').replace(/\s+/g, ' ').trim().slice(0, 80) || '你有一則新訊息';
         const details = {
             title,
@@ -1560,104 +1392,10 @@
         showToast(`送不出通知（${perm}）。請允許 Tampermonkey 與 Chrome 的通知權限`);
     }
 
-    function getNtfyTopic() {
-        return (localStorage.getItem(NTFY_TOPIC_KEY) || '').trim();
-    }
-
-    function setNtfyTopic(topic) {
-        const t = (topic || '').trim();
-        if (!t) {
-            localStorage.removeItem(NTFY_TOPIC_KEY);
-            return '';
-        }
-        if (!/^[A-Za-z0-9_-]{1,64}$/.test(t)) return null;
-        localStorage.setItem(NTFY_TOPIC_KEY, t);
-        return t;
-    }
-
-    function getNtfyTitle() {
-        return (localStorage.getItem(NTFY_TITLE_KEY) || '').trim() || NTFY_TITLE_DEFAULT;
-    }
-
-    function setNtfyTitle(title) {
-        const t = (title || '').trim().slice(0, 80);
-        if (!t) {
-            localStorage.removeItem(NTFY_TITLE_KEY);
-            return NTFY_TITLE_DEFAULT;
-        }
-        localStorage.setItem(NTFY_TITLE_KEY, t);
-        return t;
-    }
-
-    let lastNtfyAt = 0;
-    let ntfyBackoffUntil = 0;
-
-    function ntfyStatusDetail(status) {
-        if (status === 429) return 'HTTP 429：ntfy.sh 公開伺服器限流，請隔一分鐘再試';
-        return `HTTP ${status}`;
-    }
-
-    function sendNtfy(body, title) {
-        return new Promise((resolve) => {
-            const topic = getNtfyTopic();
-            if (!topic) {
-                resolve({ ok: false, detail: '尚未設定主題' });
-                return;
-            }
-            if (Date.now() < ntfyBackoffUntil) {
-                resolve({ ok: false, detail: 'HTTP 429：還在冷卻，請稍候再送' });
-                return;
-            }
-            const data = JSON.stringify({
-                topic,
-                title: title || getNtfyTitle(),
-                message: body || '你有一則新訊息'
-            });
-            const finish = (ok, detail, status) => {
-                if (status === 429) ntfyBackoffUntil = Date.now() + 60000;
-                if (ok) lastNtfyAt = Date.now();
-                resolve({ ok, detail });
-            };
-            const xhr = (typeof GM !== 'undefined' && GM.xmlHttpRequest)
-                || (typeof GM_xmlhttpRequest === 'function' && GM_xmlhttpRequest);
-            if (xhr) {
-                xhr({
-                    method: 'POST',
-                    url: `${NTFY_SERVER}/`,
-                    headers: { 'Content-Type': 'application/json' },
-                    data,
-                    onload: (r) => finish(r.status >= 200 && r.status < 300, ntfyStatusDetail(r.status), r.status),
-                    onerror: () => finish(false, '連線失敗：請允許腳本存取 ntfy.sh')
-                });
-                return;
-            }
-            fetch(`${NTFY_SERVER}/`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: data
-            }).then((r) => finish(r.ok, ntfyStatusDetail(r.status), r.status))
-                .catch((e) => finish(false, e.message || 'fetch 被網頁擋住'));
-        });
-    }
-
     function notifyNewMessage(text) {
-        if (!notificationsArmed || (document.hasFocus() && !document.hidden)) return;
+        if (!notificationsArmed || !browserNotifyEnabled || (document.hasFocus() && !document.hidden)) return;
         const body = (text || '你有一則新訊息').replace(/\s+/g, ' ').trim().slice(0, 80) || '你有一則新訊息';
-        if (ntfyEnabled && Date.now() - lastNtfyAt > 15000) sendNtfy(body);
-        if (browserNotifyEnabled) showBrowserNotification(body);
-    }
-
-    function maybeNotifyHintConnected() {
-        const hint = rememberHintFromPage();
-        if (!hint || readWaitCode()) return;
-        if (!document.querySelector('ul[data-test="messages"]')) return;
-        if (findButtons().some(isRematchButton)) return;
-        if (sessionStorage.getItem(HINT_NOTIFIED_KEY) === '1') return;
-        sessionStorage.setItem(HINT_NOTIFIED_KEY, '1');
-        const body = '已連線';
-        console.log('暗號已連線');
-        if (ntfyEnabled) sendNtfy(body);
-        if (browserNotifyEnabled) showBrowserNotification(body);
+        showBrowserNotification(body);
     }
 
     function checkNewMessages() {
@@ -1697,7 +1435,7 @@
             const notifyText = messageText || (imageUrls.length ? '[圖片]' : '');
             if (notifyText && !catchUp && messageLi === lastLi) notifyNewMessage(notifyText);
 
-            if (checkAvatarMatch(messageLi) || checkMessageAgainstBlacklist(messageDiv)) {
+            if (checkAvatarMatch(messageLi)) {
                 activelyLeaveConversation(messageId);
                 return;
             }
@@ -1824,42 +1562,6 @@
         return sw;
     }
 
-    function getKeepAliveText() {
-        return (localStorage.getItem(KEEP_ALIVE_TEXT_KEY) || '').trim();
-    }
-
-    function keepAliveHoursRange() {
-        let min = Number(localStorage.getItem(KEEP_ALIVE_MIN_H_KEY));
-        let max = Number(localStorage.getItem(KEEP_ALIVE_MAX_H_KEY));
-        if (!Number.isFinite(min) || min < 0.1) min = KEEP_ALIVE_MIN_H_DEFAULT;
-        if (!Number.isFinite(max) || max < 0.1) max = KEEP_ALIVE_MAX_H_DEFAULT;
-        if (max < min) [min, max] = [max, min];
-        return { min, max };
-    }
-
-    function setKeepAliveHoursRange(minVal, maxVal) {
-        let min = Number(minVal);
-        let max = Number(maxVal);
-        if (!Number.isFinite(min) || min < 0.1) min = KEEP_ALIVE_MIN_H_DEFAULT;
-        if (!Number.isFinite(max) || max < 0.1) max = KEEP_ALIVE_MAX_H_DEFAULT;
-        if (max < min) [min, max] = [max, min];
-        localStorage.setItem(KEEP_ALIVE_MIN_H_KEY, String(min));
-        localStorage.setItem(KEEP_ALIVE_MAX_H_KEY, String(max));
-        return { min, max };
-    }
-
-    function rollKeepAliveWaitMs() {
-        const { min, max } = keepAliveHoursRange();
-        keepAliveWaitMs = (min + Math.random() * (max - min)) * 3600000;
-        if (currentConversation.id) {
-            sessionStorage.setItem(KEEP_ALIVE_WAIT_KEY, JSON.stringify({
-                id: currentConversation.id,
-                ms: keepAliveWaitMs
-            }));
-        }
-        return keepAliveWaitMs;
-    }
-
     function createDock() {
         if (el('knock-dock')) return;
         OLD_FLOAT_IDS.forEach(id => el(id)?.remove());
@@ -1885,62 +1587,6 @@
             localStorage.setItem(AUTO_CLICK_ENABLED_KEY, String(v));
             requestNotifyPermission();
         });
-
-        const keepRow = dockRow('<span>持續連線</span>');
-        attachDockSwitch(keepRow, keepAliveEnabled, (v) => {
-            keepAliveEnabled = v;
-            localStorage.setItem(KEEP_ALIVE_ENABLED_KEY, String(v));
-            if (v && !getKeepAliveText()) showToast('請先輸入避免斷線的句子');
-        }, true);
-
-        const keepInput = document.createElement('input');
-        keepInput.type = 'text';
-        keepInput.placeholder = '沒說話就送這句';
-        keepInput.value = getKeepAliveText();
-        keepInput.style.cssText = 'width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #444;border-radius:8px;background:#1a1a1a;color:#fff;font:inherit;font-size:13px;';
-        keepInput.addEventListener('click', (e) => e.stopPropagation());
-        keepInput.addEventListener('input', () => localStorage.setItem(KEEP_ALIVE_TEXT_KEY, keepInput.value));
-
-        const hoursInp = (value) => {
-            const inp = document.createElement('input');
-            inp.type = 'number';
-            inp.min = '0.1';
-            inp.step = '0.1';
-            inp.value = String(value);
-            inp.style.cssText = 'width:52px;box-sizing:border-box;padding:6px 4px;border:1px solid #444;border-radius:6px;background:#1a1a1a;color:#fff;font:inherit;font-size:12px;';
-            inp.addEventListener('click', (e) => e.stopPropagation());
-            return inp;
-        };
-        const range = keepAliveHoursRange();
-        const minInp = hoursInp(range.min);
-        const maxInp = hoursInp(range.max);
-        const saveRange = () => {
-            setKeepAliveHoursRange(minInp.value, maxInp.value);
-            const next = keepAliveHoursRange();
-            minInp.value = String(next.min);
-            maxInp.value = String(next.max);
-            rollKeepAliveWaitMs();
-        };
-        minInp.addEventListener('change', saveRange);
-        maxInp.addEventListener('change', saveRange);
-        const rangeRow = document.createElement('div');
-        rangeRow.style.cssText = 'display:flex;align-items:center;gap:4px;font-size:12px;color:#aaa;';
-        const tilde = document.createElement('span');
-        tilde.textContent = '～';
-        const unit = document.createElement('span');
-        unit.textContent = '小時';
-        rangeRow.append(minInp, tilde, maxInp, unit);
-
-        const keepExtra = document.createElement('div');
-        keepExtra.style.cssText = 'display:none;flex-direction:column;gap:6px;';
-        keepExtra.append(keepInput, rangeRow);
-        keepRow.addEventListener('click', (e) => {
-            e.stopPropagation();
-            keepExtra.style.display = keepExtra.style.display === 'flex' ? 'none' : 'flex';
-        });
-        const keepWrap = document.createElement('div');
-        keepWrap.style.cssText = 'display:flex;flex-direction:column;gap:6px;';
-        keepWrap.append(keepRow, keepExtra);
 
         const relayBtn = dockRow('<span>遠端對話</span>', { button: true });
         relayBtn.addEventListener('click', (e) => {
@@ -1979,15 +1625,7 @@
         }, true);
         browserRow.addEventListener('click', (e) => { e.stopPropagation(); testBrowserNotification(); });
 
-        const ntfyRow = dockRow('<span>手機通知</span>');
-        attachDockSwitch(ntfyRow, ntfyEnabled, (v) => {
-            ntfyEnabled = v;
-            localStorage.setItem(NTFY_ENABLED_KEY, String(v));
-            if (v && !getNtfyTopic()) showToast('請先設定手機通知主題');
-        }, true);
-        ntfyRow.addEventListener('click', (e) => { e.stopPropagation(); createNtfySettings(); });
-
-        body.append(autoRow, keepWrap, filterRow, avatarRow, browserRow, ntfyRow, relayBtn);
+        body.append(autoRow, filterRow, avatarRow, browserRow, relayBtn);
 
         const paintOpen = () => {
             body.style.display = open ? 'flex' : 'none';
@@ -2007,53 +1645,6 @@
         dock.append(header, body);
         document.body.appendChild(dock);
         paintOpen();
-    }
-
-    // --- 持續連線 ---
-    function currentKeepAliveWaitMs() {
-        try {
-            const raw = JSON.parse(sessionStorage.getItem(KEEP_ALIVE_WAIT_KEY) || 'null');
-            if (raw && raw.id === currentConversation.id && raw.ms > 0) {
-                keepAliveWaitMs = raw.ms;
-                return keepAliveWaitMs;
-            }
-        } catch (e) {}
-        if (keepAliveWaitMs > 0) return keepAliveWaitMs;
-        return rollKeepAliveWaitMs();
-    }
-
-    function noteActivity() {
-        lastActivityAt = Date.now();
-        if (!currentConversation.id) return;
-        sessionStorage.setItem(KEEP_ALIVE_AT_KEY, JSON.stringify({
-            id: currentConversation.id,
-            at: lastActivityAt
-        }));
-    }
-
-    function lastChatAt() {
-        let latest = lastKeepAliveSentAt;
-        const consider = (msg) => {
-            const d = timestampToDate(msg, currentConversation.startTime);
-            if (d) latest = Math.max(latest, d.getTime());
-        };
-        currentConversation.messages.forEach(consider);
-        const list = document.querySelector('ul[data-test="messages"]');
-        if (list) {
-            const dates = listMessageDates(list);
-            for (const li of list.querySelectorAll('li.message-li')) {
-                const timeEl = li.querySelector('span[data-test="date"]');
-                if (!timeEl) continue;
-                consider({ timestamp: timeEl.textContent.trim(), date: dates.get(li) });
-            }
-        }
-        // ponytail: 雙方都不說話（或只有沒時間的開場句）時，從配對當下開始算
-        if (!latest) latest = lastActivityAt;
-        if (!latest && currentConversation.startTime) {
-            const start = Date.parse(currentConversation.startTime);
-            if (Number.isFinite(start)) latest = start;
-        }
-        return latest;
     }
 
     function fillReactInput(el, value) {
@@ -2353,50 +1944,26 @@
     }
 
     function relayControls() {
-        const range = keepAliveHoursRange();
         return {
             auto: autoClickEnabled,
-            keep: keepAliveEnabled,
-            keepText: getKeepAliveText(),
-            keepMin: range.min,
-            keepMax: range.max,
             userFilter: firstFilterEnabled,
             avatarFilter: avatarFilterEnabled,
-            browser: browserNotifyEnabled,
-            phone: ntfyEnabled,
-            phoneTopic: getNtfyTopic(),
-            phoneTitle: getNtfyTitle()
+            browser: browserNotifyEnabled
         };
     }
 
     function relayControlsMatch(cur, next) {
         if (!cur || !next) return false;
-        const title = String(next.phoneTitle || '').trim() || 'Knock 新訊息';
         return !!next.auto === !!cur.auto
-            && !!next.keep === !!cur.keep
-            && String(next.keepText || '').trim() === String(cur.keepText || '')
-            && Number(next.keepMin) === Number(cur.keepMin)
-            && Number(next.keepMax) === Number(cur.keepMax)
             && !!next.userFilter === !!cur.userFilter
             && !!next.avatarFilter === !!cur.avatarFilter
-            && !!next.browser === !!cur.browser
-            && !!next.phone === !!cur.phone
-            && String(next.phoneTopic || '').trim() === String(cur.phoneTopic || '')
-            && title === (String(cur.phoneTitle || '').trim() || 'Knock 新訊息');
+            && !!next.browser === !!cur.browser;
     }
 
     function applyRelayControls(c) {
         if (!c || relayControlsMatch(relayControls(), c)) return;
-        const keepWas = keepAliveEnabled;
-        const range = keepAliveHoursRange();
-        const hoursChanged = Number(c.keepMin) !== range.min || Number(c.keepMax) !== range.max;
         autoClickEnabled = !!c.auto;
         localStorage.setItem(AUTO_CLICK_ENABLED_KEY, String(autoClickEnabled));
-        keepAliveEnabled = !!c.keep;
-        localStorage.setItem(KEEP_ALIVE_ENABLED_KEY, String(keepAliveEnabled));
-        localStorage.setItem(KEEP_ALIVE_TEXT_KEY, String(c.keepText || '').trim().slice(0, 200));
-        setKeepAliveHoursRange(c.keepMin, c.keepMax);
-        if (keepAliveEnabled && (!keepWas || hoursChanged)) rollKeepAliveWaitMs();
         firstFilterEnabled = !!c.userFilter;
         localStorage.setItem(FIRST_FILTER_ENABLED_KEY, String(firstFilterEnabled));
         avatarFilterEnabled = !!c.avatarFilter;
@@ -2404,10 +1971,6 @@
         browserNotifyEnabled = !!c.browser;
         localStorage.setItem(BROWSER_NOTIFY_ENABLED_KEY, String(browserNotifyEnabled));
         if (browserNotifyEnabled) requestNotifyPermission();
-        ntfyEnabled = !!c.phone;
-        localStorage.setItem(NTFY_ENABLED_KEY, String(ntfyEnabled));
-        if (typeof c.phoneTopic === 'string') setNtfyTopic(c.phoneTopic);
-        if (typeof c.phoneTitle === 'string') setNtfyTitle(c.phoneTitle);
         const dock = el('knock-dock');
         if (dock) {
             dock.remove();
@@ -2790,115 +2353,6 @@
         } catch (e) {}
     }
 
-    function tryKeepAlive() {
-        if (!keepAliveEnabled) return;
-        const text = getKeepAliveText();
-        if (!text) return;
-        if (pendingForcedLeave) return;
-        if (!document.querySelector('ul[data-test="messages"]')) return;
-        if (findButtons().some(b => isRematchButton(b) || isConfirmExitButton(b))) return;
-        if (!currentConversation.id) initNewConversation();
-        const at = lastChatAt();
-        const wait = currentKeepAliveWaitMs();
-        if (!at || Date.now() - at < wait) return;
-        if (Date.now() - lastKeepAliveTryAt < 60000) return;
-        lastKeepAliveTryAt = Date.now();
-        sendChatMessage(text, () => {
-            lastKeepAliveSentAt = Date.now();
-            noteActivity();
-            rollKeepAliveWaitMs();
-            console.log('持續連線：已送出，下次約', (keepAliveWaitMs / 3600000).toFixed(2), '小時後');
-        });
-    }
-
-    function timestampToDate(msg, startTime, now = new Date()) {
-        const minutes = clockMinutesOnly(msg.timestamp);
-        if (minutes == null) return null;
-        const [y, mo, d] = messageDate(msg, startTime).split('-').map(Number);
-        const date = new Date(y, mo - 1, d);
-        date.setHours(0, 0, 0, 0);
-        date.setMinutes(minutes);
-        if (date.getTime() > now.getTime() + 60000) date.setDate(date.getDate() - 1);
-        return date;
-    }
-
-    function createNtfySettings() {
-        const current = getNtfyTopic();
-        const panel = toggleOverlay('knock-ntfy-settings', () => makeOverlay('knock-ntfy-settings', 520, `
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;">
-                <h2 style="margin:0;font-size:24px;">手機通知（ntfy）</h2>
-                <button id="knock-ntfy-close" style="${cssBtn('#444')}">關閉</button>
-            </div>
-            <div style="font-size:13px;color:#888;margin-bottom:16px;line-height:1.6;">
-                分頁沒在看時，新訊息會推到手機。請安裝
-                <a href="https://ntfy.sh/app" target="_blank" rel="noreferrer" style="color:#8ab4f8;">ntfy App</a>
-                ，伺服器選 <b style="color:#ccc;">ntfy.sh</b>，訂閱下方同一個主題。
-                <br><br>
-                跨域權限：按「傳送測試」時若 Tampermonkey 跳出「允許存取 ntfy.sh」，請選<strong style="color:#ccc;">永遠允許</strong>。
-                沒跳出或曾按錯過：Tampermonkey 圖示 → 管理面板 → 這支腳本 → <strong style="color:#ccc;">設定</strong> → 往下找 <strong style="color:#ccc;">XHR Security</strong>，把 ntfy.sh 從黑名單移除，或加到白名單。
-            </div>
-            <div style="font-size:12px;color:#888;margin-bottom:6px;">主題</div>
-            <input type="text" id="knock-ntfy-topic" placeholder="例如 knock-x7k2m9" value="${escapeHtml(current)}" style="${CSS_INP}margin-bottom:12px;">
-            <div style="font-size:12px;color:#888;margin-bottom:6px;">通知標題</div>
-            <input type="text" id="knock-ntfy-title" placeholder="${escapeHtml(NTFY_TITLE_DEFAULT)}" value="${escapeHtml(getNtfyTitle())}" style="${CSS_INP}margin-bottom:12px;">
-            <div style="display:flex;gap:8px;flex-wrap:wrap;">
-                <button id="knock-ntfy-save" style="${cssBtn('#4CAF50')}">儲存</button>
-                <button id="knock-ntfy-test" style="${cssBtn('#2d4a6d')}">傳送測試</button>
-                <button id="knock-ntfy-clear" style="${cssBtn('#d32f2f')}">關閉推播</button>
-            </div>
-            <div id="knock-ntfy-status" style="margin-top:14px;font-size:13px;color:#aaa;line-height:1.6;"></div>`));
-        if (!panel) return;
-        if (!current) el('knock-ntfy-topic').value = `knock-${Math.random().toString(36).slice(2, 10)}`;
-        el('knock-ntfy-close').onclick = () => panel.remove();
-        const status = el('knock-ntfy-status');
-        const paintStatus = (topic) => {
-            if (!topic) {
-                status.innerHTML = '尚未儲存主題。';
-                return;
-            }
-            const href = `${NTFY_SERVER}/${encodeURIComponent(topic)}`;
-            status.innerHTML = `手機請訂閱：<a href="${href}" target="_blank" rel="noreferrer" style="color:#8ab4f8;">${escapeHtml(topic)}</a>`;
-        };
-        paintStatus(current);
-        el('knock-ntfy-save').onclick = () => {
-            const saved = setNtfyTopic(el('knock-ntfy-topic').value);
-            if (saved === null) {
-                alert('主題只能用英數、底線、連字號，最多 64 字');
-                return;
-            }
-            setNtfyTitle(el('knock-ntfy-title').value);
-            paintStatus(saved);
-            showToast(saved ? `已設定，請在手機訂閱 ${saved}` : '已關閉手機推播');
-        };
-        el('knock-ntfy-test').onclick = async () => {
-            setNtfyTitle(el('knock-ntfy-title').value);
-            if (!getNtfyTopic()) {
-                const saved = setNtfyTopic(el('knock-ntfy-topic').value);
-                if (!saved) {
-                    alert('請先填主題並儲存');
-                    return;
-                }
-                paintStatus(saved);
-            }
-            status.textContent = '傳送中…';
-            const result = await sendNtfy('這是測試通知');
-            if (result.ok) {
-                status.textContent = `已送到 ntfy（${result.detail}）。手機沒響的話，確認 App 訂閱的主題與伺服器是 ntfy.sh。`;
-            } else if (/429/.test(result.detail)) {
-                status.textContent = `沒送出：${result.detail}`;
-            } else {
-                status.textContent = `沒送出：${result.detail}。若是連線被擋，請依上方步驟允許 ntfy.sh。`;
-            }
-            showToast(result.ok ? '測試已送到 ntfy' : (/429/.test(result.detail) ? 'ntfy 限流，稍後再試' : '測試失敗，看設定頁說明'));
-        };
-        el('knock-ntfy-clear').onclick = () => {
-            setNtfyTopic('');
-            el('knock-ntfy-topic').value = '';
-            paintStatus('');
-            showToast('已關閉手機推播');
-        };
-    }
-
     function refreshFirstFilterManager() {
         const panel = el('knock-first-filter-manager');
         if (!panel) return;
@@ -2912,12 +2366,9 @@
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;flex-wrap:wrap;">
                 <h2 style="margin:0;font-size:24px;">使用者過濾（${filters.length}）</h2>
                 <div style="display:flex;gap:8px;flex-wrap:wrap;">
-                    <button id="knock-export-first-filters" style="${cssBtn('#2d5a3d')}" ${filters.length ? '' : 'disabled'}>匯出</button>
-                    <button id="knock-import-first-filters" style="${cssBtn('#2d4a6d')}">匯入</button>
                     <button id="knock-clear-first-filters" style="${cssBtn('#d32f2f')}" ${filters.length ? '' : 'disabled'}>全部清空</button>
                     <button id="knock-filter-manager-close" style="${cssBtn('#444')}">關閉</button>
                 </div>
-                <input type="file" id="knock-import-first-filters-file" accept="application/json,.json" hidden>
             </div>
             <div style="font-size:13px;color:#888;margin-bottom:16px;">依使用者 id 自動離開。沒有 id 的舊項目，要發語詞與頭像都相同才會離開。</div>
             <input type="text" id="knock-filter-search" placeholder="搜尋已記住的人..." style="${CSS_INP}margin-bottom:16px;">
@@ -2937,24 +2388,6 @@
             </div>`));
         if (!panel) return;
         el('knock-filter-manager-close').onclick = () => panel.remove();
-        el('knock-export-first-filters').onclick = () => {
-            const n = exportFirstMessageFilters();
-            showToast(n ? `已匯出 ${n} 則` : '沒有可匯出的使用者');
-        };
-        el('knock-import-first-filters').onclick = () => el('knock-import-first-filters-file').click();
-        el('knock-import-first-filters-file').addEventListener('change', async (e) => {
-            const file = e.target.files && e.target.files[0];
-            e.target.value = '';
-            if (!file) return;
-            try {
-                const added = importFirstMessageFilters(parseImportedFilters(await file.text()));
-                syncRememberButtons();
-                refreshFirstFilterManager();
-                showToast(added ? `已匯入 ${added} 則` : '沒有新增（皆已存在或檔案為空）');
-            } catch (err) {
-                alert('匯入失敗：請使用本功能匯出的 JSON');
-            }
-        });
         el('knock-filter-search').addEventListener('input', (e) => {
             filterCardsByTerm('.knock-filter-card', e.target.value.toLowerCase(), 'flex');
         });
@@ -2973,12 +2406,9 @@
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;flex-wrap:wrap;">
                 <h2 style="margin:0;font-size:24px;">大頭貼過濾（${filters.length}）</h2>
                 <div style="display:flex;gap:8px;flex-wrap:wrap;">
-                    <button id="knock-export-avatar-filters" style="${cssBtn('#2d5a3d')}" ${filters.length ? '' : 'disabled'}>匯出</button>
-                    <button id="knock-import-avatar-filters" style="${cssBtn('#2d4a6d')}">匯入</button>
                     <button id="knock-clear-avatar-filters" style="${cssBtn('#d32f2f')}" ${filters.length ? '' : 'disabled'}>全部清空</button>
                     <button id="knock-avatar-filter-manager-close" style="${cssBtn('#444')}">關閉</button>
                 </div>
-                <input type="file" id="knock-import-avatar-filters-file" accept="application/json,.json" hidden>
             </div>
             <div style="font-size:13px;color:#888;margin-bottom:16px;">對方第一則訊息的大頭貼網址相同就會自動離開。預設頭像也可以勾，用來略過沒換頭像的人。</div>
             <input type="text" id="knock-avatar-filter-search" placeholder="搜尋大頭貼網址..." style="${CSS_INP}margin-bottom:16px;">
@@ -2996,24 +2426,6 @@
             </div>`));
         if (!panel) return;
         el('knock-avatar-filter-manager-close').onclick = () => panel.remove();
-        el('knock-export-avatar-filters').onclick = () => {
-            const n = exportAvatarFilters();
-            showToast(n ? `已匯出 ${n} 則` : '沒有可匯出的大頭貼');
-        };
-        el('knock-import-avatar-filters').onclick = () => el('knock-import-avatar-filters-file').click();
-        el('knock-import-avatar-filters-file').addEventListener('change', async (e) => {
-            const file = e.target.files && e.target.files[0];
-            e.target.value = '';
-            if (!file) return;
-            try {
-                const added = importAvatarFilters(parseImportedAvatarFilters(await file.text()));
-                syncAvatarFilterButtons();
-                refreshAvatarFilterManager();
-                showToast(added ? `已匯入 ${added} 則` : '沒有新增（皆已存在或檔案為空）');
-            } catch (err) {
-                alert('匯入失敗：請使用本功能匯出的 JSON');
-            }
-        });
         el('knock-avatar-filter-search').addEventListener('input', (e) => {
             const term = e.target.value.toLowerCase();
             document.querySelectorAll('.knock-avatar-filter-card').forEach(card => {
@@ -3092,7 +2504,6 @@
 
     new MutationObserver(() => {
         mountChrome();
-        maybeNotifyHintConnected();
         checkNewMessages();
         decorateOtherMessages();
         checkForButtonAndClick();
@@ -3100,11 +2511,9 @@
     }).observe(document.documentElement, { childList: true, subtree: true });
 
     setInterval(() => {
-        maybeNotifyHintConnected();
         maybeLeaveOnFirstMessageFilter();
         maybeLeaveOnAvatarFilter();
         tryForcedLeave();
-        tryKeepAlive();
         checkForButtonAndClick();
         checkConversationEnd();
     }, 200);
@@ -3135,11 +2544,6 @@
             || maleId === stockAvatarId(female)
             || stockAvatarId('https://example.com/custom.png')) {
             console.error('knock: 預設頭像判斷失敗');
-        }
-        if (parseHintWaitText('等待也想聊聊 早安 的人上線') !== '早安'
-            || parseHintWaitText('等待也想聊聊 感情 的人上線') !== '感情'
-            || !isHintCode('早安') || isHintCode('感情')) {
-            console.error('knock: 暗號等待判斷失敗');
         }
         if (normalizeAvatarFilter(' https://a/b.png ') !== 'https://a/b.png'
             || normalizeAvatarFilter({ url: 'https://a/b.png' }) !== 'https://a/b.png'
@@ -3213,8 +2617,8 @@
             || relayImagePlan('new', imageDone, true) !== 'send') {
             console.error('knock: 遠端圖片只送一次失敗');
         }
-        const ctrl = { auto: true, keep: false, keepText: '在嗎', keepMin: 1.5, keepMax: 2.5, userFilter: true, avatarFilter: false, browser: true, phone: true, phoneTopic: 'abc', phoneTitle: 'Knock 新訊息' };
-        if (!relayControlsMatch(ctrl, ctrl) || relayControlsMatch(ctrl, Object.assign({}, ctrl, { keep: true }))) {
+        const ctrl = { auto: true, userFilter: true, avatarFilter: false, browser: true };
+        if (!relayControlsMatch(ctrl, ctrl) || relayControlsMatch(ctrl, Object.assign({}, ctrl, { browser: false }))) {
             console.error('knock: 遠端控制比對失敗');
         }
         if (cooldownReasonText('firstFilter', '阿明') !== '開始聊天 · 過濾了 阿明'
