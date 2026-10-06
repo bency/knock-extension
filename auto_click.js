@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.78
+// @version      1.4.79
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -710,6 +710,14 @@
         }
     }
 
+    // 同一人連續發話時頭像高度會被收成 0。那種不要掛名稱，否則名稱會浮在訊息前面。
+    function avatarShown(avatar) {
+        const style = getComputedStyle(avatar);
+        const height = parseFloat(style.height);
+        const maxHeight = parseFloat(style.maxHeight);
+        return style.display !== 'none' && style.visibility !== 'hidden' && height > 0 && maxHeight !== 0;
+    }
+
     function paintPartnerCaption() {
         const name = currentPartnerName();
         const shown = name || '未命名';
@@ -717,7 +725,7 @@
         if (!list) return;
         for (const li of list.querySelectorAll('li.message-li')) {
             const avatar = isMyMessageLi(li) ? null : senderAvatar(li);
-            if (!avatar) {
+            if (!avatar || !avatarShown(avatar)) {
                 clearPartnerCaption(li);
                 continue;
             }
@@ -2113,6 +2121,20 @@
         return id;
     }
 
+    // 發語詞那則常常沒有頭像。名稱左邊的圖改看畫面上實際露出的對方頭像。
+    function shownPartnerFace() {
+        const list = document.querySelector('ul[data-test="messages"]');
+        if (!list) return null;
+        for (const li of list.querySelectorAll('li.message-li')) {
+            if (isMyMessageLi(li)) continue;
+            const el = senderAvatar(li);
+            if (!el || !avatarShown(el)) continue;
+            const img = el.querySelector('img');
+            return { el, url: img && img.src ? img.src : '' };
+        }
+        return null;
+    }
+
     function relayOpenings() {
         const list = document.querySelector('ul[data-test="messages"]');
         if (!list) return null;
@@ -2142,7 +2164,10 @@
                 avatarHash = avatarHashOf(avatarUrl);
             }
         }
-        const avatar = themLi ? openingAvatar(themLi, avatarUrl) : '';
+        const shown = shownPartnerFace();
+        const avatar = shown
+            ? openingAvatar(shown.el, shown.url)
+            : (themLi ? openingAvatar(themLi, avatarUrl) : '');
         if (!them && !mine && !avatar) return null;
         return {
             them,
