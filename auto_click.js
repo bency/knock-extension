@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.88
+// @version      1.4.89
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -46,7 +46,7 @@
     const RELAY_TOKEN_KEY = 'knockRelayToken';
     const RELAY_TAB_KEY = 'knockRelayTabId';
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.88';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.89';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -2164,6 +2164,8 @@
     const relayUploaded = new Set();
     const relayImageDone = new Set();
     const relayArchived = new Set();
+    let relayImagePendingId = '';
+    let relayImageArmedAt = 0;
     let relayImageBooted = false;
     let relayBusy = false;
 
@@ -2468,17 +2470,22 @@
         return waitFor(() => !!relayParkedFile(), 2000);
     }
 
-    // 送出鈕只點一次。simulateMouseClick 會連點，預覽還在就會連送同一張。
+    // 送出鈕亮了才點一次。點完先留著縮圖，Knock 才讀得到檔案。
     async function relayPushParkedImage() {
-        const parked = relayParkedFile();
-        if (!parked) return true;
-        const nameEl = parked.querySelector('.filepond--file-info-main');
-        const name = nameEl ? nameEl.textContent.trim() : '';
-        if (!relayShouldPushImage(name, chatDraft())) return false;
+        if (relayImageArmedAt) return false;
+        const ready = await waitFor(() => {
+            const parked = relayParkedFile();
+            if (!parked) return false;
+            const nameEl = parked.querySelector('.filepond--file-info-main');
+            const name = nameEl ? nameEl.textContent.trim() : '';
+            const send = document.querySelector('button[data-test="send"]');
+            return relayShouldPushImage(name, chatDraft()) && !!(send && !send.disabled);
+        }, 5000);
+        if (!ready || !relayParkedFile()) return false;
         const send = document.querySelector('button[data-test="send"]');
         if (!send || send.disabled) return false;
         send.click();
-        removeParkedFile();
+        relayImageArmedAt = Date.now();
         return true;
     }
 
@@ -2617,20 +2624,39 @@
                     if (queued && queued.image && queued.id) rememberRelayImage(queued.id);
                 }
             }
-            // 殘留預覽只移掉，不再補按。補按會把同一張一直送出去。
-            if (relayParkedFile()) removeParkedFile();
+            // 點過送出的縮圖先留著。超過 4 秒還在，才清掉殘留。
+            if (relayParkedFile() && relayImageArmedAt && Date.now() - relayImageArmedAt > 4000) {
+                removeParkedFile();
+                relayImageArmedAt = 0;
+            } else if (relayParkedFile() && relayImagePendingId && !relayImageArmedAt) {
+                const pushed = await relayPushParkedImage();
+                if (pushed) {
+                    rememberRelayImage(relayImagePendingId);
+                    await ackRelayItem(token, snap.tabId, relayImagePendingId);
+                    relayImagePendingId = '';
+                }
+            }
             for (const item of data.outbox || []) {
                 if (!item || !item.id || !snap.canType || (!item.text && !item.image)) continue;
                 if (item.image) {
                     if (relayImagePlan(item.id, relayImageDone, relayImageBooted) === 'ack') {
-                        if (relayParkedFile()) removeParkedFile();
                         await ackRelayItem(token, snap.tabId, item.id);
                         continue;
                     }
-                    rememberRelayImage(item.id);
+                    if (relayParkedFile() && relayImageArmedAt && Date.now() - relayImageArmedAt <= 4000) continue;
+                    if (relayImagePendingId === item.id && relayParkedFile()) continue;
                     if (relayParkedFile()) removeParkedFile();
+                    relayImagePendingId = item.id;
+                    relayImageArmedAt = 0;
                     const dropped = await relayDropImage(item);
-                    if (dropped) await relayPushParkedImage();
+                    if (!dropped) {
+                        relayImagePendingId = '';
+                        continue;
+                    }
+                    const pushed = await relayPushParkedImage();
+                    if (!pushed) continue;
+                    rememberRelayImage(item.id);
+                    relayImagePendingId = '';
                     await ackRelayItem(token, snap.tabId, item.id);
                     continue;
                 }
