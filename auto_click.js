@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.86
+// @version      1.4.87
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -13,7 +13,7 @@
 // @grant        GM.xmlHttpRequest
 // @grant        GM_xmlhttpRequest
 // @grant        GM_notification
-// @connect      knock.bency.org
+// @connect      knock.keeping.work
 // @connect      ntfy.sh
 // @connect      *
 // ==/UserScript==
@@ -42,11 +42,11 @@
     const NTFY_TITLE_KEY = 'knockNtfyTitle';
     const NTFY_TITLE_DEFAULT = 'Knock 新訊息';
     const NTFY_SERVER = 'https://ntfy.sh';
-    const RELAY_URL = 'https://knock.bency.org';
+    const RELAY_URL = 'https://knock.keeping.work';
     const RELAY_TOKEN_KEY = 'knockRelayToken';
     const RELAY_TAB_KEY = 'knockRelayTabId';
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.86';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.87';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -1699,7 +1699,7 @@
         const relayBtn = dockRow('<span>遠端對話</span>', { button: true });
         relayBtn.addEventListener('click', (e) => {
             e.stopPropagation();
-            const next = prompt('貼上遠端頁面的權杖。空白表示關閉。頁面是 https://knock.bency.org', relayToken());
+            const next = prompt('貼上遠端頁面的權杖。空白表示關閉。頁面是 https://knock.keeping.work', relayToken());
             if (next == null) return;
             const token = next.trim();
             if (token) localStorage.setItem(RELAY_TOKEN_KEY, token);
