@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.87
+// @version      1.4.88
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -46,7 +46,7 @@
     const RELAY_TOKEN_KEY = 'knockRelayToken';
     const RELAY_TAB_KEY = 'knockRelayTabId';
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.87';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.88';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -233,6 +233,7 @@
             startTime: new Date().toISOString()
         };
         clearRelayRecord();
+        nameSet = false;
         keepAliveWaitMs = 0;
         lastKeepAliveSentAt = 0;
         pendingForcedLeave = false;
@@ -429,6 +430,32 @@
         }
     }
 
+    function partnerNameFromLines(opening, firstLine, existing) {
+        if (String(existing || '').trim()) return '';
+        return openingLineName(opening, '') || openingLineName(firstLine, '');
+    }
+
+    function autoNamePartner() {
+        if (nameSet || currentPartnerName()) return;
+        const list = document.querySelector('ul[data-test="messages"]');
+        if (!list) return;
+        const opening = findFirstOtherMessage();
+        let firstLine = '';
+        for (const li of list.querySelectorAll('li.message-li')) {
+            if (isMyMessageLi(li) || (opening && li === opening.li)) continue;
+            const messageDiv = li.querySelector('div[data-test="message"]');
+            if (!messageDiv) continue;
+            const text = getMessageText(messageDiv);
+            if (!text || TYPING_RE.test(text)) continue;
+            firstLine = text;
+            break;
+        }
+        const name = partnerNameFromLines(opening && opening.filterKey, firstLine, currentConversation.label);
+        if (!name) return;
+        currentConversation.label = name;
+        paintPartnerCaption();
+    }
+
     // --- 大頭貼過濾（只記網址；勾選疊在頭像上，不包頭像） ---
     function normalizeAvatarFilter(item) {
         const u = String(item && typeof item === 'object' ? (item.u ?? item.url ?? '') : item || '').trim();
@@ -598,6 +625,7 @@
             currentConversation.partnerUid = uid;
             break;
         }
+        autoNamePartner();
         syncUnnamedChip();
     }
 
@@ -2017,6 +2045,7 @@
         const lobby = findButtons().some(isStartChatButton);
         const left = findButtons().some(isRematchButton);
         if (!list && !lobby && !left) return null;
+        autoNamePartner();
         const base = {
             tabId: relayTabId(),
             channelId: currentConversation.id || '',
@@ -2557,7 +2586,11 @@
             if (res && res.status === 200) {
             if (snap.archive) rememberArchived(snap.archive.uid, snap.archive.messages);
             const data = JSON.parse(res.responseText || '{}');
-            if (!nameSet && data.talkTitle && data.talkTitle !== '未命名' && currentConversation.label !== data.talkTitle) {
+            if (typeof data.rename === 'string' && data.rename) {
+                nameSet = true;
+                currentConversation.label = data.rename === '未命名' ? '' : String(data.rename).slice(0, 40);
+                paintPartnerCaption();
+            } else if (!nameSet && data.talkTitle && data.talkTitle !== '未命名' && currentConversation.label !== data.talkTitle) {
                 currentConversation.label = String(data.talkTitle).slice(0, 40);
                 paintPartnerCaption();
             }
@@ -2884,7 +2917,11 @@
         if (openingLineName('  嗨  ', '') !== '嗨'
             || openingLineName('https://x/a.jpg', '')
             || openingLineName('新句子', '已命名')
-            || openingLineName('一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十多餘', '').length !== 40) {
+            || openingLineName('一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十多餘', '').length !== 40
+            || partnerNameFromLines('  嗨  ', '第二句', '') !== '嗨'
+            || partnerNameFromLines('https://x/a.jpg', '第二句', '') !== '第二句'
+            || partnerNameFromLines('', '第二句', '') !== '第二句'
+            || partnerNameFromLines('嗨', '第二句', '已命名')) {
             console.error('knock: 發語詞當顯示名稱失敗');
         }
         const replyHost = document.createElement('div');

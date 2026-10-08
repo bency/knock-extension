@@ -96,8 +96,16 @@ function withYear(text) {
 function chosenTitle(archive, prev) {
     const sent = String(archive && archive.title || '').trim().slice(0, 40);
     if (archive && archive.named) return sent || '未命名';
+    if (prev && prev.title && prev.title !== '未命名') return prev.title;
     if (sent && sent !== '未命名') return sent;
     return (prev && prev.title) || sent || '未命名';
+}
+
+function setTalkTitle(talks, uid, title) {
+    const talk = uid ? talks.get(uid) : null;
+    if (!talk || talk.title === title) return false;
+    talk.title = title;
+    return true;
 }
 
 function archiveMessage(m) {
@@ -358,13 +366,18 @@ function applyHeartbeat(sessions, body, now) {
     const tabId = String(body && body.tabId || '').trim();
     if (!/^[a-z0-9]{8,40}$/.test(tabId)) return null;
     const prev = sessions.get(tabId);
-    const title = String(body.title || '').trim().slice(0, 40) || '未命名';
     const channelId = String(body.channelId || '').slice(0, 80);
     const sameChannel = !!(prev && prev.channelId === channelId);
+    const sentTitle = String(body.title || '').trim().slice(0, 40) || '未命名';
+    let titleWanted = sameChannel && prev && typeof prev.titleWanted === 'string' ? prev.titleWanted : null;
+    if (titleWanted != null && sentTitle === titleWanted) titleWanted = null;
+    const title = titleWanted != null ? titleWanted : sentTitle;
     const session = {
         tabId,
         channelId,
         title,
+        titleWanted,
+        partnerUid: cleanUid(body.archive && body.archive.uid) || (sameChannel && prev && prev.partnerUid) || '',
         canType: !!body.canType,
         lobby: !!body.lobby,
         greeting: body.lobby ? String(body.greeting || '').trim().slice(0, 200) : (prev && prev.greeting) || '',
@@ -397,6 +410,7 @@ function visibleSessions(sessions, now, waitMs) {
             tabId: s.tabId,
             channelId: s.channelId,
             title: s.title,
+            partnerUid: s.partnerUid || '',
             canType: s.canType,
             lobby: !!s.lobby,
             greeting: s.greeting || '',
@@ -832,8 +846,23 @@ function selfCheck() {
         || !rememberTalk(named, { archive: { uid: 'user_name', title: '未命名', messages: [{ id: 'n2', text: '新', time: '1/3 09:00' }] } }, 2)
         || named.get('user_name').title !== '小美'
         || named.get('user_name').messages.length !== 2
+        || !rememberTalk(named, { archive: { uid: 'user_name', title: '嗨', messages: [{ id: 'n4', text: '嘿', time: '1/4 10:00' }] } }, 4)
+        || named.get('user_name').title !== '小美'
         || !rememberTalk(named, { archive: { uid: 'user_name', title: '未命名', named: true, messages: [{ id: 'n2', text: '新', time: '1/3 09:00' }] } }, 3)
         || named.get('user_name').title !== '未命名') throw new Error('knock relay 檢查失敗');
+    const freshName = new Map();
+    if (!rememberTalk(freshName, { archive: { uid: 'user_newn', title: '未命名', messages: [{ id: 'n1', text: '嗨', time: '1/2 08:00' }] } }, 1)
+        || !rememberTalk(freshName, { archive: { uid: 'user_newn', title: '嗨', messages: [{ id: 'n2', text: '新', time: '1/3 09:00' }] } }, 2)
+        || freshName.get('user_newn').title !== '嗨') throw new Error('knock relay 檢查失敗');
+    applyHeartbeat(sessions, { tabId: 'titletab1', title: '未命名', channelId: 'c1', messages: [{ id: 'm1', text: '嗨', mine: false }] }, 20000);
+    sessions.get('titletab1').titleWanted = '小美';
+    const heldTitle = applyHeartbeat(sessions, { tabId: 'titletab1', title: '未命名', channelId: 'c1', messages: [{ id: 'm1', text: '嗨', mine: false }] }, 21000);
+    const echoedTitle = applyHeartbeat(sessions, { tabId: 'titletab1', title: '小美', channelId: 'c1', messages: [{ id: 'm1', text: '嗨', mine: false }] }, 22000);
+    const nextTitle = applyHeartbeat(sessions, { tabId: 'titletab1', title: '未命名', channelId: 'c2', messages: [{ id: 'm1', text: '嗨', mine: false }] }, 23000);
+    if (!heldTitle || heldTitle.title !== '小美' || heldTitle.titleWanted !== '小美'
+        || !echoedTitle || echoedTitle.titleWanted != null || echoedTitle.title !== '小美'
+        || !nextTitle || nextTitle.titleWanted != null || nextTitle.title !== '未命名'
+        || !heartbeatReady({ titleWanted: '小美', outbox: [] })) throw new Error('knock relay 檢查失敗');
     const thisYear = String(taipeiNow().getUTCFullYear());
     if (withYear('10/6 11:51') !== thisYear + '/10/06 11:51'
         || withYear(thisYear + '/10/06 11:51') !== thisYear + '/10/06 11:51'
@@ -841,6 +870,28 @@ function selfCheck() {
         || withYear('9/25') !== thisYear + '/09/25'
         || withYear('2024/9/25') !== '2024/09/25'
         || messageTimeMs('2024/03/04 05:06') !== Date.UTC(2024, 2, 4, 5, 6) - 8 * 60 * 60 * 1000) {
+        throw new Error('knock relay 檢查失敗');
+    }
+    const echo = ownEchoPlan(
+        [{ id: 'a', text: '嗨', mine: false }],
+        [{ id: 'a', text: '嗨', mine: false }, { id: 'b', text: '在嗎', mine: true, time: '10:01' }],
+        ['在嗎']
+    );
+    const themOnly = ownEchoPlan(
+        [{ id: 'a', text: '嗨', mine: false }],
+        [{ id: 'a', text: '嗨', mine: false }, { id: 'c', text: '喂', mine: false }],
+        []
+    );
+    const timed = ownEchoPlan(
+        [{ id: 'a', text: '嗨', mine: false, time: '' }],
+        [{ id: 'a', text: '嗨', mine: false, time: '10:02' }],
+        []
+    );
+    if (themTailId([{ id: 'a', mine: true }, { id: 'b', mine: false }, { id: 'c', mine: true }]) !== 'b'
+        || themTailId([{ id: 'c', mine: true }])
+        || !echo || echo.redraw || echo.added.length !== 1 || echo.added[0].id !== 'b' || echo.rest.length
+        || !themOnly || !themOnly.redraw
+        || !timed || timed.redraw || timed.times.length !== 1 || timed.times[0].id !== 'a') {
         throw new Error('knock relay 檢查失敗');
     }
     dropped.delete('user_one:a');
@@ -908,6 +959,7 @@ function heartbeatReady(session) {
     if (session.startWanted) return true;
     if (typeof session.greetingWanted === 'string' && session.greetingWanted !== session.greeting) return true;
     if (typeof session.notifyWanted === 'string' && session.notifyWanted) return true;
+    if (typeof session.titleWanted === 'string') return true;
     return false;
 }
 
@@ -987,6 +1039,60 @@ function send(res, code, body, type) {
         'Cache-Control': 'no-store'
     });
     res.end(payload);
+}
+
+function themTailId(messages) {
+    const ms = messages || [];
+    for (let i = ms.length - 1; i >= 0; i--) {
+        if (ms[i] && !ms[i].mine && ms[i].id) return String(ms[i].id);
+    }
+    return '';
+}
+
+function ownEchoPlan(prev, next, pending) {
+    function same(a, b) {
+        return !!(a && b && a.id && a.id === b.id
+            && String(a.text || '') === String(b.text || '')
+            && !!a.mine === !!b.mine
+            && String(a.image || '') === String(b.image || '')
+            && String(a.quote || '') === String(b.quote || ''));
+    }
+    function leftover(list) {
+        const prevIds = {};
+        (prev || []).forEach(m => { if (m && m.id) prevIds[m.id] = true; });
+        const fresh = [];
+        (next || []).forEach(m => {
+            if (m && m.mine && !m.image && m.id && !prevIds[m.id]) fresh.push(m);
+        });
+        const rest = [];
+        let j = 0;
+        (list || []).forEach(text => {
+            if (fresh[j] && fresh[j].text === text) j += 1;
+            else rest.push(text);
+        });
+        return rest;
+    }
+    const q = (pending || []).slice();
+    const added = [];
+    const times = [];
+    let i = 0;
+    const prevMs = prev || [];
+    for (const m of next || []) {
+        const old = prevMs[i];
+        if (same(old, m)) {
+            if (String(old.time || '') !== String(m.time || '') && m.time) times.push(m);
+            i += 1;
+            continue;
+        }
+        if (m && m.mine && !m.image && q.length && m.text === q[0]) {
+            added.push(m);
+            q.shift();
+            continue;
+        }
+        return { redraw: true, added: [], rest: leftover(pending), times: [] };
+    }
+    if (i !== prevMs.length) return { redraw: true, added: [], rest: leftover(pending), times: [] };
+    return { redraw: false, added, rest: q, times };
 }
 
 const PAGE = `<!DOCTYPE html>
@@ -1104,6 +1210,7 @@ const PAGE = `<!DOCTYPE html>
 </div>
 <button type="button" id="shade" aria-label="關閉列表"></button>
 <script>
+` + themTailId.toString() + '\n' + ownEchoPlan.toString() + `
 const TOKEN_KEY = 'knockRelayPageToken';
 const app = document.getElementById('app');
 const rail = document.getElementById('rail');
@@ -1267,6 +1374,7 @@ function closeRail() { document.body.classList.remove('rail-open'); }
 
 const roomUnread = {};
 const roomTail = {};
+const pendingMine = {};
 let roomTailReady = false;
 
 function redDot() {
@@ -1284,7 +1392,7 @@ function noteRooms(list) {
   const alive = {};
   for (const s of list) {
     alive[s.tabId] = true;
-    const tail = tailId(s);
+    const tail = themTailId(s.messages);
     if (!roomTailReady || roomTail[s.tabId] === undefined) {
       const fresh = roomTailReady && tail && s.tabId !== current;
       roomTail[s.tabId] = tail;
@@ -1300,7 +1408,7 @@ function noteRooms(list) {
   for (const id in roomUnread) if (!alive[id]) delete roomUnread[id];
 }
 
-function paintBar(title, end, avatar) {
+function paintBar(title, end, avatar, onRename) {
   clearChrome();
   const bar = document.createElement('div');
   bar.className = 'topbar';
@@ -1316,6 +1424,18 @@ function paintBar(title, end, avatar) {
   if (avatar) who.append(faceNode(avatar));
   const whoText = document.createElement('span');
   whoText.textContent = title || 'Knock 遠端';
+  if (onRename) {
+    whoText.title = '修改命名';
+    whoText.style.pointerEvents = 'auto';
+    whoText.style.cursor = 'pointer';
+    whoText.onclick = (e) => {
+      e.stopPropagation();
+      const shown = whoText.textContent === '未命名' ? '' : whoText.textContent;
+      const next = prompt('替這位命名。空白表示清除。', shown);
+      if (next == null) return;
+      onRename(next.trim().slice(0, 40));
+    };
+  }
   who.append(whoText);
   bar.append(railBtn, who);
   if (end) bar.append(end);
@@ -1508,7 +1628,20 @@ function paintArchive(talk, follow, y) {
   del.type = 'button';
   del.textContent = '刪除';
   del.onclick = () => { if (uid) deleteTalk(uid); };
-  paintBar((talk && talk.title) || '對話記錄', del, talk && talk.avatar);
+  paintBar((talk && talk.title) || '對話記錄', del, talk && talk.avatar, talk && uid ? (title) => {
+    api('/api/talks/' + encodeURIComponent(uid) + '/title', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: title })
+    }).then(data => {
+      const shown = data.title || '未命名';
+      if (archiveTalk && archiveTalk.uid === uid) archiveTalk.title = shown;
+      const row = talks.find(t => t.uid === uid);
+      if (row) row.title = shown;
+      sessions.forEach(s => { if (s.partnerUid === uid) s.title = shown; });
+      paint();
+    }).catch(err => alert(err.message || '命名失敗'));
+  } : null);
   app.replaceChildren();
   if (!talk) {
     const p = document.createElement('p');
@@ -1855,7 +1988,80 @@ function paintBubble(m) {
     row.append(time);
   }
   wrap.append(row);
+  if (m.id) wrap.dataset.id = m.id;
+  if (m.pending) wrap.dataset.pending = '1';
   app.append(wrap);
+  return wrap;
+}
+
+function replayPending(tabId) {
+  (pendingMine[tabId] || []).forEach(text => paintBubble({ text: text, mine: true, pending: true }));
+}
+
+function showLocalMine(tabId, text) {
+  if (!pendingMine[tabId]) pendingMine[tabId] = [];
+  pendingMine[tabId].push(text);
+  if (tabId !== current || archiveUid || showControls) return;
+  const follow = stickBottom || nearBottom();
+  paintBubble({ text: text, mine: true, pending: true });
+  if (follow) scrollBottom();
+}
+
+function undoLocalMine(tabId) {
+  const q = pendingMine[tabId];
+  if (q && q.length) q.pop();
+  if (tabId !== current) return;
+  const nodes = app.querySelectorAll('.bubble[data-pending]');
+  const last = nodes[nodes.length - 1];
+  if (last) last.remove();
+}
+
+function ensureTime(node, time) {
+  if (!node || !time) return;
+  let el = node.querySelector('.time');
+  if (!el) {
+    el = document.createElement('div');
+    el.className = 'time';
+    const msg = node.querySelector('.msg');
+    if (msg) msg.append(el);
+  }
+  if (el) el.textContent = time;
+}
+
+function stampEcho(added) {
+  const nodes = app.querySelectorAll('.bubble[data-pending]');
+  (added || []).forEach((m, i) => {
+    const node = nodes[i];
+    if (!node) return;
+    node.removeAttribute('data-pending');
+    if (m.id) node.dataset.id = m.id;
+    ensureTime(node, m.time);
+  });
+}
+
+function patchTimes(times) {
+  (times || []).forEach(m => {
+    const all = app.querySelectorAll('.bubble');
+    for (const node of all) {
+      if (node.dataset.id === m.id) ensureTime(node, m.time);
+    }
+  });
+}
+
+function syncMenuDot() {
+  const btn = document.querySelector('.topbar .rail-btn');
+  if (!btn) return;
+  const dot = btn.querySelector('.dot');
+  if (unreadLeft()) { if (!dot) btn.append(redDot()); }
+  else if (dot) dot.remove();
+}
+
+function openingSig(s) {
+  const o = s && s.openings;
+  if (!o) return '';
+  const them = o.them && o.them.text || '';
+  const mine = o.mine && o.mine.text || '';
+  return (o.avatar || '') + '|' + them + '|' + mine + '|' + (o.avatarOn ? '1' : '0') + '|' + (o.userOn ? '1' : '0');
 }
 
 function paintOpening(s) {
@@ -1897,7 +2103,18 @@ function paintOpening(s) {
 }
 
 function paintThread(s, follow, y) {
-  paintBar((s && s.title) || '未命名', controlsGear(), s && s.openings && s.openings.avatar);
+  paintBar((s && s.title) || '未命名', controlsGear(), s && s.openings && s.openings.avatar, s && s.tabId ? (title) => {
+    api('/api/sessions/' + encodeURIComponent(s.tabId) + '/title', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: title })
+    }).then(data => {
+      s.title = data.title || '未命名';
+      const row = data.uid && talks.find(t => t.uid === data.uid);
+      if (row) row.title = s.title;
+      paint();
+    }).catch(err => alert(err.message || '命名失敗'));
+  } : null);
   app.replaceChildren();
   if (!s) {
     const p = document.createElement('p');
@@ -1908,6 +2125,7 @@ function paintThread(s, follow, y) {
   }
   paintOpening(s);
   (s.messages || []).forEach(paintBubble);
+  replayPending(s.tabId);
   placeThread(s, follow, y);
 }
 
@@ -2023,16 +2241,22 @@ function paint() {
     }
     sending = true;
     sendBtn.disabled = true;
+    showLocalMine(s.tabId, text);
+    input.value = '';
+    composeDrafts[s.tabId] = '';
+    lastSentText = text;
+    lastSentAt = Date.now();
     api('/api/sessions/' + encodeURIComponent(s.tabId) + '/send', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text })
-    }).then(() => {
-      input.value = '';
-      composeDrafts[s.tabId] = '';
-      lastSentText = text;
-      lastSentAt = Date.now();
-    }).catch(err => { alert(err.message); }).finally(() => {
+    }).catch(err => {
+      undoLocalMine(s.tabId);
+      if (lastSentText === text) lastSentText = '';
+      input.value = text;
+      composeDrafts[s.tabId] = text;
+      alert(err.message);
+    }).finally(() => {
       sending = false;
       document.querySelectorAll('form button').forEach(btn => { btn.disabled = !canSend(s); });
     });
@@ -2124,6 +2348,7 @@ async function tick() {
   ticking = true;
   try {
     if (!token) return paint();
+    const prevCurrent = sessions.find(s => s.tabId === current);
     const data = await api('/api/sessions' + (pollWait ? '?wait=1' : ''));
     sessions = data.sessions || [];
     noteRooms(sessions);
@@ -2150,7 +2375,31 @@ async function tick() {
       if (!hit || hit.channelId !== userDraft.channelId) userDraft = null;
       else if (hit.openings && !!hit.openings.userOn === userDraft.on) userDraft = null;
     }
-    paint();
+    const nextCurrent = sessions.find(s => s.tabId === current);
+    let quiet = false;
+    if (current && prevCurrent && nextCurrent && prevCurrent.channelId === nextCurrent.channelId && !showControls && !archiveUid) {
+      const plan = ownEchoPlan(prevCurrent.messages, nextCurrent.messages, pendingMine[current] || []);
+      pendingMine[current] = plan.rest;
+      quiet = !plan.redraw
+        && prevCurrent.title === nextCurrent.title
+        && !!prevCurrent.canType === !!nextCurrent.canType
+        && prevCurrent.status === nextCurrent.status
+        && !!prevCurrent.lobby === !!nextCurrent.lobby
+        && !!prevCurrent.waiting === !!nextCurrent.waiting
+        && openingSig(prevCurrent) === openingSig(nextCurrent);
+      if (quiet) {
+        stampEcho(plan.added);
+        patchTimes(plan.times);
+      }
+    } else if (current && prevCurrent && nextCurrent && prevCurrent.channelId !== nextCurrent.channelId) {
+      pendingMine[current] = [];
+    }
+    if (quiet) {
+      paintRail();
+      syncMenuDot();
+    } else {
+      paint();
+    }
   } catch (e) {
     if (!token) paint();
   } finally {
@@ -2254,7 +2503,7 @@ function main() {
                 if (outbox.dirty || patch.dirty || avatarPatch.dirty || userPatch.dirty || greetingPatch.dirty || startPatch.dirty || notifyPatch.dirty) saveSessions(sessions);
                 const talkUid = cleanUid(body && body.archive && body.archive.uid);
                 const savedTalk = talkUid ? talks.get(talkUid) : null;
-                return send(res, 200, { ok: true, outbox: outbox.pending, controls: patch.controls, avatarOn: avatarPatch.avatarOn, userOn: userPatch.userOn, greeting: greetingPatch.greeting, start: startPatch.start, notify: notifyPatch.notify, filters, talkTitle: savedTalk ? savedTalk.title : '' });
+                return send(res, 200, { ok: true, outbox: outbox.pending, controls: patch.controls, avatarOn: avatarPatch.avatarOn, userOn: userPatch.userOn, greeting: greetingPatch.greeting, start: startPatch.start, notify: notifyPatch.notify, filters, talkTitle: savedTalk ? savedTalk.title : '', rename: session.titleWanted || '' });
             }
             const imgMatch = url.pathname.match(/^\/api\/images\/([a-z0-9]{8,40})$/);
             if (imgMatch && req.method === 'GET') {
@@ -2285,6 +2534,36 @@ function main() {
                 if (!item) return send(res, 400, { error: 'empty' });
                 saveSessions(sessions);
                 return send(res, 200, { ok: true, id: item.id });
+            }
+            const titlePost = url.pathname.match(/^\/api\/sessions\/([a-z0-9]{8,40})\/title$/);
+            if (req.method === 'POST' && titlePost) {
+                const session = sessions.get(titlePost[1]);
+                if (!session) return send(res, 404, { error: 'gone' });
+                const body = await readBody(req);
+                const title = String(body && body.title || '').trim().slice(0, 40) || '未命名';
+                session.title = title;
+                session.titleWanted = title;
+                if (setTalkTitle(talks, session.partnerUid, title)) saveTalks(talks);
+                touch();
+                saveSessions(sessions);
+                return send(res, 200, { ok: true, title, uid: session.partnerUid || '' });
+            }
+            const talkTitlePost = url.pathname.match(/^\/api\/talks\/([A-Za-z0-9_-]{6,128})\/title$/);
+            if (req.method === 'POST' && talkTitlePost) {
+                const uid = talkTitlePost[1];
+                if (!talks.get(uid)) return send(res, 404, { error: 'gone' });
+                const body = await readBody(req);
+                const title = String(body && body.title || '').trim().slice(0, 40) || '未命名';
+                setTalkTitle(talks, uid, title);
+                saveTalks(talks);
+                for (const session of sessions.values()) {
+                    if (session.partnerUid !== uid) continue;
+                    session.title = title;
+                    session.titleWanted = title;
+                }
+                touch();
+                saveSessions(sessions);
+                return send(res, 200, { ok: true, title, uid });
             }
             const greetPost = url.pathname.match(/^\/api\/sessions\/([a-z0-9]{8,40})\/greeting$/);
             if (req.method === 'POST' && greetPost) {
