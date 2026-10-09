@@ -2270,13 +2270,13 @@ function paint() {
   sendBtn.textContent = '送出';
   sendBtn.disabled = sending || !canSend(s);
   form.append(input, sendBtn);
-  form.onsubmit = (e) => {
-    e.preventDefault();
+  const sendText = () => {
     const text = input.value.trim();
     if (!text || !canSend(s) || sending) return;
     if (text === lastSentText && Date.now() - lastSentAt < 2000) {
       input.value = '';
       composeDrafts[s.tabId] = '';
+      input.focus();
       return;
     }
     sending = true;
@@ -2286,6 +2286,7 @@ function paint() {
     composeDrafts[s.tabId] = '';
     lastSentText = text;
     lastSentAt = Date.now();
+    input.focus();
     api('/api/sessions/' + encodeURIComponent(s.tabId) + '/send', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -2299,8 +2300,23 @@ function paint() {
     }).finally(() => {
       sending = false;
       document.querySelectorAll('form button').forEach(btn => { btn.disabled = !canSend(s); });
+      input.focus();
     });
   };
+  form.onsubmit = (e) => {
+    e.preventDefault();
+    sendText();
+  };
+  sendBtn.addEventListener('mousedown', (e) => e.preventDefault());
+  sendBtn.addEventListener('touchstart', (e) => {
+    e.preventDefault();
+    input.focus();
+  }, { passive: false });
+  sendBtn.addEventListener('touchend', (e) => {
+    e.preventDefault();
+    input.focus();
+    sendText();
+  });
   const pick = document.createElement('button');
   pick.type = 'button';
   pick.className = 'pick';
