@@ -1197,6 +1197,9 @@ const PAGE = `<!DOCTYPE html>
   svg.face { display:block; fill:#9a9a9a; }
   .open { display:flex; gap:12px; align-items:center; margin:0 0 12px; }
   .open .face { width:64px; height:64px; }
+  .face.zoomable { cursor:pointer; }
+  #zoom { position:fixed; inset:0; z-index:40; border:none; padding:24px; background:rgba(0,0,0,.86); display:flex; align-items:center; justify-content:center; }
+  #zoom .face { width:min(86vw, 420px); height:min(86vw, 420px); border-radius:16px; object-fit:contain; background:transparent; }
   .group { margin-left:auto; flex:none; display:flex; }
   .group button { width:36px; height:36px; padding:0; border:1px solid #666; background:transparent; color:#eee; cursor:pointer; display:flex; align-items:center; justify-content:center; }
   .group button svg { width:18px; height:18px; display:block; }
@@ -1437,7 +1440,7 @@ function paintBar(title, end, avatar, onRename) {
   railBtn.onclick = () => document.body.classList.toggle('rail-open');
   const who = document.createElement('span');
   who.className = 'who';
-  if (avatar) who.append(faceNode(avatar));
+  if (avatar) who.append(faceNode(avatar, true));
   const whoText = document.createElement('span');
   whoText.textContent = title || 'Knock 遠端';
   if (onRename) {
@@ -2087,7 +2090,7 @@ function paintOpening(s) {
   const box = document.createElement('div');
   box.className = 'open';
   if (o.avatar) {
-    const face = faceNode(o.avatar);
+    const face = faceNode(o.avatar, true);
     face.alt = '大頭貼';
     box.append(face);
   }
@@ -2340,13 +2343,34 @@ function plainFace() {
   return svg;
 }
 
-function faceNode(avatar) {
-  if (avatar === 'plain') return plainFace();
-  const img = document.createElement('img');
-  img.className = 'face';
-  img.alt = '';
-  showPic(avatar, img);
-  return img;
+function zoomFace(avatar) {
+  const old = document.getElementById('zoom');
+  if (old) old.remove();
+  const shade = document.createElement('button');
+  shade.type = 'button';
+  shade.id = 'zoom';
+  shade.setAttribute('aria-label', '關閉大頭貼');
+  shade.append(faceNode(avatar));
+  shade.onclick = () => shade.remove();
+  document.body.append(shade);
+}
+
+function faceNode(avatar, zoom) {
+  const node = avatar === 'plain' ? plainFace() : document.createElement('img');
+  if (avatar !== 'plain') {
+    node.className = 'face';
+    node.alt = '';
+    showPic(avatar, node);
+  }
+  if (!zoom || !avatar) return node;
+  node.classList.add('zoomable');
+  node.style.pointerEvents = 'auto';
+  node.onclick = (e) => {
+    e.stopPropagation();
+    e.preventDefault();
+    zoomFace(avatar);
+  };
+  return node;
 }
 
 function showPic(id, img) {

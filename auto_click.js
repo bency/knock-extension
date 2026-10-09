@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.92
+// @version      1.4.93
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -46,7 +46,7 @@
     const RELAY_TOKEN_KEY = 'knockRelayToken';
     const RELAY_TAB_KEY = 'knockRelayTabId';
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.92';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.93';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -194,7 +194,9 @@
     function bindChannel(id) {
         if (!id || currentConversation.id === id) return;
         clearRelayRecord();
-        if (isChannelId(currentConversation.id)) initNewConversation();
+        const before = currentConversation.id;
+        if (isChannelId(before)) initNewConversation();
+        if (currentConversation.id === before) forgetPartnerName();
         currentConversation.id = id;
         if (!currentConversation.startTime) currentConversation.startTime = new Date().toISOString();
         lastBoundAt = Date.now();
@@ -431,6 +433,24 @@
         }
     }
 
+    function partnerChanged(prevUid, nextUid) {
+        return !!(nextUid && nextUid !== prevUid);
+    }
+
+    function keepTalkTitle(sameChannel, sameUid, named, talkTitle) {
+        if (named || !sameChannel || !sameUid) return '';
+        const title = String(talkTitle || '').trim();
+        if (!title || title === '未命名') return '';
+        return title.slice(0, 40);
+    }
+
+    function forgetPartnerName() {
+        nameSet = false;
+        currentConversation.label = '';
+        currentConversation.partnerUid = null;
+        paintPartnerCaption();
+    }
+
     function partnerNameFromLines(opening, firstLine, existing) {
         if (String(existing || '').trim()) return '';
         return openingLineName(opening, '') || openingLineName(firstLine, '');
@@ -615,16 +635,21 @@
             syncUnnamedChip();
             return;
         }
+        let uid = '';
         for (const li of list.querySelectorAll('li.message-li')) {
             if (isMyMessageLi(li)) continue;
             otherPartySeen = true;
-            if (currentConversation.partnerUid) break;
             const messageDiv = li.querySelector('div[data-test="message"]');
             const text = messageDiv ? getMessageText(messageDiv) : '';
-            const uid = TYPING_RE.test(text) ? (typingSentBy(li) || messageSentBy(li)) : messageSentBy(li);
-            if (!uid) continue;
-            currentConversation.partnerUid = uid;
+            const nextUid = TYPING_RE.test(text) ? (typingSentBy(li) || messageSentBy(li)) : messageSentBy(li);
+            if (!nextUid) continue;
+            uid = nextUid;
             break;
+        }
+        if (partnerChanged(currentConversation.partnerUid, uid)) {
+            nameSet = false;
+            currentConversation.label = '';
+            currentConversation.partnerUid = uid;
         }
         autoNamePartner();
         syncUnnamedChip();
@@ -2622,13 +2647,23 @@
             if (res && res.status === 200) {
             if (snap.archive) rememberArchived(snap.archive.uid, snap.archive.messages);
             const data = JSON.parse(res.responseText || '{}');
+            const snapChannel = snap.channelId || '';
+            const snapUid = (snap.archive && snap.archive.uid) || '';
             if (typeof data.rename === 'string' && data.rename) {
                 nameSet = true;
                 currentConversation.label = data.rename === '未命名' ? '' : String(data.rename).slice(0, 40);
                 paintPartnerCaption();
-            } else if (!nameSet && data.talkTitle && data.talkTitle !== '未命名' && currentConversation.label !== data.talkTitle) {
-                currentConversation.label = String(data.talkTitle).slice(0, 40);
-                paintPartnerCaption();
+            } else {
+                const kept = keepTalkTitle(
+                    currentConversation.id === snapChannel,
+                    !snapUid || currentConversation.partnerUid === snapUid,
+                    nameSet,
+                    data.talkTitle
+                );
+                if (kept && currentConversation.label !== kept) {
+                    currentConversation.label = kept;
+                    paintPartnerCaption();
+                }
             }
             applyRemoteLobby(data);
             if (data.leave) pendingRemoteLeave = true;
@@ -2979,7 +3014,16 @@
             || partnerNameFromLines('  嗨  ', '第二句', '') !== '嗨'
             || partnerNameFromLines('https://x/a.jpg', '第二句', '') !== '第二句'
             || partnerNameFromLines('', '第二句', '') !== '第二句'
-            || partnerNameFromLines('嗨', '第二句', '已命名')) {
+            || partnerNameFromLines('嗨', '第二句', '已命名')
+            || !partnerChanged('old-user', 'new-user')
+            || partnerChanged('same-user', 'same-user')
+            || partnerChanged('old-user', '')
+            || !partnerChanged('', 'new-user')
+            || keepTalkTitle(false, true, false, '小美')
+            || keepTalkTitle(true, false, false, '小美')
+            || keepTalkTitle(true, true, true, '小美')
+            || keepTalkTitle(true, true, false, '未命名')
+            || keepTalkTitle(true, true, false, '小美') !== '小美') {
             console.error('knock: 發語詞當顯示名稱失敗');
         }
         const replyHost = document.createElement('div');
