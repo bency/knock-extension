@@ -383,6 +383,7 @@ function applyHeartbeat(sessions, body, now) {
         greeting: body.lobby ? String(body.greeting || '').trim().slice(0, 200) : (prev && prev.greeting) || '',
         greetingWanted: prev && typeof prev.greetingWanted === 'string' ? prev.greetingWanted : null,
         startWanted: !!(prev && prev.startWanted),
+        leaveWanted: !!(prev && prev.leaveWanted),
         status: body.status === 'left' ? 'left' : 'live',
         messages: body.lobby && !(body.messages && body.messages.length) && prev && prev.messages && prev.messages.length
             ? prev.messages
@@ -442,6 +443,7 @@ function loadSessions() {
                 greeting: String(s.greeting || '').slice(0, 200),
                 greetingWanted: typeof s.greetingWanted === 'string' ? String(s.greetingWanted).slice(0, 200) : null,
                 startWanted: !!s.startWanted,
+                leaveWanted: !!s.leaveWanted,
                 status: s.status === 'left' ? 'left' : 'live',
                 messages: cleanMessages(s.messages),
                 seen: Number(s.seen) || 0,
@@ -602,6 +604,12 @@ function takeStartPatch(session) {
     return { start: true, dirty: true };
 }
 
+function takeLeavePatch(session) {
+    if (!session.leaveWanted) return { leave: false, dirty: false };
+    session.leaveWanted = false;
+    return { leave: true, dirty: true };
+}
+
 function latestThemText(session) {
     const list = session && session.messages || [];
     for (let i = list.length - 1; i >= 0; i--) {
@@ -753,6 +761,13 @@ function selfCheck() {
     }, 18500);
     if (!heldStart || !heldStart.startWanted || heldStart.messages.length !== 1) throw new Error('knock relay 檢查失敗');
     heldStart.startWanted = false;
+    heldStart.leaveWanted = true;
+    const keptLeave = applyHeartbeat(sessions, { tabId: 'abc12345', title: '阿明', canType: true, messages: [{ id: 'm1', text: '嗨', mine: false }] }, 16000);
+    if (!keptLeave || !keptLeave.leaveWanted) throw new Error('knock relay 檢查失敗');
+    const leaving = takeLeavePatch(keptLeave);
+    if (!heartbeatReady({ leaveWanted: true, outbox: [] }) || !leaving.leave || keptLeave.leaveWanted || takeLeavePatch(keptLeave).leave) {
+        throw new Error('knock relay 檢查失敗');
+    }
     const keptLobby = applyHeartbeat(sessions, {
         tabId: 'abc12345', title: '大廳', canType: false, lobby: true, greeting: '你好', messages: []
     }, 18600);
@@ -957,6 +972,7 @@ function heartbeatReady(session) {
     const userOn = !!(session.openings && session.openings.userOn);
     if (typeof session.userWanted === 'boolean' && session.userWanted !== userOn) return true;
     if (session.startWanted) return true;
+    if (session.leaveWanted) return true;
     if (typeof session.greetingWanted === 'string' && session.greetingWanted !== session.greeting) return true;
     if (typeof session.notifyWanted === 'string' && session.notifyWanted) return true;
     if (typeof session.titleWanted === 'string') return true;
@@ -1438,6 +1454,7 @@ function paintBar(title, end, avatar, onRename) {
   }
   who.append(whoText);
   bar.append(railBtn, who);
+  if (end && end.dataset.side === '1') who.style.paddingRight = '120px';
   if (end) bar.append(end);
   stage.insertBefore(bar, app);
 }
@@ -2102,8 +2119,42 @@ function paintOpening(s) {
   if (mine) paintBubble(mine);
 }
 
+function leaveChat(s) {
+  if (!s || !confirm('離開這個聊天？')) return;
+  api('/api/sessions/' + encodeURIComponent(s.tabId) + '/leave', { method: 'POST' })
+    .catch(err => alert(err.message || '離開失敗'));
+}
+
+function startChat(s) {
+  if (!s) return;
+  api('/api/sessions/' + encodeURIComponent(s.tabId) + '/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}'
+  }).catch(err => alert(err.message || '開始失敗'));
+}
+
+function threadActions(s) {
+  const gear = controlsGear();
+  if (!s) return gear;
+  const inChat = !s.lobby && s.status !== 'left';
+  const box = document.createElement('div');
+  box.className = 'end';
+  box.dataset.side = '1';
+  box.style.cssText = 'display:flex;margin-left:auto;position:relative;z-index:1;';
+  const action = document.createElement('button');
+  action.type = 'button';
+  action.className = 'gear' + (inChat ? ' del' : '');
+  action.textContent = inChat ? '離開' : '開始';
+  action.onclick = () => { if (inChat) leaveChat(s); else startChat(s); };
+  gear.classList.remove('end');
+  gear.style.marginLeft = '0';
+  box.append(action, gear);
+  return box;
+}
+
 function paintThread(s, follow, y) {
-  paintBar((s && s.title) || '未命名', controlsGear(), s && s.openings && s.openings.avatar, s && s.tabId ? (title) => {
+  paintBar((s && s.title) || '未命名', threadActions(s), s && s.openings && s.openings.avatar, s && s.tabId ? (title) => {
     api('/api/sessions/' + encodeURIComponent(s.tabId) + '/title', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -2191,11 +2242,7 @@ function paint() {
     const saveBtn = document.createElement('button');
     saveBtn.type = 'submit';
     saveBtn.textContent = '設定';
-    const startBtn = document.createElement('button');
-    startBtn.type = 'button';
-    startBtn.textContent = '開始';
-    startBtn.title = '開始聊天';
-    form.append(input, saveBtn, startBtn);
+    form.append(input, saveBtn);
     form.onsubmit = (e) => {
       e.preventDefault();
       const text = input.value.trim();
@@ -2206,13 +2253,6 @@ function paint() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text: text })
       }).catch(err => alert(err.message || '設定失敗'));
-    };
-    startBtn.onclick = () => {
-      api('/api/sessions/' + encodeURIComponent(s.tabId) + '/start', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: '{}'
-      }).catch(err => alert(err.message || '開始失敗'));
     };
     stage.append(form);
     formTab = s.tabId;
@@ -2512,11 +2552,12 @@ function main() {
                 const userPatch = takeUserPatch(session);
                 const greetingPatch = takeGreetingPatch(session);
                 const startPatch = takeStartPatch(session);
+                const leavePatch = takeLeavePatch(session);
                 const notifyPatch = takeNotifyPatch(session);
-                if (outbox.dirty || patch.dirty || avatarPatch.dirty || userPatch.dirty || greetingPatch.dirty || startPatch.dirty || notifyPatch.dirty) saveSessions(sessions);
+                if (outbox.dirty || patch.dirty || avatarPatch.dirty || userPatch.dirty || greetingPatch.dirty || startPatch.dirty || leavePatch.dirty || notifyPatch.dirty) saveSessions(sessions);
                 const talkUid = cleanUid(body && body.archive && body.archive.uid);
                 const savedTalk = talkUid ? talks.get(talkUid) : null;
-                return send(res, 200, { ok: true, outbox: outbox.pending, controls: patch.controls, avatarOn: avatarPatch.avatarOn, userOn: userPatch.userOn, greeting: greetingPatch.greeting, start: startPatch.start, notify: notifyPatch.notify, filters, talkTitle: savedTalk ? savedTalk.title : '', rename: session.titleWanted || '' });
+                return send(res, 200, { ok: true, outbox: outbox.pending, controls: patch.controls, avatarOn: avatarPatch.avatarOn, userOn: userPatch.userOn, greeting: greetingPatch.greeting, start: startPatch.start, leave: leavePatch.leave, notify: notifyPatch.notify, filters, talkTitle: savedTalk ? savedTalk.title : '', rename: session.titleWanted || '' });
             }
             const imgMatch = url.pathname.match(/^\/api\/images\/([a-z0-9]{8,40})$/);
             if (imgMatch && req.method === 'GET') {
@@ -2596,6 +2637,16 @@ function main() {
                 if (!session) return send(res, 404, { error: 'gone' });
                 if (!session.lobby && session.status !== 'left') return send(res, 409, { error: 'cannot start' });
                 session.startWanted = true;
+                touch();
+                saveSessions(sessions);
+                return send(res, 200, { ok: true });
+            }
+            const leavePost = url.pathname.match(/^\/api\/sessions\/([a-z0-9]{8,40})\/leave$/);
+            if (req.method === 'POST' && leavePost) {
+                const session = sessions.get(leavePost[1]);
+                if (!session) return send(res, 404, { error: 'gone' });
+                if (session.lobby || session.status === 'left') return send(res, 409, { error: 'cannot leave' });
+                session.leaveWanted = true;
                 touch();
                 saveSessions(sessions);
                 return send(res, 200, { ok: true });

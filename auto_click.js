@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.91
+// @version      1.4.92
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -46,7 +46,7 @@
     const RELAY_TOKEN_KEY = 'knockRelayToken';
     const RELAY_TAB_KEY = 'knockRelayTabId';
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.91';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.92';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -142,6 +142,7 @@
     let relayRecordUser = false;
     let relayRecordAvatar = false;
     let pendingRemoteStart = false;
+    let pendingRemoteLeave = false;
     let greetingSaveAt = 0;
     let notificationsArmed = false;
     let pendingForcedLeave = false;
@@ -2044,6 +2045,29 @@
         initNewConversation();
     }
 
+    // 遠端離開不看自動開啟。退出後若有確認框，下一輪再按確定。
+    function remoteLeaveChat() {
+        if (!pendingRemoteLeave) return;
+        if (findButtons().some(isRematchButton)) {
+            pendingRemoteLeave = false;
+            return;
+        }
+        const confirm = findButtons().find(isConfirmExitButton);
+        if (confirm) {
+            if (isAutoClicking()) markPendingStartChat('selfLeft');
+            simulateMouseClick(confirm);
+            return;
+        }
+        const exitButton = document.querySelector('button[data-test="chat-exit-button"]');
+        if (!exitButton) {
+            if (findButtons().some(isStartChatButton)) pendingRemoteLeave = false;
+            return;
+        }
+        if (Date.now() - lastExitClickAt < 400) return;
+        lastExitClickAt = Date.now();
+        simulateMouseClick(exitButton);
+    }
+
     function relaySnapshot() {
         const list = document.querySelector('ul[data-test="messages"]');
         const lobby = findButtons().some(isStartChatButton);
@@ -2607,6 +2631,8 @@
                 paintPartnerCaption();
             }
             applyRemoteLobby(data);
+            if (data.leave) pendingRemoteLeave = true;
+            remoteLeaveChat();
             if (data.filters) applyServerFilters(data.filters);
             if (data.controls) applyRelayControls(data.controls);
             if (typeof data.notify === 'string' && data.notify) sendNtfy(data.notify);
@@ -2863,6 +2889,7 @@
         maybeLeaveOnFirstMessageFilter();
         maybeLeaveOnAvatarFilter();
         tryForcedLeave();
+        remoteLeaveChat();
         checkForButtonAndClick();
         checkConversationEnd();
         tryKeepAlive();
