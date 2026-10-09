@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.89
+// @version      1.4.91
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -46,7 +46,7 @@
     const RELAY_TOKEN_KEY = 'knockRelayToken';
     const RELAY_TAB_KEY = 'knockRelayTabId';
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.89';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.91';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -1721,6 +1721,7 @@
         attachDockSwitch(autoRow, autoClickEnabled, (v) => {
             autoClickEnabled = v;
             localStorage.setItem(AUTO_CLICK_ENABLED_KEY, String(v));
+            saveRoomControls();
             requestNotifyPermission();
         });
 
@@ -1741,6 +1742,7 @@
         attachDockSwitch(filterRow, firstFilterEnabled, (v) => {
             firstFilterEnabled = v;
             localStorage.setItem(FIRST_FILTER_ENABLED_KEY, String(v));
+            saveRoomControls();
         }, true);
         filterRow.addEventListener('click', (e) => { e.stopPropagation(); createFirstFilterManager(); });
 
@@ -1750,6 +1752,7 @@
         attachDockSwitch(avatarRow, avatarFilterEnabled, (v) => {
             avatarFilterEnabled = v;
             localStorage.setItem(AVATAR_FILTER_ENABLED_KEY, String(v));
+            saveRoomControls();
         }, true);
         avatarRow.addEventListener('click', (e) => { e.stopPropagation(); createAvatarFilterManager(); });
 
@@ -1757,6 +1760,7 @@
         attachDockSwitch(browserRow, browserNotifyEnabled, (v) => {
             browserNotifyEnabled = v;
             localStorage.setItem(BROWSER_NOTIFY_ENABLED_KEY, String(v));
+            saveRoomControls();
             if (v) requestNotifyPermission();
         }, true);
         browserRow.addEventListener('click', (e) => { e.stopPropagation(); testBrowserNotification(); });
@@ -2283,12 +2287,12 @@
         keepMin = nextKeep.min;
         keepMax = nextKeep.max;
         if (hoursChanged) keepAliveWaitMs = 0;
+        saveRoomControls();
         const dock = el('knock-dock');
         if (dock) {
             dock.remove();
             createDock();
         }
-        saveRoomControls();
     }
 
     function saveRoomControls() {
@@ -2583,6 +2587,7 @@
         if (!snap) return;
         relayBusy = true;
         try {
+            await relayUploadImages(snap);
             const res = await gmRequest({
                 method: 'POST',
                 url: `${RELAY_URL}/api/heartbeat?wait=1`,
@@ -2674,7 +2679,6 @@
                 });
                 if (!sent) relaySending.delete(item.id);
             }
-            await relayUploadImages(snap);
             }
         } catch (e) {}
         relayBusy = false;
@@ -2838,6 +2842,7 @@
     function mountChrome() {
         if (!document.body) return;
         OLD_FLOAT_IDS.forEach(id => el(id)?.remove());
+        if (el('knock-dock')) return;
         const room = storedRoomControls();
         if (room) applyRelayControls(room);
         createDock();

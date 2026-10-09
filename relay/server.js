@@ -1977,7 +1977,7 @@ function paintBubble(m) {
   if (m.image) {
     const img = document.createElement('img');
     img.className = 'pic';
-    img.alt = '圖片';
+    img.alt = '';
     row.append(img);
     showPic(m.image, img);
   }
@@ -2294,14 +2294,26 @@ function faceNode(avatar) {
 }
 
 function showPic(id, img) {
+  if (!id || !img) return;
+  img.dataset.pic = id;
   if (picUrls[id]) { img.src = picUrls[id]; return; }
+  if (img.dataset.loading === '1') return;
+  img.dataset.loading = '1';
   fetch('/api/images/' + id, { headers: { Authorization: 'Bearer ' + token } })
     .then(r => { if (!r.ok) throw new Error('no'); return r.blob(); })
     .then(blob => {
       picUrls[id] = URL.createObjectURL(blob);
+      img.dataset.loading = '';
       if (img.isConnected) img.src = picUrls[id];
     })
-    .catch(() => {});
+    .catch(() => { img.dataset.loading = ''; });
+}
+
+function retryPics() {
+  document.querySelectorAll('img[data-pic]').forEach(img => {
+    if (img.getAttribute('src')) return;
+    showPic(img.dataset.pic, img);
+  });
 }
 
 function shrinkFile(file) {
@@ -2390,6 +2402,7 @@ async function tick() {
       if (quiet) {
         stampEcho(plan.added);
         patchTimes(plan.times);
+        retryPics();
       }
     } else if (current && prevCurrent && nextCurrent && prevCurrent.channelId !== nextCurrent.channelId) {
       pendingMine[current] = [];
