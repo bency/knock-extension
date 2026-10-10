@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.96
+// @version      1.4.97
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -29,8 +29,12 @@
     const START_CHAT_REASON_LABEL = {
         otherLeft: '對方主動斷線',
         selfLeft: '我主動斷線',
-        firstFilter: '使用者過濾而重連'
+        firstFilter: '使用者過濾而重連',
+        lockMiss: '不是鎖定的使用者',
+        lockWait: '讀不到對方 id'
     };
+    const LOCK_UID_KEY = 'knockLockUid';
+    const LOCK_WAIT_MS = 5000;
     const AUTO_CLICK_ENABLED_KEY = 'knockAutoClickEnabled';
     const FIRST_MSG_FILTER_KEY = 'knockFirstMessageFilters';
     const FIRST_FILTER_ENABLED_KEY = 'knockFirstFilterEnabled';
@@ -47,7 +51,7 @@
     const RELAY_TOKEN_KEY = 'knockRelayToken';
     const RELAY_TAB_KEY = 'knockRelayTabId';
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.96';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.97';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -132,6 +136,9 @@
     let keepAliveText = '';
     let keepMin = 1.5;
     let keepMax = 2.5;
+    let lockSince = 0;
+    let knownPeople = [];
+    let lockMenuSig = '';
     let keepAliveWaitMs = 0;
     let lastKeepAliveTryAt = 0;
     let lastKeepAliveSentAt = 0;
@@ -248,6 +255,7 @@
         startChatScheduled = false;
         hideCooldown();
         otherPartySeen = false;
+        lockSince = Date.now();
         syncUnnamedChip();
         console.log('初始化新對話:', currentConversation.id);
     }
@@ -1302,15 +1310,20 @@
         }
     }
 
+    function isLockReason(reason) {
+        return reason === 'lockMiss' || reason === 'lockWait';
+    }
+
     function isAutoClicking() {
         // ponytail: 重整／重新配對會清掉記憶體旗標；session 裡的 firstFilter 撐到開始聊天
-        return autoClickEnabled || forceAutoUntilIdle
-            || sessionStorage.getItem(PENDING_START_CHAT_REASON_KEY) === 'firstFilter';
+        const pendingReason = sessionStorage.getItem(PENDING_START_CHAT_REASON_KEY);
+        return autoClickEnabled || forceAutoUntilIdle || lockHunting()
+            || pendingReason === 'firstFilter' || isLockReason(pendingReason);
     }
 
     function requestForcedLeave(reason, filterName) {
-        if (!autoClickEnabled && reason !== 'firstFilter') return;
-        if (reason === 'firstFilter') forceAutoUntilIdle = true;
+        if (!autoClickEnabled && reason !== 'firstFilter' && !isLockReason(reason)) return;
+        if (reason === 'firstFilter' || isLockReason(reason)) forceAutoUntilIdle = true;
         if (!pendingForcedLeave) {
             pendingForcedLeave = true;
             const firstMark = reason && !sessionStorage.getItem(PENDING_START_CHAT_REASON_KEY);
@@ -1386,10 +1399,112 @@
         return '';
     }
 
+    function lockTarget() {
+        return String(localStorage.getItem(LOCK_UID_KEY) || '').trim();
+    }
+
+    function lockPlan(lockUid, partnerUid, waitedMs, waitMs) {
+        const lock = String(lockUid || '').trim();
+        if (!lock) return 'off';
+        const uid = String(partnerUid || '').trim();
+        if (uid === lock) return 'stay';
+        if (!uid) return waitedMs >= (waitMs == null ? LOCK_WAIT_MS : waitMs) ? 'leave' : 'wait';
+        return 'leave';
+    }
+
+    function filterSkipsLock(lockUid, uid) {
+        const lock = String(lockUid || '').trim();
+        const u = String(uid || '').trim();
+        return !!(lock && u && lock === u);
+    }
+
+    function seenPartnerUid() {
+        return screenPartnerUid() || String(currentConversation.partnerUid || '').trim();
+    }
+
+    function lockHunting() {
+        const lock = lockTarget();
+        if (!lock) return false;
+        if (findButtons().some(isRematchButton) || findButtons().some(isStartChatButton)) return true;
+        return seenPartnerUid() !== lock;
+    }
+
+    function maybeLeaveForLock() {
+        const lock = lockTarget();
+        if (!lock) return false;
+        if (findButtons().some(isStartChatButton)) {
+            if (!isPendingStartChat()) markPendingStartChat('lockMiss');
+            return false;
+        }
+        if (findButtons().some(isRematchButton)) return false;
+        const uid = seenPartnerUid();
+        const plan = lockPlan(lock, uid, lockSince ? Date.now() - lockSince : 0);
+        if (plan === 'stay') {
+            forceAutoUntilIdle = false;
+            lockSince = 0;
+            return false;
+        }
+        if (plan === 'wait') {
+            if (!lockSince) lockSince = Date.now();
+            return false;
+        }
+        if (plan !== 'leave') return false;
+        requestForcedLeave(uid ? 'lockMiss' : 'lockWait');
+        return pendingForcedLeave;
+    }
+
+    function setLockTarget(uid) {
+        const next = String(uid || '').trim();
+        if (next === lockTarget()) return;
+        if (next) localStorage.setItem(LOCK_UID_KEY, next);
+        else localStorage.removeItem(LOCK_UID_KEY);
+        lockSince = Date.now();
+        forceAutoUntilIdle = false;
+        paintLockSelect();
+    }
+
+    function paintLockSelect() {
+        const sel = el('knock-lock-user');
+        if (!sel) return;
+        const rows = knownPeople.slice().sort((a, b) => {
+            const at = a.title || '未命名';
+            const bt = b.title || '未命名';
+            if (at !== bt) return at < bt ? -1 : 1;
+            return a.uid < b.uid ? -1 : a.uid > b.uid ? 1 : 0;
+        });
+        const lock = lockTarget();
+        if (lock && !rows.some(p => p.uid === lock)) rows.unshift({ uid: lock, title: '未命名' });
+        const sig = lock + '\n' + rows.map(p => p.uid + '\0' + (p.title || '')).join('\n');
+        if (sig === lockMenuSig && sel.options.length) return;
+        lockMenuSig = sig;
+        sel.replaceChildren();
+        const none = document.createElement('option');
+        none.value = '';
+        none.textContent = '不鎖定';
+        sel.append(none);
+        rows.forEach(p => {
+            const opt = document.createElement('option');
+            opt.value = p.uid;
+            opt.textContent = (p.title || '未命名') + ' · ' + p.uid;
+            sel.append(opt);
+        });
+        sel.value = lock && rows.some(p => p.uid === lock) ? lock : '';
+    }
+
+    function noteKnownPeople(list) {
+        if (!Array.isArray(list)) return;
+        knownPeople = list.map(p => ({
+            uid: String(p && p.uid || '').trim(),
+            title: String(p && p.title || '').trim() || '未命名'
+        })).filter(p => p.uid);
+        paintLockSelect();
+    }
+
     function maybeLeaveOnFirstMessageFilter() {
         if (!firstFilterEnabled) return false;
         const first = findFirstOtherMessage();
         const uid = (first && first.uid) || screenPartnerUid();
+        if (filterSkipsLock(lockTarget(), uid)) return false;
         if (skipFirstFilterFor && (skipFirstFilterFor === uid || (first && skipFirstFilterFor === pairingIdOf(first)))) return false;
         const filters = getNormalizedFilters();
         if (uid && firstFilterHit(filters, uid, '', '')) {
@@ -1412,6 +1527,7 @@
         if (!avatarFilterEnabled) return false;
         const first = findFirstOtherMessage();
         if (!first || !first.avatarUrl) return false;
+        if (filterSkipsLock(lockTarget(), first.uid || screenPartnerUid())) return false;
         if (skipFirstFilterFor && skipFirstFilterFor === pairingIdOf(first)) return false;
         if (!isAvatarFiltered(first.avatarUrl)) return false;
         console.log('大頭貼命中過濾，準備重連:', first.avatarUrl);
@@ -1603,7 +1719,7 @@
             initNewConversation();
         }
 
-        if (maybeLeaveOnFirstMessageFilter() || maybeLeaveOnAvatarFilter() || tryForcedLeave()) return;
+        if (maybeLeaveOnFirstMessageFilter() || maybeLeaveOnAvatarFilter() || maybeLeaveForLock() || tryForcedLeave()) return;
 
         // ponytail: 重整／往上捲時 DOM 會一次塞進舊訊息；第一次看到列表先標已讀，之後只推最新一則
         const catchUp = !notificationsArmed;
@@ -1819,7 +1935,7 @@
         }, true);
         browserRow.addEventListener('click', (e) => { e.stopPropagation(); testBrowserNotification(); });
 
-        body.append(autoRow, filterRow, avatarRow, browserRow, relayBtn);
+        body.append(autoRow, lockBox(), filterRow, avatarRow, browserRow, relayBtn);
 
         const paintOpen = () => {
             body.style.display = open ? 'flex' : 'none';
@@ -1839,6 +1955,21 @@
         dock.append(header, body);
         document.body.appendChild(dock);
         paintOpen();
+        paintLockSelect();
+    }
+
+    function lockBox() {
+        const row = document.createElement('div');
+        row.style.cssText = DOCK_ROW + 'cursor:default;flex-direction:column;align-items:stretch;';
+        const label = document.createElement('span');
+        label.textContent = '鎖定使用者';
+        const sel = document.createElement('select');
+        sel.id = 'knock-lock-user';
+        sel.style.cssText = 'width:100%;margin-top:6px;padding:6px;border-radius:6px;border:1px solid #555;background:#333;color:#fff;font:inherit;font-size:12px;';
+        sel.addEventListener('click', (e) => e.stopPropagation());
+        sel.addEventListener('change', () => setLockTarget(sel.value));
+        row.append(label, sel);
+        return row;
     }
 
     function fillReactInput(el, value) {
@@ -2695,6 +2826,7 @@
             if (data.leave) pendingRemoteLeave = true;
             remoteLeaveChat();
             if (data.filters) applyServerFilters(data.filters);
+            if (Array.isArray(data.people)) noteKnownPeople(data.people);
             if (data.controls) applyRelayControls(data.controls);
             if (typeof data.notify === 'string' && data.notify) sendNtfy(data.notify);
             if (typeof data.avatarOn === 'boolean') {
@@ -2949,6 +3081,7 @@
     setInterval(() => {
         maybeLeaveOnFirstMessageFilter();
         maybeLeaveOnAvatarFilter();
+        maybeLeaveForLock();
         tryForcedLeave();
         remoteLeaveChat();
         checkForButtonAndClick();
@@ -3088,8 +3221,19 @@
         }
         if (cooldownReasonText('firstFilter', '阿明') !== '開始聊天 · 過濾了 阿明'
             || cooldownReasonText('firstFilter', '') !== '開始聊天 · 使用者過濾而重連'
-            || cooldownReasonText('selfLeft', '阿明') !== '開始聊天 · 我主動斷線') {
+            || cooldownReasonText('selfLeft', '阿明') !== '開始聊天 · 我主動斷線'
+            || cooldownReasonText('lockWait', '') !== '開始聊天 · 讀不到對方 id') {
             console.error('knock: 過濾名稱提示失敗');
+        }
+        if (lockPlan('', 'u1', 0) !== 'off'
+            || lockPlan('u1', 'u1', 0) !== 'stay'
+            || lockPlan('u1', 'u2', 0) !== 'leave'
+            || lockPlan('u1', '', 4999) !== 'wait'
+            || lockPlan('u1', '', 5000) !== 'leave'
+            || !filterSkipsLock('u1', 'u1')
+            || filterSkipsLock('u1', 'u2')
+            || filterSkipsLock('', 'u1')) {
+            console.error('knock: 鎖定使用者判斷失敗');
         }
     }
 

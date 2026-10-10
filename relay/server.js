@@ -271,6 +271,34 @@ function earliestAt(messages) {
     return at;
 }
 
+function personStats(prev, spec) {
+    const channels = prev && Array.isArray(prev.channels) ? prev.channels.slice() : [];
+    let meets = prev && prev.meets || 0;
+    let pendingTalk = !!(prev && prev.pendingTalk);
+    let filterMeet = prev ? prev.filterMeet === true : !(spec && (spec.seedFilter || spec.seedTalk));
+    let talkSeeded = !!(prev && prev.talkSeeded);
+    let count = prev && prev.count || 0;
+    if (spec && spec.seedTalk && !talkSeeded) {
+        talkSeeded = true;
+        if (!meets && !channels.length) {
+            meets = 1;
+            pendingTalk = true;
+        }
+    }
+    if (spec && spec.seedFilter && !filterMeet) {
+        filterMeet = true;
+        meets += 1;
+    }
+    const channelId = String(spec && spec.channelId || '').trim().slice(0, 80);
+    if (channelId && channels.indexOf(channelId) < 0) {
+        channels.push(channelId);
+        if (!(pendingTalk && channels.length === 1)) meets += 1;
+        pendingTalk = false;
+    }
+    if (spec && typeof spec.count === 'number' && spec.count > count) count = spec.count;
+    return { meets, channels, pendingTalk, filterMeet, talkSeeded, count };
+}
+
 function notePerson(box, spec, now) {
     const uid = cleanUid(spec && spec.uid);
     if (!uid) return false;
@@ -289,8 +317,20 @@ function notePerson(box, spec, now) {
     let firstAt = (prev && prev.firstAt) || 0;
     if (seen && (!firstAt || seen < firstAt)) firstAt = seen;
     if (!firstAt) firstAt = now || 0;
-    if (prev && prev.title === title && (prev.avatar || '') === avatar && prev.firstAt === firstAt && !!prev.named === named) return false;
-    box.set(uid, { uid, title, avatar, firstAt, named });
+    const stats = personStats(prev, spec);
+    if (prev && prev.title === title && (prev.avatar || '') === avatar && prev.firstAt === firstAt && !!prev.named === named
+        && prev.meets === stats.meets && prev.count === stats.count && !!prev.pendingTalk === stats.pendingTalk
+        && !!prev.filterMeet === stats.filterMeet && !!prev.talkSeeded === stats.talkSeeded
+        && (prev.channels || []).join() === stats.channels.join()) return false;
+    box.set(uid, {
+        uid, title, avatar, firstAt, named,
+        meets: stats.meets,
+        count: stats.count,
+        channels: stats.channels,
+        pendingTalk: stats.pendingTalk,
+        filterMeet: stats.filterMeet,
+        talkSeeded: stats.talkSeeded
+    });
     return true;
 }
 
@@ -302,6 +342,8 @@ function visiblePeople(box) {
             title: p.title || '未命名',
             avatar: p.avatar || '',
             firstAt: p.firstAt || 0,
+            meets: p.meets || 0,
+            count: p.count || 0,
             filtered: on.has(p.uid)
         }))
         .sort((a, b) => (b.firstAt - a.firstAt) || (a.uid < b.uid ? -1 : 1));
@@ -319,7 +361,13 @@ function loadPeople() {
                 title: String(p.title || '未命名').slice(0, 40) || '未命名',
                 avatar: cleanAvatar(p.avatar) || '',
                 firstAt: Number(p.firstAt) || 0,
-                named: !!p.named
+                named: !!p.named,
+                meets: Number(p.meets) || 0,
+                count: Number(p.count) || 0,
+                channels: Array.isArray(p.channels) ? p.channels.map(c => String(c).slice(0, 80)).filter(Boolean) : [],
+                pendingTalk: p.pendingTalk === true,
+                filterMeet: p.filterMeet === true,
+                talkSeeded: p.talkSeeded === true
             });
         }
         return map;
@@ -339,12 +387,19 @@ function seedPeople(box, talks) {
             uid: t.uid,
             title: t.title,
             avatar: t.avatar,
-            messages: t.messages
+            messages: t.messages,
+            count: (t.messages || []).length,
+            seedTalk: true
         }, t.updated || t.lastAt || 0)) changed = true;
     }
     for (const f of filters.users || []) {
         const uid = cleanUid(f && f.u);
-        if (uid && notePerson(box, { uid, messages: [] }, 0)) changed = true;
+        if (uid && notePerson(box, { uid, seedFilter: true, messages: [] }, 0)) changed = true;
+    }
+    for (const p of box.values()) {
+        if (p.filterMeet) continue;
+        p.filterMeet = true;
+        changed = true;
     }
     return changed;
 }
@@ -1008,6 +1063,31 @@ function selfCheck() {
         || cleanUid('conv_1791645213224_0dsgt5sxq')
         || rememberTalk(new Map(), { archive: { uid: 'conv_1791645213224_0dsgt5sxq', messages: [{ id: 'a', text: '嗨', time: '2020/01/02 08:00' }] } }, 1)
         || notePerson(new Map(), { uid: 'conv_1791645213224_0dsgt5sxq', title: 'x' }, 1)) throw new Error('knock relay 檢查失敗');
+    const meetBox = new Map();
+    if (!notePerson(meetBox, { uid: 'user_meet', channelId: 'chan0001' }, 1)
+        || notePerson(meetBox, { uid: 'user_meet', channelId: 'chan0001' }, 2)
+        || meetBox.get('user_meet').meets !== 1
+        || !notePerson(meetBox, { uid: 'user_meet', channelId: 'chan0002' }, 3)
+        || meetBox.get('user_meet').meets !== 2) throw new Error('knock relay 檢查失敗');
+    const oldTalk = new Map();
+    if (!notePerson(oldTalk, { uid: 'user_hist', seedTalk: true, count: 4, messages: [{ time: '2020/01/02 08:00' }] }, 1)
+        || oldTalk.get('user_hist').meets !== 1
+        || oldTalk.get('user_hist').count !== 4
+        || !notePerson(oldTalk, { uid: 'user_hist', channelId: 'chanhist1' }, 2)
+        || oldTalk.get('user_hist').meets !== 1) throw new Error('knock relay 檢查失敗');
+    const both = new Map();
+    if (!notePerson(both, { uid: 'user_both', seedTalk: true, count: 2 }, 1)
+        || !notePerson(both, { uid: 'user_both', seedFilter: true }, 1)
+        || both.get('user_both').meets !== 2
+        || both.get('user_both').count !== 2
+        || notePerson(both, { uid: 'user_both', seedFilter: true }, 1)) throw new Error('knock relay 檢查失敗');
+    const onlyF = new Map();
+    if (!notePerson(onlyF, { uid: 'user_filt', seedFilter: true }, 1)
+        || onlyF.get('user_filt').meets !== 1
+        || onlyF.get('user_filt').count !== 0
+        || !notePerson(onlyF, { uid: 'user_filt', title: '仍在' }, 2)
+        || onlyF.get('user_filt').meets !== 1
+        || onlyF.get('user_filt').count !== 0) throw new Error('knock relay 檢查失敗');
     const named = new Map();
     if (!rememberTalk(named, { archive: { uid: 'user_name', title: '小美', messages: [{ id: 'n1', text: '嗨', time: '1/2 08:00' }] } }, 1)
         || !rememberTalk(named, { archive: { uid: 'user_name', title: '未命名', messages: [{ id: 'n2', text: '新', time: '1/3 09:00' }] } }, 2)
@@ -1273,11 +1353,12 @@ const PAGE = `<!DOCTYPE html>
   html, body { height:100%; }
   body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:#111; color:#eee; overflow:hidden; }
   .shell { display:flex; height:100%; }
+  #nav { width:208px; flex:none; display:flex; flex-direction:column; align-items:stretch; border-right:1px solid #333; background:#0e0e0e; }
+  #nav button { position:relative; flex:none; box-sizing:border-box; height:3lh; display:flex; align-items:center; justify-content:center; border:none; border-bottom:1px solid #333; background:transparent; color:#888; font-size:16px; font-weight:700; line-height:1.35; cursor:pointer; padding:0 12px; }
+  #nav button.on { color:#eee; background:#1c1c1c; box-shadow:inset 4px 0 #4CAF50; }
+  #nav .dot { top:8px; right:12px; }
   #rail { width:220px; flex:none; overflow:auto; border-right:1px solid #333; background:#111; }
-  #rail .rail-menu { position:sticky; top:0; z-index:3; display:flex; background:#111; border-bottom:1px solid #333; }
-  #rail .rail-menu button { position:relative; flex:1; padding:12px 8px; border:none; background:transparent; color:#888; font-size:13px; font-weight:600; cursor:pointer; }
-  #rail .rail-menu button.on { color:#eee; box-shadow:inset 0 -2px #4CAF50; }
-  #rail .rail-menu .dot { top:8px; right:8px; }
+  body.users #rail { display:none; }
   #rail .fold { display:flex; align-items:center; gap:6px; width:100%; margin:0; padding:10px 12px; border:none; background:transparent; color:#888; font-size:12px; font-weight:600; cursor:pointer; text-align:left; }
   #rail .card { width:calc(100% - 16px); box-sizing:border-box; margin:0 8px 4px; padding:4px 8px; }
   #rail .muted { margin:0 12px 8px; font-size:13px; }
@@ -1292,7 +1373,9 @@ const PAGE = `<!DOCTYPE html>
   .topbar .menu { width:48px; height:48px; padding:0; display:flex; align-items:center; justify-content:center; }
   .topbar .rail-btn { display:none; }
   @media (max-width:760px) {
-    #rail { position:fixed; z-index:20; top:0; bottom:0; left:0; width:min(280px, 86vw); transform:translateX(-110%); transition:transform .18s ease; }
+    #rail { position:fixed; z-index:20; top:0; bottom:0; left:208px; width:min(280px, calc(100vw - 208px)); transform:translateX(-110%); transition:transform .18s ease; }
+    body.pick #rail { position:static; width:auto; flex:1; transform:none; }
+    body.pick .stage { display:none; }
     body.rail-open #rail { transform:none; }
     body.rail-open #shade { display:block; }
     .topbar .rail-btn { display:flex; }
@@ -1305,6 +1388,9 @@ const PAGE = `<!DOCTYPE html>
   .topbar .gear.menu { width:48px; padding:0; }
   .topbar .end { margin-left:auto; }
   .topbar .who { position:absolute; left:0; right:0; top:0; height:48px; display:flex; align-items:center; justify-content:center; gap:8px; padding:0 72px; pointer-events:none; overflow:hidden; }
+  .topbar .back { position:relative; z-index:2; display:flex; align-items:center; height:48px; padding:0 14px; border:none; border-right:1px solid #333; background:#1c1c1c; color:#eee; font-weight:700; cursor:pointer; }
+  .topbar:has(.back) .who { padding-left:108px; }
+  .topbar:has(.back) .who { padding-left:108px; }
   .topbar .who span { min-width:0; max-width:100%; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
   .topbar .who .face { width:1em; height:1em; }
   .topbar .del { background:#e53935; border-color:#e53935; color:#fff; }
@@ -1349,11 +1435,26 @@ const PAGE = `<!DOCTYPE html>
   .queued { flex:none; margin:0; padding:8px 12px; border-top:1px solid #6a5420; background:#2a2416; color:#ffb74d; font-size:13px; }
   .queued div { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .queued button { margin-top:8px; padding:6px 12px; border:none; border-radius:8px; background:#333; color:#eee; cursor:pointer; }
-  #rail .card.user { display:flex; align-items:center; gap:8px; cursor:pointer; }
   .filter-toggle { display:flex; align-items:center; color:#888; }
   .open .filter-toggle { flex-direction:row; gap:8px; margin-top:8px; }
-  #rail .filter-toggle { margin-left:auto; flex:none; flex-direction:column; gap:2px; font-size:11px; }
-  #rail .card small.when { color:#888; }
+  main:has(.people-pane) { display:flex; flex-direction:column; padding:0; overflow:hidden; }
+  .people-pane { flex:1; min-height:0; display:flex; flex-direction:column; }
+  .people-pane .find { flex:0 0 auto; max-height:25%; box-sizing:border-box; overflow:auto; display:flex; flex-direction:column; gap:12px; padding:16px 20px; border-bottom:1px solid #333; background:#141414; }
+  .people-pane .find-title { font-size:13px; font-weight:700; color:#888; }
+  .people-pane .find input, .people-pane .find select { width:100%; box-sizing:border-box; padding:12px; border:1px solid #444; border-radius:8px; background:#1a1a1a; color:#eee; font-size:16px; }
+  .people-pane .find-row { display:flex; align-items:center; gap:8px; }
+  .people-pane .find-row select { flex:1; }
+  .people-pane .find-row span { flex:none; color:#888; font-size:13px; }
+  .people-pane .sheet { flex:1; min-height:0; overflow:auto; }
+  .people-pane table { width:100%; min-width:720px; border-collapse:collapse; }
+  .people-pane th, .people-pane td { text-align:left; padding:8px 10px; border-bottom:1px solid #2a2a2a; vertical-align:middle; }
+  .people-pane th { position:sticky; top:0; background:#161616; color:#aaa; font-weight:600; }
+  .people-pane tr { cursor:pointer; }
+  .people-pane tr.on td { background:#1e3326; }
+  .people-pane .face { width:32px; height:32px; }
+  .people-pane button.link { border:none; background:transparent; padding:0; color:#eee; cursor:pointer; text-align:left; }
+  .people-pane td.uid { font-size:12px; color:#aaa; word-break:break-all; }
+  .people-pane .muted { margin:16px; }
   .gate { display:flex; flex-direction:column; gap:8px; }
   .muted { color:#888; }
   .who { display:flex; gap:10px; align-items:center; }
@@ -1389,6 +1490,7 @@ const PAGE = `<!DOCTYPE html>
 </head>
 <body>
 <div class="shell">
+<nav id="nav"></nav>
 <aside id="rail"></aside>
 <div class="stage" id="stage">
 <main id="app"></main>
@@ -1399,6 +1501,7 @@ const PAGE = `<!DOCTYPE html>
 ` + themTailId.toString() + '\n' + ownEchoPlan.toString() + `
 const TOKEN_KEY = 'knockRelayPageToken';
 const app = document.getElementById('app');
+const nav = document.getElementById('nav');
 const rail = document.getElementById('rail');
 const stage = document.getElementById('stage');
 let token = localStorage.getItem(TOKEN_KEY) || '';
@@ -1411,6 +1514,13 @@ let archiveLoading = '';
 let sessions = [];
 let talks = [];
 let people = [];
+let peopleQuery = '';
+let peopleSort = 'first';
+let peopleFilter = 'all';
+let peopleFindFocus = false;
+let peopleFindAt = 0;
+let peopleScroll = 0;
+let userOpen = false;
 let archiveMissing = '';
 const droppedTalks = new Set();
 let sending = false;
@@ -1835,7 +1945,11 @@ function menuBtn(key, label) {
   btn.onclick = () => {
     if (menu === key) return;
     menu = key;
-    if (key === 'users') showControls = false;
+    if (key === 'users') {
+      showControls = false;
+      userOpen = false;
+    }
+    closeRail();
     paint();
   };
   return btn;
@@ -1880,11 +1994,9 @@ function setUserFilter(p, on) {
   });
 }
 
-function filterSwitch(p) {
+function filterSwitch(p, bare) {
   const wrap = document.createElement('span');
   wrap.className = 'filter-toggle';
-  const cap = document.createElement('span');
-  cap.textContent = '過濾';
   const sw = document.createElement('button');
   sw.type = 'button';
   sw.className = 'sw' + (p.filtered ? ' on' : '');
@@ -1896,78 +2008,196 @@ function filterSwitch(p) {
     setUserFilter(p, !p.filtered);
   };
   wrap.onclick = (e) => e.stopPropagation();
-  wrap.append(cap, sw);
+  if (!bare) {
+    const cap = document.createElement('span');
+    cap.textContent = '過濾';
+    wrap.append(cap);
+  }
+  wrap.append(sw);
   return wrap;
 }
 
-function userCard(p) {
+function openPerson(p) {
+  const prev = document.querySelector('.people-pane .sheet');
+  if (prev) peopleScroll = prev.scrollTop;
+  showControls = false;
+  current = '';
+  userOpen = true;
+  archiveUid = p.uid;
+  archiveTalk = null;
+  archiveUpdated = 0;
+  archiveMissing = talks.some(t => t.uid === p.uid) ? '' : p.uid;
+  stickBottom = true;
+  closeRail();
+  paint();
+  if (!archiveMissing) loadArchive(p.uid);
+}
+
+function peopleRank(list) {
+  const q = peopleQuery.trim().toLowerCase();
+  const rows = [];
+  (list || []).forEach(p => {
+    if (peopleFilter === 'on' && !p.filtered) return;
+    if (peopleFilter === 'off' && p.filtered) return;
+    const name = String(p.title || '').toLowerCase();
+    const uid = String(p.uid || '').toLowerCase();
+    if (q && name.indexOf(q) < 0 && uid.indexOf(q) < 0) return;
+    rows.push(p);
+  });
+  rows.sort((a, b) => {
+    if (peopleSort === 'meets') return (b.meets || 0) - (a.meets || 0) || (b.firstAt || 0) - (a.firstAt || 0);
+    if (peopleSort === 'count') return (b.count || 0) - (a.count || 0) || (b.firstAt || 0) - (a.firstAt || 0);
+    return (b.firstAt || 0) - (a.firstAt || 0) || (a.uid < b.uid ? -1 : 1);
+  });
+  return rows;
+}
+
+function peopleFind(picked) {
+  const box = document.createElement('div');
+  box.className = 'find';
+  const title = document.createElement('div');
+  title.className = 'find-title';
+  title.textContent = '篩選';
+  const input = document.createElement('input');
+  input.id = 'people-find';
+  input.placeholder = '名稱或 id';
+  input.value = peopleQuery;
+  input.oninput = () => {
+    peopleQuery = input.value;
+    peopleFindFocus = true;
+    peopleFindAt = input.selectionStart || 0;
+    paint();
+  };
+  input.onfocus = () => { peopleFindFocus = true; };
+  input.onblur = () => { peopleFindFocus = false; };
   const row = document.createElement('div');
-  row.className = 'card user' + (p.uid === archiveUid ? ' on' : '');
-  if (p.avatar) {
-    row.classList.add('has-face');
-    const box = document.createElement('span');
-    box.className = 'face-box';
-    box.append(faceNode(p.avatar));
-    row.append(box);
-  }
-  const body = document.createElement('div');
-  body.className = 'card-body';
-  const name = document.createElement('div');
-  name.className = 'who';
-  const title = document.createElement('span');
-  title.textContent = p.title || '未命名';
-  title.onclick = (e) => {
+  row.className = 'find-row';
+  const count = document.createElement('span');
+  count.textContent = picked.length + ' 人';
+  const sort = document.createElement('select');
+  [['first', '第一次'], ['meets', '遇到次數'], ['count', '對話量']].forEach(pair => {
+    const opt = document.createElement('option');
+    opt.value = pair[0];
+    opt.textContent = pair[1];
+    if (peopleSort === pair[0]) opt.selected = true;
+    sort.append(opt);
+  });
+  sort.onchange = () => { peopleSort = sort.value; paint(); };
+  const filt = document.createElement('select');
+  [['all', '全部'], ['on', '已過濾'], ['off', '未過濾']].forEach(pair => {
+    const opt = document.createElement('option');
+    opt.value = pair[0];
+    opt.textContent = pair[1];
+    if (peopleFilter === pair[0]) opt.selected = true;
+    filt.append(opt);
+  });
+  filt.onchange = () => { peopleFilter = filt.value; paint(); };
+  row.append(count, sort, filt);
+  box.append(title, input, row);
+  return box;
+}
+
+function peopleRow(p) {
+  const tr = document.createElement('tr');
+  if (p.uid === archiveUid && userOpen) tr.className = 'on';
+  const face = document.createElement('td');
+  if (p.avatar) face.append(faceNode(p.avatar));
+  const name = document.createElement('td');
+  const nameBtn = document.createElement('button');
+  nameBtn.type = 'button';
+  nameBtn.className = 'link';
+  nameBtn.textContent = p.title || '未命名';
+  nameBtn.onclick = (e) => {
     e.stopPropagation();
     askRename(p.uid, p.title || '未命名');
   };
-  name.append(title);
-  const sub = document.createElement('small');
-  sub.className = 'preview';
-  const label = document.createElement('span');
-  label.className = 'preview-text';
-  label.textContent = p.uid;
-  sub.append(label);
-  const when = document.createElement('small');
-  when.className = 'when';
-  when.textContent = '第一次 ' + (talkClock(p.firstAt) || '沒有時間');
-  body.append(name, sub, when);
-  row.append(body, filterSwitch(p));
-  row.onclick = () => {
-    showControls = false;
-    current = '';
-    archiveUid = p.uid;
-    archiveTalk = null;
-    archiveUpdated = 0;
-    archiveMissing = talks.some(t => t.uid === p.uid) ? '' : p.uid;
-    stickBottom = true;
-    closeRail();
-    paint();
-    if (!archiveMissing) loadArchive(p.uid);
-  };
-  return row;
+  name.append(nameBtn);
+  const id = document.createElement('td');
+  id.className = 'uid';
+  id.textContent = p.uid;
+  const when = document.createElement('td');
+  when.textContent = talkClock(p.firstAt) || '沒有時間';
+  const meets = document.createElement('td');
+  meets.textContent = String(p.meets || 0);
+  const count = document.createElement('td');
+  count.textContent = String(p.count || 0);
+  const flag = document.createElement('td');
+  flag.append(filterSwitch(p, true));
+  tr.append(face, name, id, when, meets, count, flag);
+  tr.onclick = () => openPerson(p);
+  return tr;
+}
+
+function peopleTable(rows) {
+  const sheet = document.createElement('div');
+  sheet.className = 'sheet';
+  if (!people.length) {
+    const p = document.createElement('p');
+    p.className = 'muted';
+    p.textContent = '還沒有使用者';
+    sheet.append(p);
+    return sheet;
+  }
+  if (!rows.length) {
+    const p = document.createElement('p');
+    p.className = 'muted';
+    p.textContent = '沒有符合的使用者';
+    sheet.append(p);
+    return sheet;
+  }
+  const table = document.createElement('table');
+  const head = document.createElement('thead');
+  const hr = document.createElement('tr');
+  ['', '名稱', '使用者 id', '第一次', '遇到', '對話量', '過濾'].forEach(text => {
+    const th = document.createElement('th');
+    th.textContent = text;
+    hr.append(th);
+  });
+  head.append(hr);
+  const body = document.createElement('tbody');
+  rows.forEach(p => body.append(peopleRow(p)));
+  table.append(head, body);
+  sheet.append(table);
+  return sheet;
+}
+
+function paintPeople() {
+  const prev = document.querySelector('.people-pane .sheet');
+  if (prev) peopleScroll = prev.scrollTop;
+  clearForm();
+  clearChrome();
+  const picked = peopleRank(people);
+  app.replaceChildren();
+  const pane = document.createElement('div');
+  pane.className = 'people-pane';
+  pane.append(peopleFind(picked), peopleTable(picked));
+  app.append(pane);
+  const sheet = pane.querySelector('.sheet');
+  if (sheet) sheet.scrollTop = peopleScroll;
+  if (!peopleFindFocus) return;
+  const el = document.getElementById('people-find');
+  if (!el) return;
+  el.focus();
+  const at = peopleFindAt || 0;
+  el.setSelectionRange(at, at);
+}
+
+function paintNav() {
+  nav.replaceChildren(menuBtn('chats', '對話'), menuBtn('users', '使用者管理'));
 }
 
 function paintRail() {
   const top = rail.scrollTop;
   rail.replaceChildren();
-  const nav = document.createElement('div');
-  nav.className = 'rail-menu';
-  nav.append(menuBtn('chats', '對話'), menuBtn('users', '使用者管理'));
-  rail.append(nav);
-  if (menu === 'users') {
-    if (!people.length) rail.append(railEmpty('還沒有使用者'));
-    else people.forEach(p => rail.append(userCard(p)));
-  } else {
-    const live = sessions.filter(s => !s.waiting).sort(byRecent);
-    railSection('live', '連線中', () => {
-      if (!live.length) rail.append(railEmpty('沒有正在回報的對話'));
-      else live.forEach(s => rail.append(liveCard(s)));
-    }, live.some(s => roomUnread[s.tabId]));
-    railSection('talks', '記錄', () => {
-      if (!talks.length) rail.append(railEmpty('還沒有對話記錄'));
-      else talks.forEach(t => rail.append(talkCard(t)));
-    });
-  }
+  const live = sessions.filter(s => !s.waiting).sort(byRecent);
+  railSection('live', '連線中', () => {
+    if (!live.length) rail.append(railEmpty('沒有正在回報的對話'));
+    else live.forEach(s => rail.append(liveCard(s)));
+  }, live.some(s => roomUnread[s.tabId]));
+  railSection('talks', '記錄', () => {
+    if (!talks.length) rail.append(railEmpty('還沒有對話記錄'));
+    else talks.forEach(t => rail.append(talkCard(t)));
+  });
   rail.scrollTop = top;
 }
 
@@ -2004,18 +2234,28 @@ function paintUser(talk, follow, y) {
   clearForm();
   const uid = archiveUid;
   if (!uid) {
-    paintBar('使用者管理');
-    app.replaceChildren();
-    const p = document.createElement('p');
-    p.className = 'muted';
-    p.textContent = '選一位使用者';
-    app.append(p);
+    paintPeople();
     return;
   }
   const person = people.find(p => p.uid === uid) || { uid: uid, title: '未命名', avatar: '', firstAt: 0, filtered: false };
   const title = (talk && talk.title) || person.title || '未命名';
   const avatar = (talk && talk.avatar) || person.avatar;
   paintBar(title, null, avatar, (next) => renameTalk(uid, next));
+  const bar = document.querySelector('.topbar');
+  const railBtn = bar && bar.querySelector('.rail-btn');
+  if (railBtn) railBtn.remove();
+  const back = document.createElement('button');
+  back.type = 'button';
+  back.className = 'back';
+  back.textContent = '上一頁';
+  back.onclick = () => {
+    userOpen = false;
+    archiveUid = '';
+    archiveTalk = null;
+    archiveMissing = '';
+    paint();
+  };
+  if (bar) bar.insertBefore(back, bar.firstChild);
   app.replaceChildren();
   const head = document.createElement('div');
   head.className = 'open';
@@ -2032,7 +2272,10 @@ function paintUser(talk, follow, y) {
   const when = document.createElement('div');
   when.className = 'uid';
   when.textContent = '第一次 ' + (talkClock(person.firstAt) || '沒有時間');
-  meta.append(name, idLine, when, filterSwitch(person));
+  const stats = document.createElement('div');
+  stats.className = 'uid';
+  stats.textContent = '遇到 ' + (person.meets || 0) + ' · ' + (person.count || 0) + ' 則';
+  meta.append(name, idLine, when, stats, filterSwitch(person));
   head.append(meta);
   app.append(head);
   if (!talk) {
@@ -2560,14 +2803,19 @@ function paintThread(s, follow, y) {
 function paint() {
   if (!token) { clearForm(); return gate(); }
   document.body.classList.remove('locked');
+  document.body.classList.toggle('users', menu === 'users');
+  document.body.classList.toggle('pick', menu === 'chats' && !current && !archiveUid && !showControls);
   document.querySelectorAll('.gate').forEach(el => el.remove());
-  paintRail();
+  paintNav();
   if (menu === 'users') {
-    const userY = app.scrollTop;
-    const userFollow = stickBottom || nearBottom();
-    paintUser(archiveUid ? archiveTalk : null, userFollow, userY);
+    if (userOpen && archiveUid) {
+      const userY = app.scrollTop;
+      const userFollow = stickBottom || nearBottom();
+      paintUser(archiveTalk, userFollow, userY);
+    } else paintPeople();
     return;
   }
+  paintRail();
   if (showControls) {
     const editing = document.activeElement && document.activeElement.tagName === 'INPUT' && document.activeElement.closest && document.activeElement.closest('#app');
     if (!editing) {
@@ -2880,6 +3128,7 @@ async function tick() {
       pendingMine[current] = [];
     }
     if (quiet) {
+      paintNav();
       paintRail();
       syncMenuDot();
     } else {
@@ -2904,7 +3153,7 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden) tick
 document.getElementById('shade').onclick = () => closeRail();
 let edgeSwipe = null;
 document.addEventListener('pointerdown', (e) => {
-  if (e.button || document.body.classList.contains('rail-open') || e.clientX > 28) return;
+  if (e.button || menu === 'users' || document.body.classList.contains('rail-open') || e.clientX > 28) return;
   edgeSwipe = { x: e.clientX, y: e.clientY, id: e.pointerId };
 });
 document.addEventListener('pointerup', (e) => {
@@ -2912,6 +3161,7 @@ document.addEventListener('pointerup', (e) => {
   const dx = e.clientX - edgeSwipe.x;
   const dy = e.clientY - edgeSwipe.y;
   edgeSwipe = null;
+  if (menu === 'users') return;
   if (dx >= 48 && dx > Math.abs(dy)) document.body.classList.add('rail-open');
 });
 document.addEventListener('pointercancel', () => { edgeSwipe = null; });
@@ -2992,7 +3242,9 @@ function main() {
                         title: archive.named ? archive.title : ((talk && talk.title) || archive.title),
                         named: !!archive.named,
                         avatar: (talk && talk.avatar) || (body.openings && body.openings.avatar),
-                        messages: archive.messages
+                        messages: archive.messages,
+                        channelId: body.channelId,
+                        count: talk ? talk.messages.length : undefined
                     }, Date.now());
                 }
                 saveSessions(sessions);
@@ -3014,7 +3266,7 @@ function main() {
                 if (outbox.dirty || patch.dirty || avatarPatch.dirty || userPatch.dirty || greetingPatch.dirty || startPatch.dirty || leavePatch.dirty || notifyPatch.dirty) saveSessions(sessions);
                 const talkUid = cleanUid(body && body.archive && body.archive.uid);
                 const savedTalk = talkUid ? talks.get(talkUid) : null;
-                return send(res, 200, { ok: true, outbox: outbox.pending, controls: patch.controls, avatarOn: avatarPatch.avatarOn, userOn: userPatch.userOn, greeting: greetingPatch.greeting, start: startPatch.start, leave: leavePatch.leave, notify: notifyPatch.notify, filters, talkTitle: savedTalk ? savedTalk.title : '', rename: session.titleWanted || '' });
+                return send(res, 200, { ok: true, outbox: outbox.pending, controls: patch.controls, avatarOn: avatarPatch.avatarOn, userOn: userPatch.userOn, greeting: greetingPatch.greeting, start: startPatch.start, leave: leavePatch.leave, notify: notifyPatch.notify, filters, people: visiblePeople(people).map(p => ({ uid: p.uid, title: p.title || '未命名' })), talkTitle: savedTalk ? savedTalk.title : '', rename: session.titleWanted || '' });
             }
             const imgMatch = url.pathname.match(/^\/api\/images\/([a-z0-9]{8,40})$/);
             if (imgMatch && req.method === 'GET') {
