@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.93
+// @version      1.4.96
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -42,11 +42,12 @@
     const NTFY_TITLE_KEY = 'knockNtfyTitle';
     const NTFY_TITLE_DEFAULT = 'Knock 新訊息';
     const NTFY_SERVER = 'https://ntfy.sh';
+    const NTFY_GAP_MS = 2000;
     const RELAY_URL = 'https://knock.keeping.work';
     const RELAY_TOKEN_KEY = 'knockRelayToken';
     const RELAY_TAB_KEY = 'knockRelayTabId';
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.93';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.96';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -1504,6 +1505,33 @@
 
     let lastNtfyAt = 0;
     let ntfyBackoffUntil = 0;
+    let ntfyHold = null;
+
+    function phoneNotifyPlan(holdingSame, sinceSend, now, gapMs) {
+        if (holdingSame) return 'join';
+        if (now - sinceSend < gapMs) return 'skip';
+        return 'hold';
+    }
+
+    function queuePhoneNotify(body) {
+        if (!ntfyEnabled) return;
+        const topic = getNtfyTopic();
+        if (!topic || Date.now() < ntfyBackoffUntil) return;
+        const same = !!(ntfyHold && ntfyHold.topic === topic);
+        const plan = phoneNotifyPlan(same, lastNtfyAt, Date.now(), NTFY_GAP_MS);
+        if (plan === 'skip') return;
+        if (plan === 'join') {
+            ntfyHold.lines.push(body);
+            return;
+        }
+        ntfyHold = { topic, title: getNtfyTitle(), lines: [body] };
+        setTimeout(() => {
+            const hold = ntfyHold;
+            if (!hold || hold.topic !== topic) return;
+            ntfyHold = null;
+            sendNtfy(hold.lines.join('\n').slice(0, 500), hold.title);
+        }, NTFY_GAP_MS);
+    }
 
     function ntfyStatusDetail(status) {
         if (status === 429) return 'HTTP 429：ntfy.sh 公開伺服器限流，請隔一分鐘再試';
@@ -1554,10 +1582,10 @@
     }
 
     function notifyNewMessage(text) {
-        if (!notificationsArmed || (document.hasFocus() && !document.hidden)) return;
+        if (!notificationsArmed) return;
         const body = (text || '你有一則新訊息').replace(/\s+/g, ' ').trim().slice(0, 80) || '你有一則新訊息';
-        if (ntfyEnabled && Date.now() - lastNtfyAt > 15000) sendNtfy(body);
-        if (browserNotifyEnabled) showBrowserNotification(body);
+        queuePhoneNotify(body);
+        if (browserNotifyEnabled && !(document.hasFocus() && !document.hidden)) showBrowserNotification(body);
     }
 
     function checkNewMessages() {
@@ -2163,9 +2191,7 @@
 
     function archiveUidOf(conv) {
         const uid = String((conv && conv.partnerUid) || '').trim();
-        if (/^[A-Za-z0-9_-]{6,128}$/.test(uid)) return uid;
-        const id = String((conv && conv.id) || '').trim();
-        if (/^[A-Za-z0-9_-]{6,128}$/.test(id)) return id;
+        if (/^[A-Za-z0-9_-]{6,128}$/.test(uid) && uid.indexOf('conv_') !== 0) return uid;
         return '';
     }
 
@@ -2974,9 +3000,11 @@
             console.error('knock: channel id 解析失敗');
         }
         const src = archiveSources({ id: 'live1', partnerUid: 'user_one', label: '阿明', messages: [{ id: 'm3' }, { id: 'm2' }] }, '');
+        const missingUid = archiveSources({ id: 'conv_1791645213224_0dsgt5sxq', partnerUid: '', messages: [{ id: 'm1' }] }, '');
         const batch = nextArchive(src, new Set(['user_one:m2']));
         const later = nextArchive(src, new Set(['user_one:m2', 'user_one:m3']));
         if (src.length !== 1 || src[0].uid !== 'user_one' || src[0].title !== '阿明'
+            || missingUid.length
             || src[0].messages.map(m => m.id).join() !== 'm3,m2'
             || !batch || batch.messages.map(m => m.id).join() !== 'm3'
             || later) {
@@ -3023,7 +3051,10 @@
             || keepTalkTitle(true, false, false, '小美')
             || keepTalkTitle(true, true, true, '小美')
             || keepTalkTitle(true, true, false, '未命名')
-            || keepTalkTitle(true, true, false, '小美') !== '小美') {
+            || keepTalkTitle(true, true, false, '小美') !== '小美'
+            || phoneNotifyPlan(false, 0, 3000, 2000) !== 'hold'
+            || phoneNotifyPlan(false, 1000, 2500, 2000) !== 'skip'
+            || phoneNotifyPlan(true, 1000, 2500, 2000) !== 'join') {
             console.error('knock: 發語詞當顯示名稱失敗');
         }
         const replyHost = document.createElement('div');
