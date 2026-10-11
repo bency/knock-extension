@@ -1569,6 +1569,7 @@ let peopleFilter = 'all';
 let peopleFindFocus = false;
 let peopleFindAt = 0;
 let peopleScroll = 0;
+let peopleScrollX = 0;
 let faceScroll = 0;
 let userOpen = false;
 let archiveMissing = '';
@@ -2123,10 +2124,16 @@ function peopleFind(picked) {
   input.id = 'people-find';
   input.placeholder = '名稱或 id';
   input.value = peopleQuery;
+  input.addEventListener('compositionstart', () => { input.dataset.composing = '1'; });
+  input.addEventListener('compositionend', () => {
+    delete input.dataset.composing;
+    peopleQuery = input.value;
+    paint();
+  });
   input.oninput = () => {
     peopleQuery = input.value;
     peopleFindFocus = true;
-    peopleFindAt = input.selectionStart || 0;
+    if (input.dataset.composing) return;
     paint();
   };
   input.onfocus = () => { peopleFindFocus = true; };
@@ -2299,7 +2306,24 @@ function paintFaces() {
 
 function paintPeople() {
   const prev = document.querySelector('.people-pane .sheet');
-  if (prev) peopleScroll = prev.scrollTop;
+  if (prev) {
+    peopleScroll = prev.scrollTop;
+    peopleScrollX = prev.scrollLeft;
+  }
+  const keep = document.getElementById('people-find');
+  if (peopleFindFocus && keep && document.activeElement === keep) {
+    peopleQuery = keep.value;
+    const picked = peopleRank(people);
+    const pane = keep.closest('.people-pane');
+    const next = peopleTable(picked);
+    if (prev && prev.parentNode) prev.replaceWith(next);
+    else if (pane) pane.append(next);
+    const count = pane && pane.querySelector('.find-row span');
+    if (count) count.textContent = picked.length + ' 人';
+    next.scrollTop = peopleScroll;
+    next.scrollLeft = peopleScrollX;
+    return;
+  }
   clearForm();
   paintBar('使用者管理');
   const picked = peopleRank(people);
@@ -2309,7 +2333,10 @@ function paintPeople() {
   pane.append(peopleFind(picked), peopleTable(picked));
   app.append(pane);
   const sheet = pane.querySelector('.sheet');
-  if (sheet) sheet.scrollTop = peopleScroll;
+  if (sheet) {
+    sheet.scrollTop = peopleScroll;
+    sheet.scrollLeft = peopleScrollX;
+  }
   if (!peopleFindFocus) return;
   const el = document.getElementById('people-find');
   if (!el) return;
@@ -2827,6 +2854,12 @@ function syncMenuDot() {
   else if (dot) dot.remove();
 }
 
+function refreshList() {
+  paintNav();
+  paintRail();
+  syncMenuDot();
+}
+
 function openingSig(s) {
   const o = s && s.openings;
   if (!o) return '';
@@ -3223,17 +3256,6 @@ async function tick() {
     }
     talks = freshTalks.filter(t => !droppedTalks.has(t.uid));
     people = data.people || [];
-    if (archiveUid) {
-      const sum = talks.find(t => t.uid === archiveUid);
-      if (sum && (!archiveTalk || sum.updated !== archiveUpdated)) {
-        archiveMissing = '';
-        loadArchive(archiveUid);
-      } else if (!sum && archiveMissing !== archiveUid) {
-        archiveMissing = archiveUid;
-        archiveTalk = null;
-        paint();
-      }
-    }
     if (controlDraft) {
       const hit = sessions.find(s => s.tabId === controlDraft.tabId);
       if (hit && hit.controls && JSON.stringify(packControls(hit.controls)) === JSON.stringify(controlDraft.controls)) controlDraft = null;
@@ -3250,8 +3272,15 @@ async function tick() {
     }
     const nextCurrent = sessions.find(s => s.tabId === current);
     if (nextCurrent && nextCurrent.waiting) current = '';
+    const openLive = menu === 'chats' && current && !showControls && !archiveUid;
+    if (!openLive) {
+      const leftOpen = menu === 'chats' && !showControls && !archiveUid && prevCurrent && !current;
+      if (leftOpen || (!app.childNodes.length && menu === 'chats')) paint();
+      else refreshList();
+      return;
+    }
     let quiet = false;
-    if (menu !== 'users' && menu !== 'faces' && current && prevCurrent && nextCurrent && prevCurrent.channelId === nextCurrent.channelId && !showControls && !archiveUid) {
+    if (prevCurrent && nextCurrent && prevCurrent.channelId === nextCurrent.channelId) {
       const plan = ownEchoPlan(prevCurrent.messages, nextCurrent.messages, pendingMine[current] || []);
       pendingMine[current] = plan.rest;
       quiet = !plan.redraw
@@ -3266,17 +3295,12 @@ async function tick() {
         patchTimes(plan.times);
         retryPics();
       }
-    } else if (current && prevCurrent && nextCurrent && prevCurrent.channelId !== nextCurrent.channelId) {
+    } else if (prevCurrent && nextCurrent && prevCurrent.channelId !== nextCurrent.channelId) {
       pendingMine[current] = [];
     }
-    if (quiet) {
-      paintNav();
-      paintRail();
-      syncMenuDot();
-    } else {
-      paint();
-    }
-    if (otherPing && menu !== 'users' && current && !showControls && !archiveUid) glowInput();
+    if (quiet) refreshList();
+    else paint();
+    if (otherPing) glowInput();
   } catch (e) {
     if (!token) paint();
   } finally {

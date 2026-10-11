@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.102
+// @version      1.4.103
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -52,7 +52,7 @@
     const RELAY_TOKEN_KEY = 'knockRelayToken';
     const RELAY_TAB_KEY = 'knockRelayTabId';
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.102';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.103';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -157,6 +157,7 @@
     let pendingForcedLeave = false;
     let forceAutoUntilIdle = false;
     let lastExitClickAt = 0;
+    let lastExitRevealAt = 0;
     let skipFirstFilterFor = null;
     let rematchScheduled = false;
     let startChatScheduled = false;
@@ -1358,14 +1359,43 @@
         tryForcedLeave();
     }
 
+    function exitStep(hasConfirm, hasExit, hasList) {
+        if (hasConfirm) return 'confirm';
+        if (hasExit) return 'exit';
+        if (hasList) return 'reveal';
+        return 'wait';
+    }
+
+    // 送出後退出鈕會先藏起來，要點過對話列才出現。
+    function revealChatExit() {
+        const list = document.querySelector('ul[data-test="messages"]');
+        if (!list) return false;
+        if (Date.now() - lastExitRevealAt < 400) return true;
+        lastExitRevealAt = Date.now();
+        const box = document.querySelector('[data-test="input-message"] textarea:not([readonly])');
+        if (box) box.blur();
+        const opts = { bubbles: true, cancelable: true, button: 0 };
+        for (const type of ['mousedown', 'mouseup', 'click']) {
+            try { list.dispatchEvent(new MouseEvent(type, opts)); } catch (e) {}
+        }
+        try { list.click(); } catch (e) {}
+        return true;
+    }
+
     function tryForcedLeave() {
         if (!pendingForcedLeave || !isAutoClicking()) return false;
-        if (findButtons().some(isConfirmExitButton)) {
+        const exitButton = document.querySelector('button[data-test="chat-exit-button"]');
+        const step = exitStep(
+            findButtons().some(isConfirmExitButton),
+            !!exitButton,
+            !!document.querySelector('ul[data-test="messages"]')
+        );
+        if (step === 'confirm') {
             checkForButtonAndClick();
             return true;
         }
-        const exitButton = document.querySelector('button[data-test="chat-exit-button"]');
-        if (!exitButton) return false;
+        if (step === 'reveal') return revealChatExit();
+        if (step !== 'exit') return false;
         if (Date.now() - lastExitClickAt < 400) return true;
         lastExitClickAt = Date.now();
         console.log('找到退出按鈕，點擊中...');
@@ -2332,13 +2362,18 @@
             return;
         }
         const confirm = findButtons().find(isConfirmExitButton);
-        if (confirm) {
+        const exitButton = document.querySelector('button[data-test="chat-exit-button"]');
+        const step = exitStep(!!confirm, !!exitButton, !!document.querySelector('ul[data-test="messages"]'));
+        if (step === 'confirm') {
             if (isAutoClicking()) markPendingStartChat('selfLeft');
             simulateMouseClick(confirm);
             return;
         }
-        const exitButton = document.querySelector('button[data-test="chat-exit-button"]');
-        if (!exitButton) {
+        if (step === 'reveal') {
+            revealChatExit();
+            return;
+        }
+        if (step !== 'exit') {
             if (findButtons().some(isStartChatButton)) pendingRemoteLeave = false;
             return;
         }
@@ -3297,6 +3332,12 @@
         const replyHost = document.createElement('div');
         replyHost.innerHTML = '<div data-test="message"><span><div><div><div></div><div><div data-test="user-avatar"></div><div>[unknown]</div><div>原文</div></div></div><div>回覆</div></div></span></div>';
         const replyDiv = replyHost.querySelector('[data-test="message"]');
+        if (exitStep(true, true, true) !== 'confirm'
+            || exitStep(false, true, true) !== 'exit'
+            || exitStep(false, false, true) !== 'reveal'
+            || exitStep(false, false, false) !== 'wait') {
+            console.error('knock: 離開按鈕步驟失敗');
+        }
         if (getMessageQuote(replyDiv) !== '原文' || getMessageText(replyDiv) !== '回覆') {
             console.error('knock: 回覆拆分失敗', getMessageQuote(replyDiv), getMessageText(replyDiv));
         }
