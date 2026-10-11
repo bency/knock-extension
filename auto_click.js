@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.98
+// @version      1.4.99
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -52,7 +52,7 @@
     const RELAY_TOKEN_KEY = 'knockRelayToken';
     const RELAY_TAB_KEY = 'knockRelayTabId';
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.98';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.99';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -1542,8 +1542,8 @@
         Notification.requestPermission().catch(() => {});
     }
 
-    function showBrowserNotification(body) {
-        const title = 'Knock 新訊息';
+    function showBrowserNotification(body, titleText) {
+        const title = titleText || 'Knock 新訊息';
         const text = (body || '你有一則新訊息').replace(/\s+/g, ' ').trim().slice(0, 80) || '你有一則新訊息';
         const details = {
             title,
@@ -1564,7 +1564,7 @@
         } catch (e) {}
         if (!('Notification' in window) || Notification.permission !== 'granted') return false;
         try {
-            const notification = new Notification(title, { body: text, tag: 'knock-new-message' });
+            const notification = new Notification(title, { body: text, tag: titleText ? 'knock-keep-alive' : 'knock-new-message' });
             notification.onclick = () => {
                 window.focus();
                 notification.close();
@@ -1988,17 +1988,47 @@
         }
     }
 
-    function sendChatMessage(text, onSent) {
+    function sendAttemptPlan(armed, boxValue, wanted) {
+        const value = String(boxValue || '').trim();
+        const text = String(wanted || '').trim();
+        if (!text) return 'skip';
+        // 框是空的只代表上一擊已經送出。還沒把字填進去時，空框不是成功。
+        if (armed && !value) return 'sent';
+        if (value !== text) return 'fill';
+        return 'click';
+    }
+
+    function sendChatMessage(text, onSent, onFail) {
+        const wanted = String(text || '').trim();
+        let settled = false;
+        const succeed = () => {
+            if (settled) return true;
+            settled = true;
+            if (onSent) onSent();
+            return true;
+        };
+        const fail = () => {
+            if (settled) return false;
+            settled = true;
+            if (onFail) onFail();
+            return false;
+        };
+        if (!wanted) return fail();
         const wrap = document.querySelector('[data-test="input-message"]');
-        if (!wrap) return false;
+        if (!wrap) return fail();
         const box = Array.from(wrap.querySelectorAll('textarea')).find(t =>
             t.getAttribute('aria-hidden') !== 'true' && t.style.visibility !== 'hidden'
         );
-        if (!box) return false;
-        fillReactInput(box, text);
+        if (!box) return fail();
+        let armed = false;
         const trySend = () => {
-            if (!box.value.trim()) return true;
-            if (box.value !== text) fillReactInput(box, text);
+            const plan = sendAttemptPlan(armed, box.value, wanted);
+            if (plan === 'sent') return true;
+            if (plan !== 'click') {
+                fillReactInput(box, wanted);
+                if (sendAttemptPlan(armed, box.value, wanted) !== 'click') return false;
+            }
+            armed = true;
             const send = document.querySelector('button[data-test="send"]');
             if (send && !send.disabled) {
                 send.click();
@@ -2008,20 +2038,19 @@
             }
             return !box.value.trim();
         };
-        if (trySend()) {
-            if (onSent) onSent();
-            return true;
-        }
+        if (trySend()) return succeed();
         let tries = 0;
         const tick = () => {
+            if (settled) return;
             if (trySend()) {
-                if (onSent) onSent();
+                succeed();
                 return;
             }
             if (++tries < 15) setTimeout(tick, 80);
+            else fail();
         };
         setTimeout(tick, 50);
-        return true;
+        return false;
     }
 
     function keepSentence(text) {
@@ -2080,6 +2109,23 @@
         return keepAliveWaitMs;
     }
 
+    const KEEP_WARN_MS = 600000;
+    let lastKeepWarnAt = 0;
+
+    function keepWarnPlan(sinceWarn, now, gapMs) {
+        return now - sinceWarn >= gapMs;
+    }
+
+    function warnKeepAliveFailed() {
+        const now = Date.now();
+        if (!keepWarnPlan(lastKeepWarnAt, now, KEEP_WARN_MS)) return;
+        lastKeepWarnAt = now;
+        const body = '持續連線沒送出';
+        showToast(body);
+        if (ntfyEnabled && getNtfyTopic()) sendNtfy(body, 'Knock 持續連線');
+        if (browserNotifyEnabled) showBrowserNotification(body, 'Knock 持續連線');
+    }
+
     function tryKeepAlive() {
         if (!keepAliveEnabled) return;
         const text = keepSentence(keepAliveText);
@@ -2093,8 +2139,9 @@
         lastKeepAliveTryAt = Date.now();
         sendChatMessage(text, () => {
             lastKeepAliveSentAt = Date.now();
+            lastKeepWarnAt = 0;
             rollKeepAliveWaitMs();
-        });
+        }, warnKeepAliveFailed);
     }
 
     function relayToken() {
@@ -3224,6 +3271,14 @@
             || keepRange(2.5, 1.5).max !== 2.5
             || keepSentence('') !== '🎶'
             || keepSentence('  嗨  ') !== '嗨'
+            || sendAttemptPlan(false, '', '🎶') !== 'fill'
+            || sendAttemptPlan(false, '🎶', '🎶') !== 'click'
+            || sendAttemptPlan(true, '', '🎶') !== 'sent'
+            || sendAttemptPlan(true, '🎶', '🎶') !== 'click'
+            || sendAttemptPlan(false, '', '') !== 'skip'
+            || !keepWarnPlan(0, 600000, 600000)
+            || keepWarnPlan(600000, 600000, 600000)
+            || !keepWarnPlan(0, 1200000, 600000)
             || messageAtMs('2026-10-06', '11:51', quietNight) !== new Date(2026, 9, 6, 11, 51).getTime()
             || messageAtMs('', '23:59', quietNight) !== new Date(2026, 9, 5, 23, 59).getTime()) {
             console.error('knock: 遠端控制比對失敗');
