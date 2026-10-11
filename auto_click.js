@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.101
+// @version      1.4.102
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -52,7 +52,7 @@
     const RELAY_TOKEN_KEY = 'knockRelayToken';
     const RELAY_TAB_KEY = 'knockRelayTabId';
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.101';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.102';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -1385,13 +1385,13 @@
         return unique ? unique[1] : `${first.filterKey}|${first.messageId}`;
     }
 
-    function findFirstOtherMessage() {
+    function findFirstOtherMessage(keepDated) {
         const list = document.querySelector('ul[data-test="messages"]');
         if (!list) return null;
         for (const li of list.querySelectorAll('li.message-li')) {
             if (isMyMessageLi(li)) continue;
             const messageDiv = li.querySelector('div[data-test="message"]');
-            if (!messageDiv || messageDiv.querySelector('span[data-test="date"]')) continue;
+            if (!messageDiv || (!keepDated && messageDiv.querySelector('span[data-test="date"]'))) continue;
             const text = getMessageText(messageDiv);
             const imageUrls = getMessageImages(messageDiv);
             const filterKey = text || stableImageKey(imageUrls[0]) || '';
@@ -1543,14 +1543,19 @@
         return pendingForcedLeave;
     }
 
+    function avatarFollowUp(isMine, text) {
+        if (isMine) return false;
+        return !TYPING_RE.test(String(text || ''));
+    }
+
     function extraAvatarMessages(openingLi) {
         const list = document.querySelector('ul[data-test="messages"]');
         if (!list || !openingLi) return false;
         for (const li of list.querySelectorAll('li.message-li')) {
-            if (li === openingLi) continue;
+            if (li === openingLi || isMyMessageLi(li)) continue;
             const messageDiv = li.querySelector('div[data-test="message"]');
             const text = messageDiv ? getMessageText(messageDiv) : '';
-            if (TYPING_RE.test(text)) continue;
+            if (!avatarFollowUp(false, text)) continue;
             return true;
         }
         return false;
@@ -1558,7 +1563,7 @@
 
     function maybeLeaveOnAvatarFilter() {
         if (!avatarFilterEnabled) return false;
-        const first = findFirstOtherMessage();
+        const first = findFirstOtherMessage(true);
         if (!first) return false;
         if (filterSkipsLock(lockTarget(), first.uid || screenPartnerUid())) return false;
         if (skipFirstFilterFor && skipFirstFilterFor === pairingIdOf(first)) return false;
@@ -2978,15 +2983,10 @@
                 const started = relaySending.get(item.id) || 0;
                 if (Date.now() - started < 8000) continue;
                 relaySending.set(item.id, Date.now());
-                sendChatMessage(item.text, () => {
-                    gmRequest({
-                        method: 'POST',
-                        url: `${RELAY_URL}/api/sessions/${snap.tabId}/ack`,
-                        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-                        data: JSON.stringify({ id: item.id }),
-                        timeout: 8000
-                    }).catch(() => {}).finally(() => relaySending.delete(item.id));
-                }, () => relaySending.delete(item.id));
+                const drop = () => {
+                    ackRelayItem(token, snap.tabId, item.id).finally(() => relaySending.delete(item.id));
+                };
+                sendChatMessage(item.text, drop, drop);
             }
             }
         } catch (e) {}
@@ -3219,6 +3219,9 @@
             || avatarLeavePlan(true, true) !== 'stay'
             || avatarLeavePlan(false, true) !== 'leave'
             || avatarLeavePlan(false, false) !== 'stay'
+            || avatarFollowUp(true, '嗨')
+            || !avatarFollowUp(false, '177 中部')
+            || avatarFollowUp(false, '對方正在輸入')
             || relayImageId('https://x/a.png?token=1') !== relayImageId('https://x/a.png?token=2')) {
             console.error('knock: 大頭貼過濾判斷失敗');
         }
