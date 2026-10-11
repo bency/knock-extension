@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.103
+// @version      1.4.104
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -52,7 +52,7 @@
     const RELAY_TOKEN_KEY = 'knockRelayToken';
     const RELAY_TAB_KEY = 'knockRelayTabId';
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.103';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.104';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -158,6 +158,7 @@
     let forceAutoUntilIdle = false;
     let lastExitClickAt = 0;
     let lastExitRevealAt = 0;
+    let exitRevealArmed = false;
     let skipFirstFilterFor = null;
     let rematchScheduled = false;
     let startChatScheduled = false;
@@ -1366,19 +1367,34 @@
         return 'wait';
     }
 
-    // 送出後退出鈕會先藏起來，要點過對話列才出現。
-    function revealChatExit() {
-        const list = document.querySelector('ul[data-test="messages"]');
-        if (!list) return false;
-        if (Date.now() - lastExitRevealAt < 400) return true;
-        lastExitRevealAt = Date.now();
-        const box = document.querySelector('[data-test="input-message"] textarea:not([readonly])');
-        if (box) box.blur();
+    function nextExitReveal(armed) {
+        return armed ? 'list' : 'input';
+    }
+
+    function clickNode(node) {
+        if (!node) return;
         const opts = { bubbles: true, cancelable: true, button: 0 };
         for (const type of ['mousedown', 'mouseup', 'click']) {
-            try { list.dispatchEvent(new MouseEvent(type, opts)); } catch (e) {}
+            try { node.dispatchEvent(new MouseEvent(type, opts)); } catch (e) {}
         }
-        try { list.click(); } catch (e) {}
+        try { node.click(); } catch (e) {}
+    }
+
+    // 送出後退出鈕會先藏起來。要先點輸入框，再點對話列，才會出現。
+    function revealChatExit() {
+        const list = document.querySelector('ul[data-test="messages"]');
+        const box = document.querySelector('[data-test="input-message"] textarea:not([readonly])');
+        if (!list || !box) return false;
+        if (Date.now() - lastExitRevealAt < 150) return true;
+        lastExitRevealAt = Date.now();
+        const which = nextExitReveal(exitRevealArmed);
+        exitRevealArmed = !exitRevealArmed;
+        if (which === 'input') {
+            clickNode(box);
+            try { box.focus(); } catch (e) {}
+            return true;
+        }
+        clickNode(list);
         return true;
     }
 
@@ -1390,6 +1406,7 @@
             !!exitButton,
             !!document.querySelector('ul[data-test="messages"]')
         );
+        if (step === 'confirm' || step === 'exit') exitRevealArmed = false;
         if (step === 'confirm') {
             checkForButtonAndClick();
             return true;
@@ -2364,6 +2381,7 @@
         const confirm = findButtons().find(isConfirmExitButton);
         const exitButton = document.querySelector('button[data-test="chat-exit-button"]');
         const step = exitStep(!!confirm, !!exitButton, !!document.querySelector('ul[data-test="messages"]'));
+        if (step === 'confirm' || step === 'exit') exitRevealArmed = false;
         if (step === 'confirm') {
             if (isAutoClicking()) markPendingStartChat('selfLeft');
             simulateMouseClick(confirm);
@@ -3335,7 +3353,9 @@
         if (exitStep(true, true, true) !== 'confirm'
             || exitStep(false, true, true) !== 'exit'
             || exitStep(false, false, true) !== 'reveal'
-            || exitStep(false, false, false) !== 'wait') {
+            || exitStep(false, false, false) !== 'wait'
+            || nextExitReveal(false) !== 'input'
+            || nextExitReveal(true) !== 'list') {
             console.error('knock: 離開按鈕步驟失敗');
         }
         if (getMessageQuote(replyDiv) !== '原文' || getMessageText(replyDiv) !== '回覆') {
