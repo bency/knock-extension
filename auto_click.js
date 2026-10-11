@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.99
+// @version      1.4.100
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -52,7 +52,7 @@
     const RELAY_TOKEN_KEY = 'knockRelayToken';
     const RELAY_TAB_KEY = 'knockRelayTabId';
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.99';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.100';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -487,7 +487,7 @@
         paintPartnerCaption();
     }
 
-    // --- 大頭貼過濾（只記網址；勾選疊在頭像上，不包頭像） ---
+    // --- 大頭貼過濾（記圖片識別；舊名單裡的完整網址仍算命中。勾選疊在頭像上，不包頭像） ---
     function normalizeAvatarFilter(item) {
         const u = String(item && typeof item === 'object' ? (item.u ?? item.url ?? '') : item || '').trim();
         return u || null;
@@ -497,26 +497,43 @@
         return storageGet(AVATAR_FILTER_KEY, []).map(normalizeAvatarFilter).filter(Boolean);
     }
 
-    function isAvatarFiltered(url) {
-        const u = (url || '').trim();
-        return !!u && getAvatarFilters().includes(u);
+    function avatarFilterKey(url, id) {
+        const key = String(id || '').trim();
+        return key || String(url || '').trim();
     }
 
-    function addAvatarFilter(url) {
-        const u = (url || '').trim();
-        if (!u) return false;
+    function avatarFilterHit(list, url, id) {
+        const rows = list || [];
+        const u = String(url || '').trim();
+        const key = String(id || '').trim();
+        if (u && rows.includes(u)) return true;
+        return !!(key && rows.includes(key));
+    }
+
+    function avatarLeavePlan(extra, hit) {
+        if (!hit || extra) return 'stay';
+        return 'leave';
+    }
+
+    function isAvatarFiltered(url, id) {
+        return avatarFilterHit(getAvatarFilters(), url, id);
+    }
+
+    function addAvatarFilter(url, id) {
+        const key = avatarFilterKey(url, id);
+        if (!key) return false;
         const list = getAvatarFilters();
-        if (list.includes(u)) return false;
-        list.push(u);
+        if (list.includes(key)) return false;
+        list.push(key);
         const ok = storageSet(AVATAR_FILTER_KEY, list);
-        if (ok) pushFilters({ addAvatars: [u] });
+        if (ok) pushFilters({ addAvatars: [key] });
         return ok;
     }
 
-    function removeAvatarFilter(url) {
-        const u = (url || '').trim();
-        const ok = storageSet(AVATAR_FILTER_KEY, getAvatarFilters().filter(x => x !== u));
-        if (ok) pushFilters({ removeAvatars: [u] });
+    function removeAvatarFilter(url, id) {
+        const drop = [String(url || '').trim(), String(id || '').trim()].filter(Boolean);
+        const ok = storageSet(AVATAR_FILTER_KEY, getAvatarFilters().filter(x => drop.indexOf(x) < 0));
+        if (ok && drop.length) pushFilters({ removeAvatars: drop });
         return ok;
     }
 
@@ -564,24 +581,26 @@
     function syncAvatarFilterButtons() {
         document.querySelectorAll('.knock-remember-avatar, .knock-remember-avatar-saved').forEach(btn => {
             const url = decodeURIComponent(btn.dataset.avatarUrl || '');
-            paintAvatarFilterButton(btn, !!(url && isAvatarFiltered(url)));
+            const id = btn.dataset.avatarId || '';
+            paintAvatarFilterButton(btn, isAvatarFiltered(url, id));
         });
         const badge = el('knock-avatar-filter-count');
         if (badge) badge.textContent = String(getAvatarFilters().length);
     }
 
-    function toggleAvatarFilter(url) {
+    function toggleAvatarFilter(url, id) {
         const u = (url || '').trim();
-        if (!u) return false;
-        if (isAvatarFiltered(u)) {
-            removeAvatarFilter(u);
+        const first = findFirstOtherMessage();
+        const keyId = String(id || '').trim() || openingAvatar(first && first.li, u);
+        if (!avatarFilterKey(u, keyId)) return false;
+        if (isAvatarFiltered(u, keyId)) {
+            removeAvatarFilter(u, keyId);
             syncAvatarFilterButtons();
             showToast('已從大頭貼過濾移除');
             return false;
         }
-        if (addAvatarFilter(u)) {
-            const first = findFirstOtherMessage();
-            skipFirstFilterFor = first ? pairingIdOf(first) : u;
+        if (addAvatarFilter(u, keyId)) {
+            skipFirstFilterFor = first ? pairingIdOf(first) : (u || keyId);
             pendingForcedLeave = false;
             syncAvatarFilterButtons();
             showToast('已加入大頭貼過濾');
@@ -1524,14 +1543,29 @@
         return pendingForcedLeave;
     }
 
+    function extraAvatarMessages(openingLi) {
+        const list = document.querySelector('ul[data-test="messages"]');
+        if (!list || !openingLi) return false;
+        for (const li of list.querySelectorAll('li.message-li')) {
+            if (li === openingLi) continue;
+            const messageDiv = li.querySelector('div[data-test="message"]');
+            const text = messageDiv ? getMessageText(messageDiv) : '';
+            if (TYPING_RE.test(text)) continue;
+            return true;
+        }
+        return false;
+    }
+
     function maybeLeaveOnAvatarFilter() {
         if (!avatarFilterEnabled) return false;
         const first = findFirstOtherMessage();
-        if (!first || !first.avatarUrl) return false;
+        if (!first) return false;
         if (filterSkipsLock(lockTarget(), first.uid || screenPartnerUid())) return false;
         if (skipFirstFilterFor && skipFirstFilterFor === pairingIdOf(first)) return false;
-        if (!isAvatarFiltered(first.avatarUrl)) return false;
-        console.log('大頭貼命中過濾，準備重連:', first.avatarUrl);
+        const id = openingAvatar(first.li, first.avatarUrl);
+        const hit = avatarFilterHit(getAvatarFilters(), first.avatarUrl, id);
+        if (avatarLeavePlan(extraAvatarMessages(first.li), hit) !== 'leave') return false;
+        console.log('大頭貼命中過濾，準備重連:', first.avatarUrl || id);
         requestForcedLeave('firstFilter');
         return pendingForcedLeave;
     }
@@ -1800,9 +1834,10 @@
                 btn.type = 'button';
                 btn.className = 'knock-remember-avatar';
                 btn.dataset.avatarUrl = encodeURIComponent(first.avatarUrl);
+                btn.dataset.avatarId = openingAvatar(first.li, first.avatarUrl);
                 btn.style.left = `${Math.max(0, avatarEl.offsetLeft + avatarEl.offsetWidth - 14)}px`;
                 btn.style.top = `${Math.max(0, avatarEl.offsetTop + avatarEl.offsetHeight - 14)}px`;
-                paintAvatarFilterButton(btn, isAvatarFiltered(first.avatarUrl));
+                paintAvatarFilterButton(btn, isAvatarFiltered(first.avatarUrl, btn.dataset.avatarId));
                 btn.addEventListener('click', (e) => {
                     e.preventDefault();
                     e.stopPropagation();
@@ -2887,7 +2922,8 @@
                 relayRecordAvatar = data.avatarOn;
                 const first = findFirstOtherMessage();
                 const url = first && first.avatarUrl;
-                if (url && isAvatarFiltered(url) !== data.avatarOn) toggleAvatarFilter(url);
+                const id = first ? openingAvatar(first.li, url) : '';
+                if ((url || id) && isAvatarFiltered(url, id) !== data.avatarOn) toggleAvatarFilter(url, id);
             }
             if (typeof data.userOn === 'boolean') {
                 relayRecordUser = data.userOn;
@@ -3172,7 +3208,18 @@
         }
         if (normalizeAvatarFilter(' https://a/b.png ') !== 'https://a/b.png'
             || normalizeAvatarFilter({ url: 'https://a/b.png' }) !== 'https://a/b.png'
-            || normalizeAvatarFilter('')) {
+            || normalizeAvatarFilter('')
+            || avatarFilterKey('https://a/p.png?token=1', 'face1') !== 'face1'
+            || avatarFilterKey('https://a/p.png', '') !== 'https://a/p.png'
+            || !avatarFilterHit(['face1'], 'https://a/p.png?token=1', 'face1')
+            || !avatarFilterHit(['face1'], 'https://a/p.png?token=2', 'face1')
+            || !avatarFilterHit(['https://a/p.png?token=1'], 'https://a/p.png?token=1', '')
+            || avatarFilterHit(['face1'], 'https://a/p.png?token=1', 'face2')
+            || avatarFilterHit([], 'https://a/p.png', 'face1')
+            || avatarLeavePlan(true, true) !== 'stay'
+            || avatarLeavePlan(false, true) !== 'leave'
+            || avatarLeavePlan(false, false) !== 'stay'
+            || relayImageId('https://x/a.png?token=1') !== relayImageId('https://x/a.png?token=2')) {
             console.error('knock: 大頭貼過濾判斷失敗');
         }
         const dayNow = new Date(2026, 8, 20, 12, 0, 0);

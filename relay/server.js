@@ -334,8 +334,25 @@ function notePerson(box, spec, now) {
     return true;
 }
 
+function faceRows(list) {
+    const map = new Map();
+    for (const p of list || []) {
+        const id = String(p && p.avatar || '');
+        if (!id) continue;
+        let row = map.get(id);
+        if (!row) {
+            row = { id, count: 0, filtered: false };
+            map.set(id, row);
+        }
+        row.count += 1;
+        if (p.avatarFiltered) row.filtered = true;
+    }
+    return [...map.values()].sort((a, b) => (b.count - a.count) || (a.id < b.id ? -1 : 1));
+}
+
 function visiblePeople(box) {
     const on = new Set((filters.users || []).map(x => x && x.u).filter(Boolean));
+    const faces = new Set(filters.avatars || []);
     return [...box.values()]
         .map(p => ({
             uid: p.uid,
@@ -344,7 +361,8 @@ function visiblePeople(box) {
             firstAt: p.firstAt || 0,
             meets: p.meets || 0,
             count: p.count || 0,
-            filtered: on.has(p.uid)
+            filtered: on.has(p.uid),
+            avatarFiltered: !!(p.avatar && faces.has(p.avatar))
         }))
         .sort((a, b) => (b.firstAt - a.firstAt) || (a.uid < b.uid ? -1 : 1));
 }
@@ -1059,6 +1077,18 @@ function selfCheck() {
     filters.users.push({ u: 'user_one', t: '', a: '' });
     const shownPeople = visiblePeople(folks);
     filters.users = filters.users.filter(x => x.u !== 'user_one');
+    filters.avatars.push('faceaaa1');
+    notePerson(folks, { uid: 'user_face1', avatar: 'faceaaa1', title: '甲' }, 1);
+    notePerson(folks, { uid: 'user_face2', avatar: 'faceaaa1', title: '乙' }, 1);
+    notePerson(folks, { uid: 'user_face3', avatar: 'facebbb2', title: '丙' }, 1);
+    const facePeople = visiblePeople(folks);
+    const faceList = faceRows(facePeople);
+    filters.avatars = filters.avatars.filter(x => x !== 'faceaaa1');
+    if (!facePeople.find(p => p.uid === 'user_face1' && p.avatarFiltered)
+        || facePeople.find(p => p.uid === 'user_face3' && p.avatarFiltered)
+        || faceList[0].id !== 'faceaaa1' || faceList[0].count !== 2 || !faceList[0].filtered
+        || !faceList.find(row => row.id === 'facebbb2' && row.count === 1 && !row.filtered)
+        || faceRows([{ avatar: '' }]).length) throw new Error('knock relay 檢查失敗');
     if (!shownPeople.find(p => p.uid === 'user_one' && p.filtered && p.title === '小美')
         || shownPeople.find(p => p.uid === 'user_bare').firstAt !== 1000
         || cleanUid('conv_1791645213224_0dsgt5sxq')
@@ -1137,6 +1167,12 @@ function selfCheck() {
     );
     if (themTailId([{ id: 'a', mine: true }, { id: 'b', mine: false }, { id: 'c', mine: true }]) !== 'b'
         || themTailId([{ id: 'c', mine: true }])
+        || composerAlert('b', 'a', 'm1', undefined, false)
+        || composerAlert('a', 'a', 'm2', 'm1', true)
+        || composerAlert('b', 'a', '', 'm1', true)
+        || composerAlert('b', 'a', 'm1', 'm1', true)
+        || !composerAlert('b', 'a', 'm2', 'm1', true)
+        || !composerAlert('b', 'a', 'm1', undefined, true)
         || !echo || echo.redraw || echo.added.length !== 1 || echo.added[0].id !== 'b' || echo.rest.length
         || !themOnly || !themOnly.redraw
         || !timed || timed.redraw || timed.times.length !== 1 || timed.times[0].id !== 'a') {
@@ -1290,6 +1326,11 @@ function send(res, code, body, type) {
     res.end(payload);
 }
 
+function composerAlert(tabId, currentId, tail, prevTail, ready) {
+    if (!ready || !tail || !tabId || tabId === currentId) return false;
+    return prevTail === undefined || tail !== prevTail;
+}
+
 function themTailId(messages) {
     const ms = messages || [];
     for (let i = ms.length - 1; i >= 0; i--) {
@@ -1359,7 +1400,7 @@ const PAGE = `<!DOCTYPE html>
   #nav button.on { color:#eee; background:#1c1c1c; box-shadow:inset 4px 0 #4CAF50; }
   #nav .dot { top:8px; right:12px; }
   #rail { width:220px; flex:none; overflow:auto; border-right:1px solid #333; background:#111; }
-  body.users #rail { display:none; }
+  body.users #rail, body.faces #rail { display:none; }
   #rail .fold { display:flex; align-items:center; gap:6px; width:100%; margin:0; padding:10px 12px; border:none; background:transparent; color:#888; font-size:12px; font-weight:600; cursor:pointer; text-align:left; }
   #rail .card { width:calc(100% - 16px); box-sizing:border-box; margin:0 8px 4px; padding:4px 8px; }
   #rail .muted { margin:0 12px 8px; font-size:13px; }
@@ -1374,12 +1415,12 @@ const PAGE = `<!DOCTYPE html>
   .topbar .menu { width:48px; height:48px; padding:0; display:flex; align-items:center; justify-content:center; }
   .topbar .rail-btn { display:none; }
   @media (min-width:761px) {
-    body.people-list .topbar { display:none; }
+    body.people-list .topbar, body.face-list .topbar { display:none; }
   }
   @media (max-width:760px) {
     #nav, #rail { position:fixed; left:0; width:min(280px, 86vw); transform:translateX(-110%); transition:transform .18s ease; }
     #nav { z-index:21; top:0; height:auto; }
-    #rail { z-index:20; top:calc(var(--menu-item) * 2); bottom:0; }
+    #rail { z-index:20; top:calc(var(--menu-item) * 3); bottom:0; }
     body.rail-open #nav, body.rail-open #rail { transform:none; }
     body.rail-open #shade { display:block; }
     .topbar .rail-btn { display:flex; }
@@ -1432,6 +1473,8 @@ const PAGE = `<!DOCTYPE html>
   .time { display:block; margin-top:4px; font-size:11px; color:rgba(255,255,255,.55); }
   form { position:relative; flex:none; display:flex; gap:8px; padding:10px; background:#111; border-top:1px solid #333; }
   form input { flex:1; padding:10px; border-radius:8px; border:1px solid #444; background:#1a1a1a; }
+  form input.glow { animation:composer-glow .5s ease-out; }
+  @keyframes composer-glow { 0% { box-shadow:0 0 0 0 rgba(255,183,77,0); } 40% { box-shadow:0 0 12px 3px rgba(255,183,77,.9); } 100% { box-shadow:0 0 0 0 rgba(255,183,77,0); } }
   form input[type=file] { display:none; }
   form button { padding:10px 14px; border:none; border-radius:8px; background:#4CAF50; cursor:pointer; }
   form button.pick { background:#333; }
@@ -1459,6 +1502,8 @@ const PAGE = `<!DOCTYPE html>
   .people-pane button.link { border:none; background:transparent; padding:0; color:#eee; cursor:pointer; text-align:left; }
   .people-pane td.uid { font-size:12px; color:#aaa; word-break:break-all; }
   .people-pane .muted { margin:16px; }
+  .face-pane table { min-width:0; }
+  .face-pane tr { cursor:default; }
   .gate { display:flex; flex-direction:column; gap:8px; }
   .muted { color:#888; }
   .who { display:flex; gap:10px; align-items:center; }
@@ -1486,7 +1531,7 @@ const PAGE = `<!DOCTYPE html>
   .extra button { padding:8px 12px; border:none; border-radius:8px; background:#2d4a6d; color:#eee; cursor:pointer; }
   .hours { display:flex; align-items:center; gap:6px; color:#aaa; }
   .hours input { width:72px; }
-  .sw { width:40px; height:22px; border-radius:11px; background:#555; position:relative; flex:none; }
+  .sw { width:40px; height:22px; border:none; padding:0; border-radius:11px; background:#555; position:relative; flex:none; cursor:pointer; }
   .sw.on { background:#4CAF50; }
   .sw i { width:18px; height:18px; border-radius:50%; background:#fff; position:absolute; top:2px; left:2px; }
   .sw.on i { left:20px; }
@@ -1502,7 +1547,7 @@ const PAGE = `<!DOCTYPE html>
 </div>
 <button type="button" id="shade" aria-label="關閉列表"></button>
 <script>
-` + themTailId.toString() + '\n' + ownEchoPlan.toString() + `
+` + themTailId.toString() + '\n' + ownEchoPlan.toString() + '\n' + composerAlert.toString() + '\n' + faceRows.toString() + `
 const TOKEN_KEY = 'knockRelayPageToken';
 const app = document.getElementById('app');
 const nav = document.getElementById('nav');
@@ -1524,6 +1569,7 @@ let peopleFilter = 'all';
 let peopleFindFocus = false;
 let peopleFindAt = 0;
 let peopleScroll = 0;
+let faceScroll = 0;
 let userOpen = false;
 let archiveMissing = '';
 const droppedTalks = new Set();
@@ -1723,27 +1769,38 @@ function unreadLeft() {
 
 function noteRooms(list) {
   const alive = {};
+  let alert = false;
   for (const s of list) {
     alive[s.tabId] = true;
     const tail = themTailId(s.messages);
+    const prev = roomTail[s.tabId];
     if (s.waiting) {
-      if (roomTail[s.tabId] === undefined) roomTail[s.tabId] = tail;
+      if (prev === undefined) roomTail[s.tabId] = tail;
       delete roomUnread[s.tabId];
       continue;
     }
-    if (!roomTailReady || roomTail[s.tabId] === undefined) {
-      const fresh = roomTailReady && tail && s.tabId !== current;
+    if (composerAlert(s.tabId, current, tail, prev, roomTailReady)) alert = true;
+    if (!roomTailReady || prev === undefined) {
       roomTail[s.tabId] = tail;
-      if (fresh) roomUnread[s.tabId] = true;
+      if (roomTailReady && tail && s.tabId !== current) roomUnread[s.tabId] = true;
       continue;
     }
-    if (tail === roomTail[s.tabId]) continue;
+    if (tail === prev) continue;
     roomTail[s.tabId] = tail;
     if (s.tabId === current || !tail) delete roomUnread[s.tabId];
     else roomUnread[s.tabId] = true;
   }
   roomTailReady = true;
   for (const id in roomUnread) if (!alive[id]) delete roomUnread[id];
+  return alert;
+}
+
+function glowInput() {
+  const input = document.querySelector('form input:not([type=file])');
+  if (!input || input.dataset.kind === 'greeting') return;
+  input.classList.remove('glow');
+  void input.offsetWidth;
+  input.classList.add('glow');
 }
 
 function paintBar(title, end, avatar, onRename) {
@@ -1949,7 +2006,7 @@ function menuBtn(key, label) {
   btn.onclick = () => {
     if (menu === key) return;
     menu = key;
-    if (key === 'users') {
+    if (key === 'users' || key === 'faces') {
       showControls = false;
       userOpen = false;
     }
@@ -2014,7 +2071,7 @@ function filterSwitch(p, bare) {
   wrap.onclick = (e) => e.stopPropagation();
   if (!bare) {
     const cap = document.createElement('span');
-    cap.textContent = '過濾';
+    cap.textContent = '過濾使用者';
     wrap.append(cap);
   }
   wrap.append(sw);
@@ -2152,7 +2209,7 @@ function peopleTable(rows) {
   const table = document.createElement('table');
   const head = document.createElement('thead');
   const hr = document.createElement('tr');
-  ['', '名稱', '使用者 id', '第一次', '遇到', '對話量', '過濾'].forEach(text => {
+  ['', '名稱', '使用者 id', '第一次', '遇到', '對話量', '過濾使用者'].forEach(text => {
     const th = document.createElement('th');
     th.textContent = text;
     hr.append(th);
@@ -2163,6 +2220,81 @@ function peopleTable(rows) {
   table.append(head, body);
   sheet.append(table);
   return sheet;
+}
+
+function setFaceFilter(id, on) {
+  const touched = [];
+  people.forEach(p => {
+    if (p.avatar !== id) return;
+    touched.push(p);
+    p.avatarFiltered = on;
+  });
+  paint();
+  api('/api/filters', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(on ? { addAvatars: [id] } : { removeAvatars: [id] })
+  }).catch(err => {
+    touched.forEach(p => { p.avatarFiltered = !on; });
+    alert(err.message || '設定失敗');
+    paint();
+  });
+}
+
+function paintFaces() {
+  const prev = document.querySelector('.face-pane .sheet');
+  if (prev) faceScroll = prev.scrollTop;
+  clearForm();
+  paintBar('大頭貼過濾');
+  const rows = faceRows(people);
+  app.replaceChildren();
+  const pane = document.createElement('div');
+  pane.className = 'people-pane face-pane';
+  const sheet = document.createElement('div');
+  sheet.className = 'sheet';
+  if (!rows.length) {
+    const p = document.createElement('p');
+    p.className = 'muted';
+    p.textContent = '還沒有記錄到大頭照';
+    sheet.append(p);
+  } else {
+    const table = document.createElement('table');
+    const head = document.createElement('thead');
+    const hr = document.createElement('tr');
+    ['', '多少人共用', '過濾'].forEach(text => {
+      const th = document.createElement('th');
+      th.textContent = text;
+      hr.append(th);
+    });
+    head.append(hr);
+    const body = document.createElement('tbody');
+    rows.forEach(row => {
+      const tr = document.createElement('tr');
+      const face = document.createElement('td');
+      face.append(faceNode(row.id));
+      const count = document.createElement('td');
+      count.textContent = String(row.count);
+      const flag = document.createElement('td');
+      const sw = document.createElement('button');
+      sw.type = 'button';
+      sw.className = 'sw' + (row.filtered ? ' on' : '');
+      sw.title = row.filtered ? '已在過濾名單，再點移除' : '把這張圖列入過濾';
+      sw.append(document.createElement('i'));
+      sw.onclick = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setFaceFilter(row.id, !row.filtered);
+      };
+      flag.append(sw);
+      tr.append(face, count, flag);
+      body.append(tr);
+    });
+    table.append(head, body);
+    sheet.append(table);
+  }
+  pane.append(sheet);
+  app.append(pane);
+  sheet.scrollTop = faceScroll;
 }
 
 function paintPeople() {
@@ -2187,7 +2319,7 @@ function paintPeople() {
 }
 
 function paintNav() {
-  nav.replaceChildren(menuBtn('chats', '對話'), menuBtn('users', '使用者管理'));
+  nav.replaceChildren(menuBtn('chats', '對話'), menuBtn('users', '使用者管理'), menuBtn('faces', '大頭貼過濾'));
 }
 
 function paintRail() {
@@ -2808,9 +2940,15 @@ function paint() {
   if (!token) { clearForm(); return gate(); }
   document.body.classList.remove('locked');
   document.body.classList.toggle('users', menu === 'users');
+  document.body.classList.toggle('faces', menu === 'faces');
   document.body.classList.toggle('people-list', menu === 'users' && !(userOpen && archiveUid));
+  document.body.classList.toggle('face-list', menu === 'faces');
   document.querySelectorAll('.gate').forEach(el => el.remove());
   paintNav();
+  if (menu === 'faces') {
+    paintFaces();
+    return;
+  }
   if (menu === 'users') {
     if (userOpen && archiveUid) {
       const userY = app.scrollTop;
@@ -3078,7 +3216,7 @@ async function tick() {
     const prevCurrent = sessions.find(s => s.tabId === current);
     const data = await api('/api/sessions' + (pollWait ? '?wait=1' : ''));
     sessions = data.sessions || [];
-    noteRooms(sessions);
+    const otherPing = noteRooms(sessions);
     const freshTalks = data.talks || [];
     for (const uid of [...droppedTalks]) {
       if (!freshTalks.some(t => t.uid === uid)) droppedTalks.delete(uid);
@@ -3113,7 +3251,7 @@ async function tick() {
     const nextCurrent = sessions.find(s => s.tabId === current);
     if (nextCurrent && nextCurrent.waiting) current = '';
     let quiet = false;
-    if (menu !== 'users' && current && prevCurrent && nextCurrent && prevCurrent.channelId === nextCurrent.channelId && !showControls && !archiveUid) {
+    if (menu !== 'users' && menu !== 'faces' && current && prevCurrent && nextCurrent && prevCurrent.channelId === nextCurrent.channelId && !showControls && !archiveUid) {
       const plan = ownEchoPlan(prevCurrent.messages, nextCurrent.messages, pendingMine[current] || []);
       pendingMine[current] = plan.rest;
       quiet = !plan.redraw
@@ -3138,6 +3276,7 @@ async function tick() {
     } else {
       paint();
     }
+    if (otherPing && menu !== 'users' && current && !showControls && !archiveUid) glowInput();
   } catch (e) {
     if (!token) paint();
   } finally {
