@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.100
+// @version      1.4.101
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -52,7 +52,7 @@
     const RELAY_TOKEN_KEY = 'knockRelayToken';
     const RELAY_TAB_KEY = 'knockRelayTabId';
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.100';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.101';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -2027,8 +2027,9 @@
         const value = String(boxValue || '').trim();
         const text = String(wanted || '').trim();
         if (!text) return 'skip';
-        // 框是空的只代表上一擊已經送出。還沒把字填進去時，空框不是成功。
+        // 框是空的只代表上一擊已經送出。字還在框裡時不要再點，否則會送成兩則。
         if (armed && !value) return 'sent';
+        if (armed) return 'wait';
         if (value !== text) return 'fill';
         return 'click';
     }
@@ -2059,6 +2060,7 @@
         const trySend = () => {
             const plan = sendAttemptPlan(armed, box.value, wanted);
             if (plan === 'sent') return true;
+            if (plan === 'wait') return false;
             if (plan !== 'click') {
                 fillReactInput(box, wanted);
                 if (sendAttemptPlan(armed, box.value, wanted) !== 'click') return false;
@@ -2066,8 +2068,7 @@
             armed = true;
             const send = document.querySelector('button[data-test="send"]');
             if (send && !send.disabled) {
-                send.click();
-                simulateMouseClick(send);
+                try { send.click(); } catch (e) { simulateMouseClick(send); }
             } else {
                 pressEnter(box);
             }
@@ -2977,7 +2978,7 @@
                 const started = relaySending.get(item.id) || 0;
                 if (Date.now() - started < 8000) continue;
                 relaySending.set(item.id, Date.now());
-                const sent = sendChatMessage(item.text, () => {
+                sendChatMessage(item.text, () => {
                     gmRequest({
                         method: 'POST',
                         url: `${RELAY_URL}/api/sessions/${snap.tabId}/ack`,
@@ -2985,8 +2986,7 @@
                         data: JSON.stringify({ id: item.id }),
                         timeout: 8000
                     }).catch(() => {}).finally(() => relaySending.delete(item.id));
-                });
-                if (!sent) relaySending.delete(item.id);
+                }, () => relaySending.delete(item.id));
             }
             }
         } catch (e) {}
@@ -3321,7 +3321,7 @@
             || sendAttemptPlan(false, '', '🎶') !== 'fill'
             || sendAttemptPlan(false, '🎶', '🎶') !== 'click'
             || sendAttemptPlan(true, '', '🎶') !== 'sent'
-            || sendAttemptPlan(true, '🎶', '🎶') !== 'click'
+            || sendAttemptPlan(true, '🎶', '🎶') !== 'wait'
             || sendAttemptPlan(false, '', '') !== 'skip'
             || !keepWarnPlan(0, 600000, 600000)
             || keepWarnPlan(600000, 600000, 600000)

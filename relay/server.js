@@ -1473,7 +1473,7 @@ const PAGE = `<!DOCTYPE html>
   .time { display:block; margin-top:4px; font-size:11px; color:rgba(255,255,255,.55); }
   form { position:relative; flex:none; display:flex; gap:8px; padding:10px; background:#111; border-top:1px solid #333; }
   form input { flex:1; padding:10px; border-radius:8px; border:1px solid #444; background:#1a1a1a; }
-  form input.glow { animation:composer-glow .5s ease-out; }
+  form input.glow { animation:composer-glow 2s ease-out; }
   @keyframes composer-glow { 0% { box-shadow:0 0 0 0 rgba(255,183,77,0); } 40% { box-shadow:0 0 12px 3px rgba(255,183,77,.9); } 100% { box-shadow:0 0 0 0 rgba(255,183,77,0); } }
   form input[type=file] { display:none; }
   form button { padding:10px 14px; border:none; border-radius:8px; background:#4CAF50; cursor:pointer; }
@@ -2271,7 +2271,7 @@ function paintFaces() {
     rows.forEach(row => {
       const tr = document.createElement('tr');
       const face = document.createElement('td');
-      face.append(faceNode(row.id));
+      face.append(faceNode(row.id, true));
       const count = document.createElement('td');
       count.textContent = String(row.count);
       const flag = document.createElement('td');
