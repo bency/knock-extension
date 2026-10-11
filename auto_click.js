@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.97
+// @version      1.4.98
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -35,6 +35,7 @@
     };
     const LOCK_UID_KEY = 'knockLockUid';
     const LOCK_WAIT_MS = 5000;
+    const KEEP_ALIVE_TEXT = '🎶';
     const AUTO_CLICK_ENABLED_KEY = 'knockAutoClickEnabled';
     const FIRST_MSG_FILTER_KEY = 'knockFirstMessageFilters';
     const FIRST_FILTER_ENABLED_KEY = 'knockFirstFilterEnabled';
@@ -51,7 +52,7 @@
     const RELAY_TOKEN_KEY = 'knockRelayToken';
     const RELAY_TAB_KEY = 'knockRelayTabId';
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.97';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.98';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -2023,6 +2024,11 @@
         return true;
     }
 
+    function keepSentence(text) {
+        const s = String(text || '').trim().slice(0, 200);
+        return s || KEEP_ALIVE_TEXT;
+    }
+
     function keepRange(minVal, maxVal) {
         let min = Number(minVal);
         let max = Number(maxVal);
@@ -2075,7 +2081,8 @@
     }
 
     function tryKeepAlive() {
-        if (!keepAliveEnabled || !keepAliveText) return;
+        if (!keepAliveEnabled) return;
+        const text = keepSentence(keepAliveText);
         if (pendingForcedLeave) return;
         if (!document.querySelector('ul[data-test="messages"]')) return;
         if (findButtons().some(b => isRematchButton(b) || isConfirmExitButton(b))) return;
@@ -2084,7 +2091,7 @@
         if (!at || Date.now() - at < keepAliveWaitMs) return;
         if (Date.now() - lastKeepAliveTryAt < 60000) return;
         lastKeepAliveTryAt = Date.now();
-        sendChatMessage(keepAliveText, () => {
+        sendChatMessage(text, () => {
             lastKeepAliveSentAt = Date.now();
             rollKeepAliveWaitMs();
         });
@@ -2447,7 +2454,7 @@
             phoneTopic: getNtfyTopic(),
             phoneTitle: getNtfyTitle(),
             keep: keepAliveEnabled,
-            keepText: keepAliveText,
+            keepText: keepSentence(keepAliveText),
             keepMin,
             keepMax
         };
@@ -2489,7 +2496,7 @@
         const nextKeep = keepRange(c.keepMin, c.keepMax);
         const hoursChanged = nextKeep.min !== keepMin || nextKeep.max !== keepMax;
         keepAliveEnabled = !!c.keep;
-        keepAliveText = String(c.keepText || '').trim().slice(0, 200);
+        keepAliveText = keepSentence(c.keepText);
         keepMin = nextKeep.min;
         keepMax = nextKeep.max;
         if (hoursChanged) keepAliveWaitMs = 0;
@@ -3215,6 +3222,8 @@
             || relayControlsMatch(ctrl, Object.assign({}, ctrl, { keep: true }))
             || keepRange(2.5, 1.5).min !== 1.5
             || keepRange(2.5, 1.5).max !== 2.5
+            || keepSentence('') !== '🎶'
+            || keepSentence('  嗨  ') !== '嗨'
             || messageAtMs('2026-10-06', '11:51', quietNight) !== new Date(2026, 9, 6, 11, 51).getTime()
             || messageAtMs('', '23:59', quietNight) !== new Date(2026, 9, 5, 23, 59).getTime()) {
             console.error('knock: 遠端控制比對失敗');

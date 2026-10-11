@@ -675,7 +675,7 @@ function cleanControls(raw) {
         phoneTopic,
         phoneTitle: String(raw.phoneTitle || '').trim().slice(0, 80) || 'Knock 新訊息',
         keep: !!raw.keep,
-        keepText: String(raw.keepText || '').trim().slice(0, 200),
+        keepText: String(raw.keepText || '').trim().slice(0, 200) || '🎶',
         keepMin,
         keepMax
     };
@@ -687,7 +687,7 @@ function keepControls(next, raw, prev) {
     if (!old || (raw && Object.prototype.hasOwnProperty.call(raw, 'keep'))) return next;
     return Object.assign({}, next, {
         keep: !!old.keep,
-        keepText: String(old.keepText || ''),
+        keepText: String(old.keepText || '').trim().slice(0, 200) || '🎶',
         keepMin: old.keepMin,
         keepMax: old.keepMax
     });
@@ -865,7 +865,8 @@ function selfCheck() {
         throw new Error('knock relay 檢查失敗');
     }
     const keptAlive = keepControls(cleanControls({ auto: 1, phoneTopic: 'knock-room' }), { auto: 1, phoneTopic: 'knock-room' }, { controls: wanted });
-    if (!keptAlive || !keptAlive.keep || keptAlive.keepText !== '在嗎' || keptAlive.keepMin !== 1 || keptAlive.keepMax !== 2) {
+    if (!keptAlive || !keptAlive.keep || keptAlive.keepText !== '在嗎' || keptAlive.keepMin !== 1 || keptAlive.keepMax !== 2
+        || cleanControls({ keepText: '  ' }).keepText !== '🎶') {
         throw new Error('knock relay 檢查失敗');
     }
     const firstOpen = applyHeartbeat(sessions, {
@@ -1352,9 +1353,9 @@ const PAGE = `<!DOCTYPE html>
 <style>
   html, body { height:100%; }
   body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:#111; color:#eee; overflow:hidden; }
-  .shell { display:flex; height:100%; }
+  .shell { --menu-item:calc(16px * 1.35 * 3); display:flex; height:100%; }
   #nav { width:208px; flex:none; display:flex; flex-direction:column; align-items:stretch; border-right:1px solid #333; background:#0e0e0e; }
-  #nav button { position:relative; flex:none; box-sizing:border-box; height:3lh; display:flex; align-items:center; justify-content:center; border:none; border-bottom:1px solid #333; background:transparent; color:#888; font-size:16px; font-weight:700; line-height:1.35; cursor:pointer; padding:0 12px; }
+  #nav button { position:relative; flex:none; box-sizing:border-box; height:var(--menu-item); display:flex; align-items:center; justify-content:center; border:none; border-bottom:1px solid #333; background:transparent; color:#888; font-size:16px; font-weight:700; line-height:1.35; cursor:pointer; padding:0 12px; }
   #nav button.on { color:#eee; background:#1c1c1c; box-shadow:inset 4px 0 #4CAF50; }
   #nav .dot { top:8px; right:12px; }
   #rail { width:220px; flex:none; overflow:auto; border-right:1px solid #333; background:#111; }
@@ -1372,11 +1373,14 @@ const PAGE = `<!DOCTYPE html>
   #shade { display:none; position:fixed; inset:0; z-index:19; border:none; padding:0; background:rgba(0,0,0,.5); }
   .topbar .menu { width:48px; height:48px; padding:0; display:flex; align-items:center; justify-content:center; }
   .topbar .rail-btn { display:none; }
+  @media (min-width:761px) {
+    body.people-list .topbar { display:none; }
+  }
   @media (max-width:760px) {
-    #rail { position:fixed; z-index:20; top:0; bottom:0; left:208px; width:min(280px, calc(100vw - 208px)); transform:translateX(-110%); transition:transform .18s ease; }
-    body.pick #rail { position:static; width:auto; flex:1; transform:none; }
-    body.pick .stage { display:none; }
-    body.rail-open #rail { transform:none; }
+    #nav, #rail { position:fixed; left:0; width:min(280px, 86vw); transform:translateX(-110%); transition:transform .18s ease; }
+    #nav { z-index:21; top:0; height:auto; }
+    #rail { z-index:20; top:calc(var(--menu-item) * 2); bottom:0; }
+    body.rail-open #nav, body.rail-open #rail { transform:none; }
     body.rail-open #shade { display:block; }
     .topbar .rail-btn { display:flex; }
   }
@@ -2165,7 +2169,7 @@ function paintPeople() {
   const prev = document.querySelector('.people-pane .sheet');
   if (prev) peopleScroll = prev.scrollTop;
   clearForm();
-  clearChrome();
+  paintBar('使用者管理');
   const picked = peopleRank(people);
   app.replaceChildren();
   const pane = document.createElement('div');
@@ -2414,7 +2418,7 @@ function packControls(c) {
     phoneTopic: String(c.phoneTopic || '').trim(),
     phoneTitle: String(c.phoneTitle || '').trim().slice(0, 80) || 'Knock 新訊息',
     keep: !!c.keep,
-    keepText: String(c.keepText || '').trim().slice(0, 200),
+    keepText: String(c.keepText || '').trim().slice(0, 200) || '🎶',
     keepMin: min,
     keepMax: max
   };
@@ -2804,7 +2808,7 @@ function paint() {
   if (!token) { clearForm(); return gate(); }
   document.body.classList.remove('locked');
   document.body.classList.toggle('users', menu === 'users');
-  document.body.classList.toggle('pick', menu === 'chats' && !current && !archiveUid && !showControls);
+  document.body.classList.toggle('people-list', menu === 'users' && !(userOpen && archiveUid));
   document.querySelectorAll('.gate').forEach(el => el.remove());
   paintNav();
   if (menu === 'users') {
@@ -3153,7 +3157,7 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden) tick
 document.getElementById('shade').onclick = () => closeRail();
 let edgeSwipe = null;
 document.addEventListener('pointerdown', (e) => {
-  if (e.button || menu === 'users' || document.body.classList.contains('rail-open') || e.clientX > 28) return;
+  if (e.button || document.body.classList.contains('rail-open') || e.clientX > 28) return;
   edgeSwipe = { x: e.clientX, y: e.clientY, id: e.pointerId };
 });
 document.addEventListener('pointerup', (e) => {
@@ -3161,7 +3165,6 @@ document.addEventListener('pointerup', (e) => {
   const dx = e.clientX - edgeSwipe.x;
   const dy = e.clientY - edgeSwipe.y;
   edgeSwipe = null;
-  if (menu === 'users') return;
   if (dx >= 48 && dx > Math.abs(dy)) document.body.classList.add('rail-open');
 });
 document.addEventListener('pointercancel', () => { edgeSwipe = null; });
