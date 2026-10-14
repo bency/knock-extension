@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.104
+// @version      1.4.107
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -52,7 +52,7 @@
     const RELAY_TOKEN_KEY = 'knockRelayToken';
     const RELAY_TAB_KEY = 'knockRelayTabId';
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.104';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.107';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -158,7 +158,8 @@
     let forceAutoUntilIdle = false;
     let lastExitClickAt = 0;
     let lastExitRevealAt = 0;
-    let exitRevealArmed = false;
+    let exitRevealPhase = 0;
+    let leaveLog = '';
     let skipFirstFilterFor = null;
     let rematchScheduled = false;
     let startChatScheduled = false;
@@ -618,12 +619,20 @@
     }
 
     // --- 訊息與日期 ---
+    function messageSide(flexDirection) {
+        return flexDirection === 'row-reverse' ? 'mine' : 'them';
+    }
+
     function isMyMessageLi(messageLi) {
         const container = messageLi.querySelector('div[class*="jss"]');
         if (!container) return false;
-        const cls = container.classList.toString();
-        return window.getComputedStyle(container).flexDirection === 'row-reverse' ||
-            cls.includes('jss630') || cls.includes('jss94');
+        const view = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+        let dir = '';
+        try { dir = view.getComputedStyle(container).flexDirection; } catch (e) {}
+        if (!dir) {
+            try { dir = getComputedStyle(container).flexDirection; } catch (e) {}
+        }
+        return messageSide(dir) === 'mine';
     }
 
     function getAvatarUrl(messageLi) {
@@ -1367,34 +1376,73 @@
         return 'wait';
     }
 
-    function nextExitReveal(armed) {
-        return armed ? 'list' : 'input';
+    function nextExitReveal(phase) {
+        if (phase === 1) return 'list';
+        if (phase === 2) return 'wait';
+        return 'input';
+    }
+
+    function logLeave(text) {
+        if (leaveLog === text) return;
+        leaveLog = text;
+        console.log('knock 離開：' + text);
     }
 
     function clickNode(node) {
         if (!node) return;
+        const host = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
         const opts = { bubbles: true, cancelable: true, button: 0 };
-        for (const type of ['mousedown', 'mouseup', 'click']) {
-            try { node.dispatchEvent(new MouseEvent(type, opts)); } catch (e) {}
+        for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+            try {
+                const Ctor = type.indexOf('pointer') === 0 && host.PointerEvent ? host.PointerEvent : host.MouseEvent;
+                node.dispatchEvent(new Ctor(type, opts));
+            } catch (e) {}
         }
         try { node.click(); } catch (e) {}
     }
 
-    // 送出後退出鈕會先藏起來。要先點輸入框，再點對話列，才會出現。
+    function conversationTarget(list) {
+        const rect = list.getBoundingClientRect();
+        const x = rect.left + Math.max(8, rect.width / 2);
+        let y = rect.top + Math.min(80, Math.max(8, rect.height / 3));
+        if (y < 8) y = 8;
+        if (y > window.innerHeight - 8) y = window.innerHeight - 8;
+        const hit = document.elementFromPoint(x, y);
+        if (hit && (hit === list || list.contains(hit))) return hit;
+        return list.querySelector('li') || list;
+    }
+
+    // 送出後退出鈕會先藏起來。先點輸入框，再讓它失焦並點對話區，鈕才會出現。
     function revealChatExit() {
         const list = document.querySelector('ul[data-test="messages"]');
         const box = document.querySelector('[data-test="input-message"] textarea:not([readonly])');
-        if (!list || !box) return false;
-        if (Date.now() - lastExitRevealAt < 150) return true;
+        if (!list || !box) {
+            logLeave(!list ? '找不到對話列' : '找不到輸入框');
+            return false;
+        }
+        if (Date.now() - lastExitRevealAt < 300) {
+            logLeave(exitRevealPhase === 1 ? '已點輸入框，等一下再點對話列' : '已點對話列，等離開鈕');
+            return true;
+        }
         lastExitRevealAt = Date.now();
-        const which = nextExitReveal(exitRevealArmed);
-        exitRevealArmed = !exitRevealArmed;
+        const which = nextExitReveal(exitRevealPhase);
+        if (which === 'wait') {
+            exitRevealPhase = 0;
+            logLeave('點過對話列，等離開鈕');
+            return true;
+        }
         if (which === 'input') {
+            exitRevealPhase = 1;
+            logLeave('點輸入框');
             clickNode(box);
             try { box.focus(); } catch (e) {}
             return true;
         }
-        clickNode(list);
+        exitRevealPhase = 2;
+        try { box.blur(); } catch (e) {}
+        const target = conversationTarget(list);
+        logLeave('點對話列 ' + (target.tagName || ''));
+        clickNode(target);
         return true;
     }
 
@@ -1406,16 +1454,23 @@
             !!exitButton,
             !!document.querySelector('ul[data-test="messages"]')
         );
-        if (step === 'confirm' || step === 'exit') exitRevealArmed = false;
+        if (step === 'confirm' || step === 'exit') exitRevealPhase = 0;
         if (step === 'confirm') {
+            logLeave('點確定');
             checkForButtonAndClick();
             return true;
         }
         if (step === 'reveal') return revealChatExit();
-        if (step !== 'exit') return false;
-        if (Date.now() - lastExitClickAt < 400) return true;
+        if (step !== 'exit') {
+            logLeave('還沒有對話列，等待');
+            return false;
+        }
+        if (Date.now() - lastExitClickAt < 400) {
+            logLeave('離開鈕已出現，稍後再點');
+            return true;
+        }
         lastExitClickAt = Date.now();
-        console.log('找到退出按鈕，點擊中...');
+        logLeave('點離開鈕');
         simulateMouseClick(exitButton);
         checkForButtonAndClick();
         return true;
@@ -2375,14 +2430,17 @@
     function remoteLeaveChat() {
         if (!pendingRemoteLeave) return;
         if (findButtons().some(isRematchButton)) {
+            logLeave('對方已離開，停止');
             pendingRemoteLeave = false;
+            leaveLog = '';
             return;
         }
         const confirm = findButtons().find(isConfirmExitButton);
         const exitButton = document.querySelector('button[data-test="chat-exit-button"]');
         const step = exitStep(!!confirm, !!exitButton, !!document.querySelector('ul[data-test="messages"]'));
-        if (step === 'confirm' || step === 'exit') exitRevealArmed = false;
+        if (step === 'confirm' || step === 'exit') exitRevealPhase = 0;
         if (step === 'confirm') {
+            logLeave('點確定');
             if (isAutoClicking()) markPendingStartChat('selfLeft');
             simulateMouseClick(confirm);
             return;
@@ -2392,11 +2450,21 @@
             return;
         }
         if (step !== 'exit') {
-            if (findButtons().some(isStartChatButton)) pendingRemoteLeave = false;
+            if (findButtons().some(isStartChatButton)) {
+                logLeave('已在配對頁，停止');
+                pendingRemoteLeave = false;
+                leaveLog = '';
+                return;
+            }
+            logLeave('還沒有對話列，等待');
             return;
         }
-        if (Date.now() - lastExitClickAt < 400) return;
+        if (Date.now() - lastExitClickAt < 400) {
+            logLeave('離開鈕已出現，稍後再點');
+            return;
+        }
         lastExitClickAt = Date.now();
+        logLeave('點離開鈕');
         simulateMouseClick(exitButton);
     }
 
@@ -2971,7 +3039,10 @@
                 }
             }
             applyRemoteLobby(data);
-            if (data.leave) pendingRemoteLeave = true;
+            if (data.leave) {
+                pendingRemoteLeave = true;
+                logLeave('收到離開');
+            }
             remoteLeaveChat();
             if (data.filters) applyServerFilters(data.filters);
             if (Array.isArray(data.people)) noteKnownPeople(data.people);
@@ -3354,8 +3425,12 @@
             || exitStep(false, true, true) !== 'exit'
             || exitStep(false, false, true) !== 'reveal'
             || exitStep(false, false, false) !== 'wait'
-            || nextExitReveal(false) !== 'input'
-            || nextExitReveal(true) !== 'list') {
+            || nextExitReveal(0) !== 'input'
+            || nextExitReveal(1) !== 'list'
+            || nextExitReveal(2) !== 'wait'
+            || messageSide('row-reverse') !== 'mine'
+            || messageSide('row') !== 'them'
+            || messageSide('') !== 'them') {
             console.error('knock: 離開按鈕步驟失敗');
         }
         if (getMessageQuote(replyDiv) !== '原文' || getMessageText(replyDiv) !== '回覆') {

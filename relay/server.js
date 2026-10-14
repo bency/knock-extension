@@ -1644,32 +1644,11 @@ function statusText(s) {
   if (s.lobby) return '';
   if (s.status === 'left') return '對方已離開';
   if (!s.canType) return '現在不能回';
-  const queued = s.queued || [];
-  if (queued.length) return '待送出：' + queued.map(item => item.text || '圖片').join('、');
   return '';
 }
 
-function paintQueued(s) {
+function paintQueued() {
   document.querySelectorAll('.queued').forEach(el => el.remove());
-  const list = (s && s.queued) || [];
-  if (!s || !list.length) return;
-  const box = document.createElement('div');
-  box.className = 'queued';
-  list.forEach(item => {
-    const line = document.createElement('div');
-    line.textContent = item.text || '圖片';
-    box.append(line);
-  });
-  const clear = document.createElement('button');
-  clear.type = 'button';
-  clear.textContent = '清除待送出';
-  clear.onclick = () => {
-    api('/api/sessions/' + encodeURIComponent(s.tabId) + '/outbox', { method: 'DELETE' })
-      .catch(err => alert(err.message || '清除失敗'));
-  };
-  const form = stage.querySelector('form');
-  if (form) stage.insertBefore(box, form);
-  else stage.append(box);
 }
 
 function deleteTalk(uid) {
@@ -1930,7 +1909,6 @@ function liveCard(s) {
   const extra = statusText(s);
   if (extra) {
     const st = document.createElement('small');
-    if (s.queued && s.queued.length) st.className = 'queued-note';
     st.textContent = extra;
     body.append(st);
   }
@@ -2639,6 +2617,7 @@ function paintControls() {
     p.className = 'muted';
     p.textContent = '這個聊天室還沒回報設定。先讓那一頁開著。';
     app.append(p);
+    appendLeave();
     return;
   }
   const c = packControls(src);
@@ -2717,6 +2696,7 @@ function paintControls() {
     extra.append(topic, title, test);
     app.append(extra);
   }
+  appendLeave();
 }
 
 function openingClock(ms) {
@@ -2858,6 +2838,7 @@ function refreshList() {
   paintNav();
   paintRail();
   syncMenuDot();
+  paintQueued();
 }
 
 function openingSig(s) {
@@ -2912,6 +2893,19 @@ function leaveChat(s) {
     .catch(err => alert(err.message || '離開失敗'));
 }
 
+function appendLeave() {
+  const s = sessions.find(x => x.tabId === current);
+  if (!s || s.lobby || s.status === 'left') return;
+  const leave = document.createElement('button');
+  leave.type = 'button';
+  leave.className = 'ctrl';
+  leave.textContent = '離開';
+  leave.style.color = '#e53935';
+  leave.style.justifyContent = 'flex-start';
+  leave.onclick = () => leaveChat(s);
+  app.append(leave);
+}
+
 function startChat(s) {
   if (!s) return;
   api('/api/sessions/' + encodeURIComponent(s.tabId) + '/start', {
@@ -2923,17 +2917,16 @@ function startChat(s) {
 
 function threadActions(s) {
   const gear = controlsGear();
-  if (!s) return gear;
-  const inChat = !s.lobby && s.status !== 'left';
+  if (!s || (!s.lobby && s.status !== 'left')) return gear;
   const box = document.createElement('div');
   box.className = 'end';
   box.dataset.side = '1';
   box.style.cssText = 'display:flex;margin-left:auto;position:relative;z-index:1;';
   const action = document.createElement('button');
   action.type = 'button';
-  action.className = 'gear' + (inChat ? ' del' : '');
-  action.textContent = inChat ? '離開' : '開始';
-  action.onclick = () => { if (inChat) leaveChat(s); else startChat(s); };
+  action.className = 'gear';
+  action.textContent = '開始';
+  action.onclick = () => startChat(s);
   gear.classList.remove('end');
   gear.style.marginLeft = '0';
   box.append(action, gear);
