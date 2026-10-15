@@ -532,6 +532,11 @@ function keepRecalled(incoming, prev) {
     });
 }
 
+function cleanScriptVersion(raw) {
+    const s = String(raw || '').trim();
+    return /^[0-9]+\.[0-9]+\.[0-9]+$/.test(s) ? s : '';
+}
+
 function applyHeartbeat(sessions, body, now) {
     const tabId = String(body && body.tabId || '').trim();
     if (!/^[a-z0-9]{8,40}$/.test(tabId)) return null;
@@ -565,6 +570,7 @@ function applyHeartbeat(sessions, body, now) {
         avatarWanted: sameChannel && prev && typeof prev.avatarWanted === 'boolean' ? prev.avatarWanted : null,
         userWanted: sameChannel && prev && typeof prev.userWanted === 'boolean' ? prev.userWanted : null,
         controls: keepControls(cleanControls(body.controls), body.controls, prev),
+        script: cleanScriptVersion(body.script) || (prev && prev.script) || '',
         controlWanted: prev ? prev.controlWanted : null,
         notifyWanted: prev && typeof prev.notifyWanted === 'string' ? prev.notifyWanted : null,
         outbox: prev ? prev.outbox : []
@@ -591,6 +597,7 @@ function visibleSessions(sessions, now, waitMs) {
             messages: s.messages,
             openings: s.openings || null,
             controls: s.controls || null,
+            script: s.script || '',
             pending: s.outbox.length,
             queued: queuedLines(s.outbox)
         });
@@ -622,6 +629,7 @@ function loadSessions() {
                 avatarWanted: s.avatarWanted === true ? true : s.avatarWanted === false ? false : null,
                 userWanted: s.userWanted === true ? true : s.userWanted === false ? false : null,
                 controls: cleanControls(s.controls),
+                script: cleanScriptVersion(s.script),
                 controlWanted: cleanControls(s.controlWanted),
                 outbox: keptOutbox(s.outbox)
             });
@@ -850,7 +858,11 @@ function selfCheck() {
     const quiet = applyHeartbeat(sessions, { tabId: 'quiettab1', title: '空', canType: true, messages: [] }, 1000);
     if (!live || sessions.get('abc12345').outbox.length !== 1 || vis.length !== 2
         || !fresh || fresh.waiting || fresh.title !== '阿明' || !old || !old.waiting
-        || heartbeatReady(quiet) || !heartbeatReady(sessions.get('abc12345'))) {
+        || heartbeatReady(quiet) || !heartbeatReady(sessions.get('abc12345'))
+        || cleanScriptVersion('1.4.108') !== '1.4.108'
+        || cleanScriptVersion('1.4')
+        || cleanScriptVersion('abc')
+        || applyHeartbeat(sessions, { tabId: 'quiettab1', title: '空', canType: true, script: '1.4.108', messages: [] }, 1500).script !== '1.4.108') {
         throw new Error('knock relay 檢查失敗');
     }
     if (applyHeartbeat(sessions, { tabId: '../x', title: 'x' }, 2000)) throw new Error('knock relay 檢查失敗');
@@ -1533,7 +1545,7 @@ const PAGE = `<!DOCTYPE html>
   .hours input { width:72px; }
   .sw { width:40px; height:22px; border:none; padding:0; border-radius:11px; background:#555; position:relative; flex:none; cursor:pointer; }
   .sw.on { background:#4CAF50; }
-  .sw i { width:18px; height:18px; border-radius:50%; background:#fff; position:absolute; top:2px; left:2px; }
+  .sw i { width:18px; height:18px; border-radius:50%; background:#fff; position:absolute; top:2px; left:2px; pointer-events:none; }
   .sw.on i { left:20px; }
 </style>
 </head>
@@ -2018,19 +2030,33 @@ function askRename(uid, shown) {
   renameTalk(uid, next.trim().slice(0, 40));
 }
 
-function setUserFilter(p, on) {
+let filterToggleUid = '';
+let filterToggleAt = 0;
+
+function paintUserSwitch(sw, on) {
+  sw.className = 'sw' + (on ? ' on' : '');
+  sw.title = on ? '已在過濾名單，再點移除' : '把這個 id 列入過濾';
+}
+
+function setUserFilter(p, on, sw) {
   if (!p || !p.uid) return;
+  const now = Date.now();
+  if (filterToggleUid === p.uid && now - filterToggleAt < 500) return;
+  filterToggleUid = p.uid;
+  filterToggleAt = now;
   const prev = !!p.filtered;
-  p.filtered = on;
-  paint();
+  p.filtered = !!on;
+  if (sw) paintUserSwitch(sw, p.filtered);
   api('/api/filters', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(on ? { addUsers: [{ u: p.uid, t: '', a: '' }] } : { removeUsers: [{ u: p.uid, t: '', a: '' }] })
   }).catch(err => {
     p.filtered = prev;
+    filterToggleAt = 0;
+    filterToggleUid = '';
+    if (sw && sw.isConnected) paintUserSwitch(sw, prev);
     alert(err.message || '設定失敗');
-    paint();
   });
 }
 
@@ -2045,7 +2071,7 @@ function filterSwitch(p, bare) {
   sw.onclick = (e) => {
     e.preventDefault();
     e.stopPropagation();
-    setUserFilter(p, !p.filtered);
+    setUserFilter(p, !p.filtered, sw);
   };
   wrap.onclick = (e) => e.stopPropagation();
   if (!bare) {
@@ -2169,6 +2195,7 @@ function peopleRow(p) {
   count.textContent = String(p.count || 0);
   const flag = document.createElement('td');
   flag.append(filterSwitch(p, true));
+  flag.onclick = (e) => e.stopPropagation();
   tr.append(face, name, id, when, meets, count, flag);
   tr.onclick = () => openPerson(p);
   return tr;
@@ -2611,6 +2638,12 @@ function fieldInput(value, placeholder) {
 function paintControls() {
   app.replaceChildren();
   clearForm();
+  const room = sessions.find(x => x.tabId === current);
+  const ver = document.createElement('p');
+  ver.className = 'muted';
+  ver.style.margin = '0 0 12px';
+  ver.textContent = room && room.script ? '腳本 ' + room.script : '還沒回報腳本版本';
+  app.append(ver);
   const src = shownControls();
   if (!src) {
     const p = document.createElement('p');
@@ -2889,6 +2922,8 @@ function paintOpening(s) {
 
 function leaveChat(s) {
   if (!s || !confirm('離開這個聊天？')) return;
+  showControls = false;
+  paint();
   api('/api/sessions/' + encodeURIComponent(s.tabId) + '/leave', { method: 'POST' })
     .catch(err => alert(err.message || '離開失敗'));
 }

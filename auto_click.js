@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.107
+// @version      1.4.108
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -31,7 +31,8 @@
         selfLeft: '我主動斷線',
         firstFilter: '使用者過濾而重連',
         lockMiss: '不是鎖定的使用者',
-        lockWait: '讀不到對方 id'
+        lockWait: '讀不到對方 id',
+        pairingDown: '配對失敗'
     };
     const LOCK_UID_KEY = 'knockLockUid';
     const LOCK_WAIT_MS = 5000;
@@ -52,7 +53,7 @@
     const RELAY_TOKEN_KEY = 'knockRelayToken';
     const RELAY_TAB_KEY = 'knockRelayTabId';
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.107';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.108';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -231,6 +232,61 @@
                 if (/firestore\.googleapis\.com/.test(this.__knockUrl || '')) {
                     const id = extractChannelId(body);
                     if (id) bindChannel(id);
+                }
+            } catch (e) { /* 略 */ }
+            return origSend.apply(this, arguments);
+        };
+    }
+
+    const PAIRING_RELOAD_KEY = 'knockPairingReloadAt';
+
+    function pairingFailPlan(url, status) {
+        if (String(url || '').indexOf('startPairing') < 0) return '';
+        return status === 503 ? 'reload' : '';
+    }
+
+    function notePairingDown() {
+        const now = Date.now();
+        const prev = Number(sessionStorage.getItem(PAIRING_RELOAD_KEY) || 0);
+        if (now - prev < 8000) {
+            console.log('knock: startPairing 503，剛重整過，先不連續重整');
+            return;
+        }
+        sessionStorage.setItem(PAIRING_RELOAD_KEY, String(now));
+        if (autoClickEnabled) markPendingStartChat('pairingDown');
+        console.log('knock: startPairing 503，重整頁面');
+        const loc = (typeof unsafeWindow !== 'undefined' && unsafeWindow.location) || location;
+        loc.reload();
+    }
+
+    function watchPairingResponse(url, status) {
+        if (pairingFailPlan(url, status) === 'reload') notePairingDown();
+    }
+
+    function hookPairingFailure() {
+        const host = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+        if (host.fetch && !host.fetch.__knockPairing) {
+            const orig = host.fetch;
+            const wrapped = function (input) {
+                const url = typeof input === 'string' ? input : (input && input.url) || '';
+                return orig.apply(this, arguments).then(res => {
+                    try { watchPairingResponse(url, res && res.status); } catch (e) { /* 略 */ }
+                    return res;
+                });
+            };
+            wrapped.__knockPairing = true;
+            host.fetch = wrapped;
+        }
+        const xhr = (host.XMLHttpRequest || XMLHttpRequest).prototype;
+        if (xhr.__knockPairing) return;
+        xhr.__knockPairing = true;
+        const origSend = xhr.send;
+        xhr.send = function () {
+            try {
+                if (String(this.__knockUrl || '').indexOf('startPairing') >= 0) {
+                    this.addEventListener('loadend', function () {
+                        watchPairingResponse(this.__knockUrl, this.status);
+                    });
                 }
             } catch (e) { /* 略 */ }
             return origSend.apply(this, arguments);
@@ -2485,6 +2541,7 @@
             messages: [],
             openings: null,
             controls: relayControls(),
+            script: SCRIPT_VERSION,
             archive: relayArchive()
         };
         if (!list) return base;
@@ -3271,6 +3328,7 @@
 
     // --- 啟動 ---
     hookFirestoreChannel();
+    hookPairingFailure();
 
     function mountChrome() {
         if (!document.body) return;
@@ -3430,7 +3488,10 @@
             || nextExitReveal(2) !== 'wait'
             || messageSide('row-reverse') !== 'mine'
             || messageSide('row') !== 'them'
-            || messageSide('') !== 'them') {
+            || messageSide('') !== 'them'
+            || pairingFailPlan('https://asia-east2-knocktalk-prod.cloudfunctions.net/startPairing', 503) !== 'reload'
+            || pairingFailPlan('https://asia-east2-knocktalk-prod.cloudfunctions.net/startPairing', 200)
+            || pairingFailPlan('https://example.com/other', 503)) {
             console.error('knock: 離開按鈕步驟失敗');
         }
         if (getMessageQuote(replyDiv) !== '原文' || getMessageText(replyDiv) !== '回覆') {
@@ -3472,7 +3533,8 @@
         if (cooldownReasonText('firstFilter', '阿明') !== '開始聊天 · 過濾了 阿明'
             || cooldownReasonText('firstFilter', '') !== '開始聊天 · 使用者過濾而重連'
             || cooldownReasonText('selfLeft', '阿明') !== '開始聊天 · 我主動斷線'
-            || cooldownReasonText('lockWait', '') !== '開始聊天 · 讀不到對方 id') {
+            || cooldownReasonText('lockWait', '') !== '開始聊天 · 讀不到對方 id'
+            || cooldownReasonText('pairingDown', '') !== '開始聊天 · 配對失敗') {
             console.error('knock: 過濾名稱提示失敗');
         }
         if (lockPlan('', 'u1', 0) !== 'off'

@@ -1,0 +1,12 @@
+---
+description: 腳本版本號在 cp 之前只跳一次
+alwaysApply: true
+---
+
+# 腳本版本號
+
+`auto_click.js` 的 `@version` 與 `SCRIPT_VERSION` 要相同。
+
+對照最後一次已 commit 的版本，這批還沒 `cp` 的腳本改動只加一個 patch。同一批後續修改留在這個版本號，不要再往上加。
+
+例如已 commit 的是 `1.4.107`，之後連續改了配對 503 與重整後自動開始，版本都停在 `1.4.108`，直到使用者說 `cp`。
