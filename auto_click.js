@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.108
+// @version      1.4.109
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -48,12 +48,12 @@
     const NTFY_TITLE_KEY = 'knockNtfyTitle';
     const NTFY_TITLE_DEFAULT = 'Knock 新訊息';
     const NTFY_SERVER = 'https://ntfy.sh';
-    const NTFY_GAP_MS = 2000;
+    const NTFY_GAP_MS = 60000;
     const RELAY_URL = 'https://knock.keeping.work';
     const RELAY_TOKEN_KEY = 'knockRelayToken';
     const RELAY_TAB_KEY = 'knockRelayTabId';
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.108';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.109';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -1820,31 +1820,41 @@
     let lastNtfyAt = 0;
     let ntfyBackoffUntil = 0;
     let ntfyHold = null;
+    let remotePageOn = false;
 
-    function phoneNotifyPlan(holdingSame, sinceSend, now, gapMs) {
-        if (holdingSame) return 'join';
-        if (now - sinceSend < gapMs) return 'skip';
-        return 'hold';
+    function phoneNotifyPlan(holding, sinceSend, now, gapMs, pageOn) {
+        if (pageOn) return 'quiet';
+        if (holding) return 'join';
+        if (now - sinceSend < gapMs) return 'wait';
+        return 'send';
+    }
+
+    function flushPhoneNotify(topic) {
+        const hold = ntfyHold;
+        if (!hold || hold.topic !== topic) return;
+        ntfyHold = null;
+        if (remotePageOn || !hold.lines.length) return;
+        lastNtfyAt = Date.now();
+        sendNtfy(hold.lines.join('\n').slice(0, 500), hold.title);
     }
 
     function queuePhoneNotify(body) {
         if (!ntfyEnabled) return;
         const topic = getNtfyTopic();
         if (!topic || Date.now() < ntfyBackoffUntil) return;
-        const same = !!(ntfyHold && ntfyHold.topic === topic);
-        const plan = phoneNotifyPlan(same, lastNtfyAt, Date.now(), NTFY_GAP_MS);
-        if (plan === 'skip') return;
+        const holding = !!(ntfyHold && ntfyHold.topic === topic);
+        const plan = phoneNotifyPlan(holding, lastNtfyAt, Date.now(), NTFY_GAP_MS, remotePageOn);
+        if (plan === 'quiet') {
+            ntfyHold = null;
+            return;
+        }
         if (plan === 'join') {
             ntfyHold.lines.push(body);
             return;
         }
+        const wait = plan === 'wait' ? Math.max(0, lastNtfyAt + NTFY_GAP_MS - Date.now()) : 0;
         ntfyHold = { topic, title: getNtfyTitle(), lines: [body] };
-        setTimeout(() => {
-            const hold = ntfyHold;
-            if (!hold || hold.topic !== topic) return;
-            ntfyHold = null;
-            sendNtfy(hold.lines.join('\n').slice(0, 500), hold.title);
-        }, NTFY_GAP_MS);
+        setTimeout(() => flushPhoneNotify(topic), wait);
     }
 
     function ntfyStatusDetail(status) {
@@ -3104,6 +3114,7 @@
             if (data.filters) applyServerFilters(data.filters);
             if (Array.isArray(data.people)) noteKnownPeople(data.people);
             if (data.controls) applyRelayControls(data.controls);
+            if (typeof data.pageOn === 'boolean') remotePageOn = data.pageOn;
             if (typeof data.notify === 'string' && data.notify) sendNtfy(data.notify);
             if (typeof data.avatarOn === 'boolean') {
                 relayRecordAvatar = data.avatarOn;
@@ -3471,9 +3482,10 @@
             || keepTalkTitle(true, true, true, '小美')
             || keepTalkTitle(true, true, false, '未命名')
             || keepTalkTitle(true, true, false, '小美') !== '小美'
-            || phoneNotifyPlan(false, 0, 3000, 2000) !== 'hold'
-            || phoneNotifyPlan(false, 1000, 2500, 2000) !== 'skip'
-            || phoneNotifyPlan(true, 1000, 2500, 2000) !== 'join') {
+            || phoneNotifyPlan(false, 0, 70000, 60000, false) !== 'send'
+            || phoneNotifyPlan(false, 1000, 30000, 60000, false) !== 'wait'
+            || phoneNotifyPlan(true, 1000, 30000, 60000, false) !== 'join'
+            || phoneNotifyPlan(false, 0, 70000, 60000, true) !== 'quiet') {
             console.error('knock: 發語詞當顯示名稱失敗');
         }
         const replyHost = document.createElement('div');

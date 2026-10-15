@@ -865,6 +865,10 @@ function selfCheck() {
         || applyHeartbeat(sessions, { tabId: 'quiettab1', title: '空', canType: true, script: '1.4.108', messages: [] }, 1500).script !== '1.4.108') {
         throw new Error('knock relay 檢查失敗');
     }
+    notePageActive('1', 1000);
+    if (!pageOn(5000) || pageOn(9000)) throw new Error('knock relay 檢查失敗');
+    notePageActive('0', 5000);
+    if (pageOn(5000)) throw new Error('knock relay 檢查失敗');
     if (applyHeartbeat(sessions, { tabId: '../x', title: 'x' }, 2000)) throw new Error('knock relay 檢查失敗');
     const imgItem = enqueue(sessions.get('abc12345'), '', 30000, 'abcd1234');
     const withImg = cleanMessages([{ id: 'imgmsg01', text: '', quote: '原文', image: 'abcd1234' }]);
@@ -1212,7 +1216,18 @@ function pause(ms, req) {
 
 let revision = 0;
 let filterRev = 0;
+let pageActiveAt = 0;
+const PAGE_ON_MS = 8000;
 const wakes = new Set();
+
+function pageOn(now) {
+    return pageActiveAt > 0 && now - pageActiveAt < PAGE_ON_MS;
+}
+
+function notePageActive(flag, now) {
+    if (flag === '1') pageActiveAt = now;
+    else if (flag === '0') pageActiveAt = 0;
+}
 
 function touchFilters() {
     filterRev += 1;
@@ -3275,7 +3290,10 @@ async function tick() {
   try {
     if (!token) return paint();
     const prevCurrent = sessions.find(s => s.tabId === current);
-    const data = await api('/api/sessions' + (pollWait ? '?wait=1' : ''));
+    const ask = [];
+    if (pollWait) ask.push('wait=1');
+    ask.push(document.hidden ? 'active=0' : 'active=1');
+    const data = await api('/api/sessions?' + ask.join('&'));
     sessions = data.sessions || [];
     const otherPing = noteRooms(sessions);
     const freshTalks = data.talks || [];
@@ -3344,7 +3362,7 @@ async function loop() {
     if (Date.now() - started < 1000) await new Promise(r => setTimeout(r, 2000));
   }
 }
-document.addEventListener('visibilitychange', () => { if (!document.hidden) tick(); });
+document.addEventListener('visibilitychange', () => { tick(); });
 document.getElementById('shade').onclick = () => closeRail();
 let edgeSwipe = null;
 document.addEventListener('pointerdown', (e) => {
@@ -3394,6 +3412,7 @@ function main() {
         if (!tokenOk(req.headers.authorization)) return send(res, 401, { error: 'unauthorized' });
         try {
             if (req.method === 'GET' && url.pathname === '/api/sessions') {
+                notePageActive(url.searchParams.get('active'), Date.now());
                 if (url.searchParams.get('wait') === '1') {
                     const seen = revision;
                     await waitUntil(POLL_MS, req, () => revision !== seen);
@@ -3460,7 +3479,7 @@ function main() {
                 if (outbox.dirty || patch.dirty || avatarPatch.dirty || userPatch.dirty || greetingPatch.dirty || startPatch.dirty || leavePatch.dirty || notifyPatch.dirty) saveSessions(sessions);
                 const talkUid = cleanUid(body && body.archive && body.archive.uid);
                 const savedTalk = talkUid ? talks.get(talkUid) : null;
-                return send(res, 200, { ok: true, outbox: outbox.pending, controls: patch.controls, avatarOn: avatarPatch.avatarOn, userOn: userPatch.userOn, greeting: greetingPatch.greeting, start: startPatch.start, leave: leavePatch.leave, notify: notifyPatch.notify, filters, people: visiblePeople(people).map(p => ({ uid: p.uid, title: p.title || '未命名' })), talkTitle: savedTalk ? savedTalk.title : '', rename: session.titleWanted || '' });
+                return send(res, 200, { ok: true, outbox: outbox.pending, controls: patch.controls, avatarOn: avatarPatch.avatarOn, userOn: userPatch.userOn, greeting: greetingPatch.greeting, start: startPatch.start, leave: leavePatch.leave, notify: notifyPatch.notify, pageOn: pageOn(Date.now()), filters, people: visiblePeople(people).map(p => ({ uid: p.uid, title: p.title || '未命名' })), talkTitle: savedTalk ? savedTalk.title : '', rename: session.titleWanted || '' });
             }
             const imgMatch = url.pathname.match(/^\/api\/images\/([a-z0-9]{8,40})$/);
             if (imgMatch && req.method === 'GET') {
