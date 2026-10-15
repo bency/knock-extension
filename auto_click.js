@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.109
+// @version      1.4.110
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -53,7 +53,7 @@
     const RELAY_TOKEN_KEY = 'knockRelayToken';
     const RELAY_TAB_KEY = 'knockRelayTabId';
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.109';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.110';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -1960,6 +1960,7 @@
         paintPartnerCaption();
         decorateOtherMessages();
         checkConversationEnd();
+        kickRelayImages();
     }
 
     function onRememberRowClick(e) {
@@ -2840,22 +2841,70 @@
         });
     }
 
-    async function relayUploadImages(snap) {
-        const avatarId = snap.openings && /^[a-z0-9]{8,40}$/.test(snap.openings.avatar || '') ? snap.openings.avatar : '';
+    const relayUploadWait = new Map();
+    let relayUploadBusy = false;
+
+    function relayImageQueue(chat, avatar) {
         const queue = [];
-        if (avatarId && !relayUploaded.has(avatarId)) {
-            const first = findFirstOtherMessage();
-            if (first && first.avatarUrl) queue.push({ id: avatarId, url: first.avatarUrl, stock: isStockAvatar(first.avatarUrl) });
+        const seen = new Set();
+        for (const item of chat || []) {
+            if (!item || !item.id || seen.has(item.id)) continue;
+            seen.add(item.id);
+            queue.push(item);
         }
-        for (const m of snap.messages || []) {
-            if (!m.image || relayUploaded.has(m.image)) continue;
-            const li = Array.from(document.querySelectorAll('li.message-li')).find(el => el.classList.contains('message-li-' + m.id));
-            const messageDiv = li && li.querySelector('[data-test="message"]');
+        if (avatar && avatar.id && !seen.has(avatar.id)) queue.push(avatar);
+        return queue;
+    }
+
+    function chatImagesToUpload() {
+        const list = document.querySelector('ul[data-test="messages"]');
+        if (!list) return [];
+        const items = [];
+        const seen = new Set();
+        const now = Date.now();
+        const lis = list.querySelectorAll('li.message-li');
+        for (let i = lis.length - 1; i >= 0; i--) {
+            const messageDiv = lis[i].querySelector('[data-test="message"]');
             const url = messageDiv && getMessageImages(messageDiv)[0];
-            if (url) queue.push({ id: m.image, url });
+            if (!url) continue;
+            const id = relayImageId(url);
+            if (!/^[a-z0-9]{8,40}$/.test(id) || relayUploaded.has(id) || seen.has(id)) continue;
+            if ((relayUploadWait.get(id) || 0) > now) continue;
+            seen.add(id);
+            items.push({ id, url });
         }
-        const item = queue[0];
-        if (!item) return;
+        return items;
+    }
+
+    function avatarToUpload() {
+        const first = findFirstOtherMessage();
+        if (!first || !first.avatarUrl) return null;
+        const id = openingAvatar(first.li, first.avatarUrl);
+        if (!/^[a-z0-9]{8,40}$/.test(id) || relayUploaded.has(id)) return null;
+        if ((relayUploadWait.get(id) || 0) > Date.now()) return null;
+        return { id, url: first.avatarUrl, stock: isStockAvatar(first.avatarUrl) };
+    }
+
+    function kickRelayImages() {
+        if (relayUploadBusy || !relayToken()) return;
+        const queue = relayImageQueue(chatImagesToUpload(), avatarToUpload());
+        if (!queue.length) return;
+        relayUploadBusy = true;
+        uploadRelayQueue(queue).finally(() => {
+            relayUploadBusy = false;
+            kickRelayImages();
+        });
+    }
+
+    async function uploadRelayQueue(queue) {
+        for (const item of queue) {
+            if (relayUploaded.has(item.id)) continue;
+            if (await uploadRelayImage(item)) relayUploaded.add(item.id);
+            else relayUploadWait.set(item.id, Date.now() + 3000);
+        }
+    }
+
+    async function uploadRelayImage(item) {
         try {
             if (item.stock) {
                 const have = await gmRequest({
@@ -2864,10 +2913,7 @@
                     headers: { Authorization: `Bearer ${relayToken()}` },
                     timeout: 8000
                 });
-                if (have && have.status === 200) {
-                    relayUploaded.add(item.id);
-                    return;
-                }
+                if (have && have.status === 200) return true;
             }
             let blob = await fetchImageBlob(item.url);
             if (item.stock && (!blob.type || blob.type.indexOf('svg') !== -1)) blob = await svgToJpeg(blob);
@@ -2882,8 +2928,10 @@
                 data: blob,
                 timeout: 20000
             });
-            if (res && (res.status === 200 || res.status === 409)) relayUploaded.add(item.id);
-        } catch (e) {}
+            return !!(res && (res.status === 200 || res.status === 409));
+        } catch (e) {
+            return false;
+        }
     }
 
     function relayParkedFile() {
@@ -3076,7 +3124,7 @@
         if (!snap) return;
         relayBusy = true;
         try {
-            await relayUploadImages(snap);
+            kickRelayImages();
             const res = await gmRequest({
                 method: 'POST',
                 url: `${RELAY_URL}/api/heartbeat?wait=1`,
@@ -3518,6 +3566,10 @@
             || relayImagePlan('old', imageDone, true) !== 'ack'
             || relayImagePlan('new', imageDone, true) !== 'send') {
             console.error('knock: 遠端圖片只送一次失敗');
+        }
+        const uploadOrder = relayImageQueue([{ id: 'chatimg1' }, { id: 'chatimg1' }], { id: 'faceimg1' });
+        if (uploadOrder.length !== 2 || uploadOrder[0].id !== 'chatimg1' || uploadOrder[1].id !== 'faceimg1') {
+            console.error('knock: 圖片上傳順序失敗');
         }
         const ctrl = { auto: true, userFilter: true, avatarFilter: false, browser: true, phone: true, phoneTopic: 'abc', phoneTitle: 'Knock 新訊息', keep: false, keepText: '在嗎', keepMin: 1.5, keepMax: 2.5 };
         const quietNight = new Date(2026, 9, 6, 0, 20);

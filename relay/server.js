@@ -3492,10 +3492,12 @@ function main() {
                 return;
             }
             if (imgMatch && req.method === 'POST') {
-                // 檔案已在就用同一份，不再寫一次。
-                if (imagePath(imgMatch[1])) return send(res, 200, { ok: true });
-                const buf = await readRaw(req, 1500000);
-                if (!writeImage(imgMatch[1], buf, req.headers['content-type'])) return send(res, 400, { error: 'bad image' });
+                // 檔案已在就用同一份，不再寫一次。寫好就叫醒正在看的頁面。
+                if (!imagePath(imgMatch[1])) {
+                    const buf = await readRaw(req, 1500000);
+                    if (!writeImage(imgMatch[1], buf, req.headers['content-type'])) return send(res, 400, { error: 'bad image' });
+                }
+                touch();
                 return send(res, 200, { ok: true });
             }
             const imgSend = url.pathname.match(/^\/api\/sessions\/([a-z0-9]{8,40})\/send-image$/);
