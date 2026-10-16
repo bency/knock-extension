@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.110
+// @version      1.4.111
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -53,7 +53,7 @@
     const RELAY_TOKEN_KEY = 'knockRelayToken';
     const RELAY_TAB_KEY = 'knockRelayTabId';
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.110';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.111';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -2197,6 +2197,11 @@
         }
     }
 
+    function outboxHandPlan(id, handed) {
+        if (!id || handed) return 'skip';
+        return 'send';
+    }
+
     function sendAttemptPlan(armed, boxValue, wanted) {
         const value = String(boxValue || '').trim();
         const text = String(wanted || '').trim();
@@ -2654,7 +2659,7 @@
         return { uid: next.uid, title: next.title, named: nameSet, messages };
     }
 
-    const relaySending = new Map();
+    const relayHanded = new Set();
     const relayUploaded = new Set();
     const relayImageDone = new Set();
     const relayArchived = new Set();
@@ -3158,6 +3163,11 @@
                 pendingRemoteLeave = true;
                 logLeave('收到離開');
             }
+            if (data.reload) {
+                const loc = (typeof unsafeWindow !== 'undefined' && unsafeWindow.location) || location;
+                loc.reload();
+                return;
+            }
             remoteLeaveChat();
             if (data.filters) applyServerFilters(data.filters);
             if (Array.isArray(data.people)) noteKnownPeople(data.people);
@@ -3220,12 +3230,9 @@
                     await ackRelayItem(token, snap.tabId, item.id);
                     continue;
                 }
-                const started = relaySending.get(item.id) || 0;
-                if (Date.now() - started < 8000) continue;
-                relaySending.set(item.id, Date.now());
-                const drop = () => {
-                    ackRelayItem(token, snap.tabId, item.id).finally(() => relaySending.delete(item.id));
-                };
+                if (outboxHandPlan(item.id, relayHanded.has(item.id)) === 'skip') continue;
+                relayHanded.add(item.id);
+                const drop = () => ackRelayItem(token, snap.tabId, item.id);
                 sendChatMessage(item.text, drop, drop);
             }
             }
@@ -3587,6 +3594,9 @@
             || sendAttemptPlan(true, '', '🎶') !== 'sent'
             || sendAttemptPlan(true, '🎶', '🎶') !== 'wait'
             || sendAttemptPlan(false, '', '') !== 'skip'
+            || outboxHandPlan('', false) !== 'skip'
+            || outboxHandPlan('abc', true) !== 'skip'
+            || outboxHandPlan('abc', false) !== 'send'
             || !keepWarnPlan(0, 600000, 600000)
             || keepWarnPlan(600000, 600000, 600000)
             || !keepWarnPlan(0, 1200000, 600000)

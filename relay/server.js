@@ -559,6 +559,7 @@ function applyHeartbeat(sessions, body, now) {
         greetingWanted: prev && typeof prev.greetingWanted === 'string' ? prev.greetingWanted : null,
         startWanted: !!(prev && prev.startWanted),
         leaveWanted: !!(prev && prev.leaveWanted),
+        reloadWanted: !!(prev && prev.reloadWanted),
         status: body.status === 'left' ? 'left' : 'live',
         messages: body.lobby && !(body.messages && body.messages.length) && prev && prev.messages && prev.messages.length
             ? prev.messages
@@ -622,6 +623,7 @@ function loadSessions() {
                 greetingWanted: typeof s.greetingWanted === 'string' ? String(s.greetingWanted).slice(0, 200) : null,
                 startWanted: !!s.startWanted,
                 leaveWanted: !!s.leaveWanted,
+                reloadWanted: !!s.reloadWanted,
                 status: s.status === 'left' ? 'left' : 'live',
                 messages: cleanMessages(s.messages),
                 seen: Number(s.seen) || 0,
@@ -802,6 +804,12 @@ function takeLeavePatch(session) {
     return { leave: true, dirty: true };
 }
 
+function takeReloadPatch(session) {
+    if (!session.reloadWanted) return { reload: false, dirty: false };
+    session.reloadWanted = false;
+    return { reload: true, dirty: true };
+}
+
 function latestThemText(session) {
     const list = session && session.messages || [];
     for (let i = list.length - 1; i >= 0; i--) {
@@ -972,6 +980,12 @@ function selfCheck() {
     if (!keptLeave || !keptLeave.leaveWanted) throw new Error('knock relay 檢查失敗');
     const leaving = takeLeavePatch(keptLeave);
     if (!heartbeatReady({ leaveWanted: true, outbox: [] }) || !leaving.leave || keptLeave.leaveWanted || takeLeavePatch(keptLeave).leave) {
+        throw new Error('knock relay 檢查失敗');
+    }
+    keptLeave.reloadWanted = true;
+    const keptReload = applyHeartbeat(sessions, { tabId: 'abc12345', title: '阿明', canType: true, messages: [{ id: 'm1', text: '嗨', mine: false }] }, 17000);
+    const reloading = takeReloadPatch(keptReload);
+    if (!keptReload || !heartbeatReady({ reloadWanted: true, outbox: [] }) || !reloading.reload || keptReload.reloadWanted || takeReloadPatch(keptReload).reload) {
         throw new Error('knock relay 檢查失敗');
     }
     const keptLobby = applyHeartbeat(sessions, {
@@ -1269,6 +1283,7 @@ function heartbeatReady(session) {
     if (typeof session.userWanted === 'boolean' && session.userWanted !== userOn) return true;
     if (session.startWanted) return true;
     if (session.leaveWanted) return true;
+    if (session.reloadWanted) return true;
     if (typeof session.greetingWanted === 'string' && session.greetingWanted !== session.greeting) return true;
     if (typeof session.notifyWanted === 'string' && session.notifyWanted) return true;
     if (typeof session.titleWanted === 'string') return true;
@@ -2665,6 +2680,7 @@ function paintControls() {
     p.className = 'muted';
     p.textContent = '這個聊天室還沒回報設定。先讓那一頁開著。';
     app.append(p);
+    appendReload();
     appendLeave();
     return;
   }
@@ -2744,6 +2760,7 @@ function paintControls() {
     extra.append(topic, title, test);
     app.append(extra);
   }
+  appendReload();
   appendLeave();
 }
 
@@ -2933,6 +2950,24 @@ function paintOpening(s) {
   const mine = o.mine && o.mine.text ? { mine: true, text: o.mine.text, time: openingClock(o.mine.at) } : null;
   if (them) paintBubble(them);
   if (mine) paintBubble(mine);
+}
+
+function reloadPage(s) {
+  if (!s) return;
+  api('/api/sessions/' + encodeURIComponent(s.tabId) + '/reload', { method: 'POST' })
+    .catch(err => alert(err.message || '重新整理失敗'));
+}
+
+function appendReload() {
+  const s = sessions.find(x => x.tabId === current);
+  if (!s) return;
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'ctrl';
+  btn.textContent = '重新整理';
+  btn.style.justifyContent = 'flex-start';
+  btn.onclick = () => reloadPage(s);
+  app.append(btn);
 }
 
 function leaveChat(s) {
@@ -3475,11 +3510,12 @@ function main() {
                 const greetingPatch = takeGreetingPatch(session);
                 const startPatch = takeStartPatch(session);
                 const leavePatch = takeLeavePatch(session);
+                const reloadPatch = takeReloadPatch(session);
                 const notifyPatch = takeNotifyPatch(session);
-                if (outbox.dirty || patch.dirty || avatarPatch.dirty || userPatch.dirty || greetingPatch.dirty || startPatch.dirty || leavePatch.dirty || notifyPatch.dirty) saveSessions(sessions);
+                if (outbox.dirty || patch.dirty || avatarPatch.dirty || userPatch.dirty || greetingPatch.dirty || startPatch.dirty || leavePatch.dirty || reloadPatch.dirty || notifyPatch.dirty) saveSessions(sessions);
                 const talkUid = cleanUid(body && body.archive && body.archive.uid);
                 const savedTalk = talkUid ? talks.get(talkUid) : null;
-                return send(res, 200, { ok: true, outbox: outbox.pending, controls: patch.controls, avatarOn: avatarPatch.avatarOn, userOn: userPatch.userOn, greeting: greetingPatch.greeting, start: startPatch.start, leave: leavePatch.leave, notify: notifyPatch.notify, pageOn: pageOn(Date.now()), filters, people: visiblePeople(people).map(p => ({ uid: p.uid, title: p.title || '未命名' })), talkTitle: savedTalk ? savedTalk.title : '', rename: session.titleWanted || '' });
+                return send(res, 200, { ok: true, outbox: outbox.pending, controls: patch.controls, avatarOn: avatarPatch.avatarOn, userOn: userPatch.userOn, greeting: greetingPatch.greeting, start: startPatch.start, leave: leavePatch.leave, reload: reloadPatch.reload, notify: notifyPatch.notify, pageOn: pageOn(Date.now()), filters, people: visiblePeople(people).map(p => ({ uid: p.uid, title: p.title || '未命名' })), talkTitle: savedTalk ? savedTalk.title : '', rename: session.titleWanted || '' });
             }
             const imgMatch = url.pathname.match(/^\/api\/images\/([a-z0-9]{8,40})$/);
             if (imgMatch && req.method === 'GET') {
@@ -3588,6 +3624,15 @@ function main() {
                 if (!session) return send(res, 404, { error: 'gone' });
                 if (session.lobby || session.status === 'left') return send(res, 409, { error: 'cannot leave' });
                 session.leaveWanted = true;
+                touch();
+                saveSessions(sessions);
+                return send(res, 200, { ok: true });
+            }
+            const reloadPost = url.pathname.match(/^\/api\/sessions\/([a-z0-9]{8,40})\/reload$/);
+            if (req.method === 'POST' && reloadPost) {
+                const session = sessions.get(reloadPost[1]);
+                if (!session) return send(res, 404, { error: 'gone' });
+                session.reloadWanted = true;
                 touch();
                 saveSessions(sessions);
                 return send(res, 200, { ok: true });
