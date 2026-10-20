@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.111
+// @version      1.4.112
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -53,7 +53,7 @@
     const RELAY_TOKEN_KEY = 'knockRelayToken';
     const RELAY_TAB_KEY = 'knockRelayTabId';
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.111';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.112';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -2540,6 +2540,16 @@
         simulateMouseClick(exitButton);
     }
 
+    function partnerTyping() {
+        const list = document.querySelector('ul[data-test="messages"]');
+        if (!list) return false;
+        for (const li of list.querySelectorAll('li.message-li')) {
+            const messageDiv = li.querySelector('div[data-test="message"]');
+            if (messageDiv && TYPING_RE.test(getMessageText(messageDiv))) return true;
+        }
+        return false;
+    }
+
     function relaySnapshot() {
         const list = document.querySelector('ul[data-test="messages"]');
         const lobby = findButtons().some(isStartChatButton);
@@ -2558,6 +2568,7 @@
             openings: null,
             controls: relayControls(),
             script: SCRIPT_VERSION,
+            typing: partnerTyping(),
             archive: relayArchive()
         };
         if (!list) return base;

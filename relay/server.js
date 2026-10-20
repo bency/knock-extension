@@ -572,6 +572,7 @@ function applyHeartbeat(sessions, body, now) {
         userWanted: sameChannel && prev && typeof prev.userWanted === 'boolean' ? prev.userWanted : null,
         controls: keepControls(cleanControls(body.controls), body.controls, prev),
         script: cleanScriptVersion(body.script) || (prev && prev.script) || '',
+        typing: !!body.typing,
         controlWanted: prev ? prev.controlWanted : null,
         notifyWanted: prev && typeof prev.notifyWanted === 'string' ? prev.notifyWanted : null,
         outbox: prev ? prev.outbox : []
@@ -599,6 +600,7 @@ function visibleSessions(sessions, now, waitMs) {
             openings: s.openings || null,
             controls: s.controls || null,
             script: s.script || '',
+            typing: !!s.typing,
             pending: s.outbox.length,
             queued: queuedLines(s.outbox)
         });
@@ -871,6 +873,13 @@ function selfCheck() {
         || cleanScriptVersion('1.4')
         || cleanScriptVersion('abc')
         || applyHeartbeat(sessions, { tabId: 'quiettab1', title: '空', canType: true, script: '1.4.108', messages: [] }, 1500).script !== '1.4.108') {
+        throw new Error('knock relay 檢查失敗');
+    }
+    const typingOn = applyHeartbeat(sessions, { tabId: 'abc12345', title: '阿明', canType: true, typing: true, messages: [{ id: 'm1', text: '嗨', mine: false }] }, 21000);
+    const shownOn = visibleSessions(sessions, 21000, 15000).find(s => s.tabId === 'abc12345');
+    const typingOff = applyHeartbeat(sessions, { tabId: 'abc12345', title: '阿明', canType: true, messages: [{ id: 'm1', text: '嗨', mine: false }] }, 22000);
+    const shownOff = visibleSessions(sessions, 22000, 15000).find(s => s.tabId === 'abc12345');
+    if (!typingOn.typing || !shownOn || !shownOn.typing || typingOff.typing || !shownOff || shownOff.typing) {
         throw new Error('knock relay 檢查失敗');
     }
     notePageActive('1', 1000);
@@ -1503,6 +1512,9 @@ const PAGE = `<!DOCTYPE html>
   .card small.preview .preview-time { flex:none; color:#888; white-space:nowrap; }
   .card small.preview.mine { color:#9ccc65; }
   .new-msg { position:absolute; left:50%; bottom:72px; transform:translateX(-50%); z-index:7; padding:6px 14px; border:none; border-radius:16px; background:#ffb74d; color:#111; font-size:13px; cursor:pointer; box-shadow:0 2px 8px rgba(0,0,0,.35); }
+  .jump-room { position:absolute; left:16px; bottom:72px; z-index:7; max-width:calc(100% - 32px); height:40px; padding:0 14px 0 8px; border:none; border-radius:20px; background:#ffb74d; color:#111; cursor:pointer; box-shadow:0 2px 8px rgba(0,0,0,.35); display:flex; align-items:center; gap:2px; }
+  .jump-room span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:14px; }
+  .toast { position:fixed; left:50%; bottom:88px; transform:translateX(-50%); z-index:50; max-width:min(420px, calc(100% - 32px)); padding:10px 14px; border-radius:10px; background:#333; color:#eee; font-size:14px; text-align:center; box-shadow:0 2px 10px rgba(0,0,0,.45); pointer-events:none; }
   .bubble { display:flex; margin:0 0 8px; }
   .bubble.mine { justify-content:flex-end; }
   .bubble.them { justify-content:flex-start; }
@@ -1511,7 +1523,9 @@ const PAGE = `<!DOCTYPE html>
   .bubble.them .msg { background:#2d2d3d; }
   .msg { padding:8px 10px; white-space:pre-wrap; word-break:break-word; }
   .quote { font-size:12px; color:rgba(255,255,255,.7); border-left:2px solid rgba(255,255,255,.35); padding-left:6px; margin-bottom:6px; }
-  .msg img.pic { display:block; max-width:100%; max-height:240px; border-radius:6px; margin-top:6px; }
+  .msg img.pic { display:block; max-width:100%; max-height:240px; border-radius:6px; margin-top:6px; cursor:pointer; }
+  #zoom.pic { padding:0; }
+  #zoom.pic img { width:auto; height:auto; max-width:100%; max-height:100%; object-fit:contain; min-width:0; min-height:0; }
   .time { display:block; margin-top:4px; font-size:11px; color:rgba(255,255,255,.55); }
   form { position:relative; flex:none; display:flex; gap:8px; padding:10px; background:#111; border-top:1px solid #333; }
   form input { flex:1; padding:10px; border-radius:8px; border:1px solid #444; background:#1a1a1a; }
@@ -1519,7 +1533,6 @@ const PAGE = `<!DOCTYPE html>
   @keyframes composer-glow { 0% { box-shadow:0 0 0 0 rgba(255,183,77,0); } 40% { box-shadow:0 0 12px 3px rgba(255,183,77,.9); } 100% { box-shadow:0 0 0 0 rgba(255,183,77,0); } }
   form input[type=file] { display:none; }
   form button { padding:10px 14px; border:none; border-radius:8px; background:#4CAF50; cursor:pointer; }
-  form button.pick { background:#333; }
   form button:disabled { opacity:0.45; }
   .queued { flex:none; margin:0; padding:8px 12px; border-top:1px solid #6a5420; background:#2a2416; color:#ffb74d; font-size:13px; }
   .queued div { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -1595,6 +1608,13 @@ const app = document.getElementById('app');
 const nav = document.getElementById('nav');
 const rail = document.getElementById('rail');
 const stage = document.getElementById('stage');
+app.addEventListener('click', () => { if (jumpTab) hideJump(); });
+document.addEventListener('click', (e) => {
+  if (!showControls) return;
+  if (e.target.closest('.ctrl, .extra, .gear')) return;
+  showControls = false;
+  paint();
+});
 let token = localStorage.getItem(TOKEN_KEY) || '';
 let current = '';
 let menu = 'chats';
@@ -1684,9 +1704,23 @@ function gate() {
 
 function statusText(s) {
   if (s.lobby) return '';
-  if (s.status === 'left') return '對方已離開';
+  if (s.status === 'left') return '對方已離開對話';
   if (!s.canType) return '現在不能回';
   return '';
+}
+
+let toastTimer = 0;
+function toast(text) {
+  const msg = String(text || '失敗').trim() || '失敗';
+  let el = document.querySelector('.toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.className = 'toast';
+    document.body.append(el);
+  }
+  el.textContent = msg;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { if (el.isConnected) el.remove(); }, 2800);
 }
 
 function paintQueued() {
@@ -1716,7 +1750,7 @@ function deleteTalk(uid) {
   }
   api('/api/talks/' + encodeURIComponent(uid), { method: 'DELETE' }).catch(() => {
     droppedTalks.delete(uid);
-    alert('刪除失敗');
+    toast('刪除失敗');
   });
 }
 
@@ -1771,6 +1805,19 @@ function barsIcon() {
   return bars;
 }
 
+function leftIcon() {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('width', '22');
+  svg.setAttribute('height', '22');
+  svg.setAttribute('aria-hidden', 'true');
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('fill', 'currentColor');
+  path.setAttribute('d', 'M15.4 7.4L14 6l-6 6 6 6 1.4-1.4L10.8 12z');
+  svg.append(path);
+  return svg;
+}
+
 function closeRail() { document.body.classList.remove('rail-open'); }
 
 const roomUnread = {};
@@ -1791,7 +1838,7 @@ function unreadLeft() {
 
 function noteRooms(list) {
   const alive = {};
-  let alert = false;
+  let alertId = '';
   for (const s of list) {
     alive[s.tabId] = true;
     const tail = themTailId(s.messages);
@@ -1801,7 +1848,7 @@ function noteRooms(list) {
       delete roomUnread[s.tabId];
       continue;
     }
-    if (composerAlert(s.tabId, current, tail, prev, roomTailReady)) alert = true;
+    if (composerAlert(s.tabId, current, tail, prev, roomTailReady)) alertId = s.tabId;
     if (!roomTailReady || prev === undefined) {
       roomTail[s.tabId] = tail;
       if (roomTailReady && tail && s.tabId !== current) roomUnread[s.tabId] = true;
@@ -1814,7 +1861,15 @@ function noteRooms(list) {
   }
   roomTailReady = true;
   for (const id in roomUnread) if (!alive[id]) delete roomUnread[id];
-  return alert;
+  return alertId;
+}
+
+let jumpTab = '';
+
+function hideJump() {
+  jumpTab = '';
+  const btn = document.querySelector('.jump-room');
+  if (btn) btn.remove();
 }
 
 function glowInput() {
@@ -1823,6 +1878,44 @@ function glowInput() {
   input.classList.remove('glow');
   void input.offsetWidth;
   input.classList.add('glow');
+}
+
+function jumpLine(tabId) {
+  const s = sessions.find(x => x.tabId === tabId);
+  const last = s && s.messages && s.messages[s.messages.length - 1];
+  if (!last) return '';
+  return String(last.text || (last.image ? '圖片' : last.quote || '')).trim();
+}
+
+function showJump(tabId) {
+  const input = document.querySelector('form input:not([type=file])');
+  if (!tabId || !input || input.dataset.kind === 'greeting') return;
+  jumpTab = tabId;
+  const line = jumpLine(tabId);
+  let btn = document.querySelector('.jump-room');
+  if (!btn) {
+    btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'jump-room';
+    btn.append(leftIcon(), document.createElement('span'));
+    btn.onclick = () => {
+      const id = jumpTab;
+      const s = sessions.find(x => x.tabId === id);
+      hideJump();
+      if (!s) return;
+      showControls = false;
+      archiveUid = '';
+      archiveTalk = null;
+      current = s.tabId;
+      delete roomUnread[s.tabId];
+      stickBottom = true;
+      closeRail();
+      paint();
+    };
+    stage.append(btn);
+  }
+  btn.querySelector('span').textContent = line;
+  btn.setAttribute('aria-label', line ? '前往新訊息：' + line : '前往新訊息');
 }
 
 function paintBar(title, end, avatar, onRename) {
@@ -2051,7 +2144,7 @@ function renameTalk(uid, title) {
     if (person) person.title = shown;
     sessions.forEach(s => { if (s.partnerUid === uid) s.title = shown; });
     paint();
-  }).catch(err => alert(err.message || '命名失敗'));
+  }).catch(err => toast(err.message || '命名失敗'));
 }
 
 function askRename(uid, shown) {
@@ -2086,7 +2179,7 @@ function setUserFilter(p, on, sw) {
     filterToggleAt = 0;
     filterToggleUid = '';
     if (sw && sw.isConnected) paintUserSwitch(sw, prev);
-    alert(err.message || '設定失敗');
+    toast(err.message || '設定失敗');
   });
 }
 
@@ -2226,7 +2319,7 @@ function peopleRow(p) {
   const flag = document.createElement('td');
   flag.append(filterSwitch(p, true));
   flag.onclick = (e) => e.stopPropagation();
-  tr.append(face, name, id, when, meets, count, flag);
+  tr.append(face, flag, name, id, when, meets, count);
   tr.onclick = () => openPerson(p);
   return tr;
 }
@@ -2251,7 +2344,7 @@ function peopleTable(rows) {
   const table = document.createElement('table');
   const head = document.createElement('thead');
   const hr = document.createElement('tr');
-  ['', '名稱', '使用者 id', '第一次', '遇到', '對話量', '過濾使用者'].forEach(text => {
+  ['', '過濾使用者', '名稱', '使用者 id', '第一次', '遇到', '對話量'].forEach(text => {
     const th = document.createElement('th');
     th.textContent = text;
     hr.append(th);
@@ -2278,7 +2371,7 @@ function setFaceFilter(id, on) {
     body: JSON.stringify(on ? { addAvatars: [id] } : { removeAvatars: [id] })
   }).catch(err => {
     touched.forEach(p => { p.avatarFiltered = !on; });
-    alert(err.message || '設定失敗');
+    toast(err.message || '設定失敗');
     paint();
   });
 }
@@ -2627,7 +2720,7 @@ function shownControls() {
 function postControls(next) {
   if (!current) return;
   const packed = packControls(next);
-  if (!topicOk(packed.phoneTopic)) { alert('主題只接受英文、數字、底線和減號'); return; }
+  if (!topicOk(packed.phoneTopic)) { toast('主題只接受英文、數字、底線和減號'); return; }
   const tabId = current;
   controlDraft = { tabId: tabId, controls: packed };
   paint();
@@ -2635,7 +2728,7 @@ function postControls(next) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(packed)
-  }).catch(err => { controlDraft = null; alert(err.message || '設定失敗'); paint(); });
+  }).catch(err => { controlDraft = null; toast(err.message || '設定失敗'); paint(); });
 }
 
 function switchBox(on) {
@@ -2674,6 +2767,7 @@ function paintControls() {
   ver.style.margin = '0 0 12px';
   ver.textContent = room && room.script ? '腳本 ' + room.script : '還沒回報腳本版本';
   app.append(ver);
+  appendSendImage();
   const src = shownControls();
   if (!src) {
     const p = document.createElement('p');
@@ -2740,14 +2834,14 @@ function paintControls() {
       const room = sessions.find(x => x.tabId === current);
       if (!room) return;
       const topicText = topic.value.trim();
-      if (!topicOk(topicText)) { alert('主題只接受英文、數字、底線和減號'); return; }
-      if (!topicText) { alert('請先設定主題'); return; }
+      if (!topicOk(topicText)) { toast('主題只接受英文、數字、底線和減號'); return; }
+      if (!topicText) { toast('請先設定主題'); return; }
       const packed = packControls(Object.assign({}, c, { phoneTopic: topicText, phoneTitle: title.value }));
       const sendTest = () => api('/api/sessions/' + encodeURIComponent(room.tabId) + '/notify-test', { method: 'POST' }).then(data => {
-        if (data && data.error) alert(data.error);
+        if (data && data.error) toast(data.error);
       });
       if (JSON.stringify(packed) === JSON.stringify(packControls(c))) {
-        sendTest().catch(err => alert(err.message || '測試失敗'));
+        sendTest().catch(err => toast(err.message || '測試失敗'));
         return;
       }
       controlDraft = { tabId: room.tabId, controls: packed };
@@ -2755,7 +2849,7 @@ function paintControls() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(packed)
-      }).then(sendTest).catch(err => { controlDraft = null; alert(err.message || '測試失敗'); paint(); });
+      }).then(sendTest).catch(err => { controlDraft = null; toast(err.message || '測試失敗'); paint(); });
     };
     extra.append(topic, title, test);
     app.append(extra);
@@ -2779,7 +2873,7 @@ function postAvatar(s, on) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ on: !!on })
-  }).catch(err => { avatarDraft = null; alert(err.message || '設定失敗'); paint(); });
+  }).catch(err => { avatarDraft = null; toast(err.message || '設定失敗'); paint(); });
 }
 
 function postUser(s, on) {
@@ -2790,7 +2884,7 @@ function postUser(s, on) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ on: !!on })
-  }).catch(err => { userDraft = null; alert(err.message || '設定失敗'); paint(); });
+  }).catch(err => { userDraft = null; toast(err.message || '設定失敗'); paint(); });
 }
 
 function shownOpenings(s) {
@@ -2821,6 +2915,7 @@ function paintBubble(m) {
     const img = document.createElement('img');
     img.className = 'pic';
     img.alt = '';
+    img.onclick = () => zoomPic(m.image);
     row.append(img);
     showPic(m.image, img);
   }
@@ -2954,8 +3049,26 @@ function paintOpening(s) {
 
 function reloadPage(s) {
   if (!s) return;
+  showControls = false;
+  paint();
   api('/api/sessions/' + encodeURIComponent(s.tabId) + '/reload', { method: 'POST' })
-    .catch(err => alert(err.message || '重新整理失敗'));
+    .catch(err => toast(err.message || '重新整理失敗'));
+}
+
+function appendSendImage() {
+  const s = sessions.find(x => x.tabId === current);
+  if (!s || !canSend(s)) return;
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'ctrl';
+  btn.textContent = '傳送圖片';
+  btn.style.justifyContent = 'flex-start';
+  btn.onclick = () => {
+    showControls = false;
+    paint();
+    relayFile.click();
+  };
+  app.append(btn);
 }
 
 function appendReload() {
@@ -2975,7 +3088,7 @@ function leaveChat(s) {
   showControls = false;
   paint();
   api('/api/sessions/' + encodeURIComponent(s.tabId) + '/leave', { method: 'POST' })
-    .catch(err => alert(err.message || '離開失敗'));
+    .catch(err => toast(err.message || '離開失敗'));
 }
 
 function appendLeave() {
@@ -2997,7 +3110,7 @@ function startChat(s) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: '{}'
-  }).catch(err => alert(err.message || '開始失敗'));
+  }).catch(err => toast(err.message || '開始失敗'));
 }
 
 function threadActions(s) {
@@ -3018,6 +3131,22 @@ function threadActions(s) {
   return box;
 }
 
+function paintTyping(on) {
+  const old = document.querySelector('.typing');
+  if (!on) {
+    if (old) old.remove();
+    return;
+  }
+  if (old) return;
+  const follow = stickBottom || nearBottom();
+  const note = document.createElement('p');
+  note.className = 'muted typing';
+  note.style.textAlign = 'center';
+  note.textContent = '對方正在輸入...';
+  app.append(note);
+  if (follow) scrollBottom();
+}
+
 function paintThread(s, follow, y) {
   paintBar((s && s.title) || '未命名', threadActions(s), s && s.openings && s.openings.avatar, s && s.tabId ? (title) => {
     api('/api/sessions/' + encodeURIComponent(s.tabId) + '/title', {
@@ -3031,7 +3160,7 @@ function paintThread(s, follow, y) {
       const person = data.uid && people.find(p => p.uid === data.uid);
       if (person) person.title = s.title;
       paint();
-    }).catch(err => alert(err.message || '命名失敗'));
+    }).catch(err => toast(err.message || '命名失敗'));
   } : null);
   app.replaceChildren();
   if (!s) {
@@ -3044,6 +3173,14 @@ function paintThread(s, follow, y) {
   paintOpening(s);
   (s.messages || []).forEach(paintBubble);
   replayPending(s.tabId);
+  if (s.status === 'left') {
+    const note = document.createElement('p');
+    note.className = 'muted';
+    note.style.textAlign = 'center';
+    note.textContent = statusText(s);
+    app.append(note);
+  }
+  paintTyping(!!s.typing);
   placeThread(s, follow, y);
 }
 
@@ -3057,10 +3194,12 @@ function paint() {
   document.querySelectorAll('.gate').forEach(el => el.remove());
   paintNav();
   if (menu === 'faces') {
+    hideJump();
     paintFaces();
     return;
   }
   if (menu === 'users') {
+    hideJump();
     if (userOpen && archiveUid) {
       const userY = app.scrollTop;
       const userFollow = stickBottom || nearBottom();
@@ -3070,6 +3209,7 @@ function paint() {
   }
   paintRail();
   if (showControls) {
+    hideJump();
     const editing = document.activeElement && document.activeElement.tagName === 'INPUT' && document.activeElement.closest && document.activeElement.closest('#app');
     if (!editing) {
       const s = sessions.find(x => x.tabId === current);
@@ -3079,6 +3219,7 @@ function paint() {
     return;
   }
   if (archiveUid) {
+    hideJump();
     const y = app.scrollTop;
     const follow = stickBottom || nearBottom();
     paintArchive(archiveTalk, follow, y);
@@ -3091,7 +3232,7 @@ function paint() {
     const s = sessions.find(x => x.tabId === current);
     paintThread(s, follow, y);
     paintQueued(s);
-    if (s && (s.lobby || s.status === 'left')) return;
+    if (s && (s.lobby || s.status === 'left')) { hideJump(); return; }
     const input = document.querySelector('form input');
     if (input) input.disabled = !canSend(s);
     document.querySelectorAll('form button').forEach(btn => { btn.disabled = sending || !canSend(s); });
@@ -3104,6 +3245,7 @@ function paint() {
   }
   const draft = composeDrafts[current] || '';
   if (!current) {
+    hideJump();
     paintBar('Knock 遠端');
     app.replaceChildren();
     clearForm();
@@ -3118,6 +3260,7 @@ function paint() {
   paintThread(s, follow, y);
   if (!s) return;
   if (s.lobby || s.status === 'left') {
+    hideJump();
     const form = document.createElement('form');
     const input = document.createElement('input');
     input.maxLength = 200;
@@ -3137,7 +3280,7 @@ function paint() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text: text })
-      }).catch(err => alert(err.message || '設定失敗'));
+      }).catch(err => toast(err.message || '設定失敗'));
     };
     stage.append(form);
     formTab = s.tabId;
@@ -3182,7 +3325,7 @@ function paint() {
       if (lastSentText === text) lastSentText = '';
       input.value = text;
       composeDrafts[s.tabId] = text;
-      alert(err.message);
+      toast(err.message);
     }).finally(() => {
       sending = false;
       document.querySelectorAll('form button').forEach(btn => { btn.disabled = !canSend(s); });
@@ -3203,13 +3346,6 @@ function paint() {
     input.focus();
     sendText();
   });
-  const pick = document.createElement('button');
-  pick.type = 'button';
-  pick.className = 'pick';
-  pick.textContent = '圖片';
-  pick.disabled = sending || !canSend(s);
-  pick.onclick = () => relayFile.click();
-  form.append(pick);
   stage.append(form);
   formTab = s.tabId;
   paintQueued(s);
@@ -3225,6 +3361,23 @@ function plainFace() {
   path.setAttribute('d', 'M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 3c1.66 0 3 1.34 3 3s-1.34 3-3 3-3-1.34-3-3 1.34-3 3-3zm0 14.2c-2.5 0-4.71-1.28-6-3.22.03-1.99 4-3.08 6-3.08 1.99 0 5.97 1.09 6 3.08-1.29 1.94-3.5 3.22-6 3.22z');
   svg.append(path);
   return svg;
+}
+
+function zoomPic(id) {
+  const old = document.getElementById('zoom');
+  if (old) old.remove();
+  const shade = document.createElement('button');
+  shade.type = 'button';
+  shade.id = 'zoom';
+  shade.className = 'pic';
+  shade.setAttribute('aria-label', '關閉圖片');
+  const img = document.createElement('img');
+  img.alt = '';
+  img.onclick = (e) => e.stopPropagation();
+  showPic(id, img);
+  shade.append(img);
+  shade.onclick = () => shade.remove();
+  document.body.append(shade);
 }
 
 function zoomFace(avatar) {
@@ -3311,7 +3464,7 @@ function sendImage(s, file) {
     method: 'POST',
     headers: { 'Content-Type': ready.type || 'image/jpeg' },
     body: ready
-  })).catch(err => alert(err.message || '圖片送出失敗')).finally(() => {
+  })).catch(err => toast(err.message || '圖片送出失敗')).finally(() => {
     sending = false;
     document.querySelectorAll('form button').forEach(btn => { btn.disabled = !canSend(s); });
   });
@@ -3355,6 +3508,7 @@ async function tick() {
     if (nextCurrent && nextCurrent.waiting) current = '';
     const openLive = menu === 'chats' && current && !showControls && !archiveUid;
     if (!openLive) {
+      hideJump();
       const leftOpen = menu === 'chats' && !showControls && !archiveUid && prevCurrent && !current;
       if (leftOpen || (!app.childNodes.length && menu === 'chats')) paint();
       else refreshList();
@@ -3381,7 +3535,13 @@ async function tick() {
     }
     if (quiet) refreshList();
     else paint();
-    if (otherPing) glowInput();
+    paintTyping(!!(nextCurrent && nextCurrent.typing));
+    if (otherPing) {
+      glowInput();
+      showJump(otherPing);
+    }
+    const composer = document.querySelector('form input:not([type=file])');
+    if (!composer || composer.dataset.kind === 'greeting') hideJump();
   } catch (e) {
     if (!token) paint();
   } finally {
