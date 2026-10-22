@@ -113,9 +113,17 @@ function archiveMessage(m) {
     const text = String(m && m.text || '').slice(0, 500);
     const quote = String(m && m.quote || '').slice(0, 200);
     const image = /^[a-z0-9]{8,40}$/.test(m && m.image) ? m.image : '';
+    const end = m && (m.end === 'idle' || m.end === 'them' || m.end === 'mine') ? m.end : '';
     const time = withYear(m && m.time);
-    if (!id || !(text || quote || image)) return null;
-    return { id, text, quote, image, mine: !!(m && m.mine), time };
+    if (!id || !(text || quote || image || end)) return null;
+    const row = { id, text, quote, image, mine: !!(m && m.mine), time };
+    if (end) row.end = end;
+    return row;
+}
+
+function taipeiClock(now) {
+    const d = new Date((Number(now) || Date.now()) + 8 * 60 * 60 * 1000);
+    return d.getUTCFullYear() + '/' + pad2(d.getUTCMonth() + 1) + '/' + pad2(d.getUTCDate()) + ' ' + pad2(d.getUTCHours()) + ':' + pad2(d.getUTCMinutes());
 }
 
 // 同一人的訊息全部保留。人超過 300 個時，刪掉最久沒更新的。
@@ -137,6 +145,7 @@ function rememberTalk(talks, body, now) {
     let changed = !prev || prev.title !== title || (avatar && avatar !== (prev.avatar || ''));
     for (const m of incoming) {
         const old = map.get(m.id);
+        if (m.end && !m.time && !(old && old.time)) m.time = taipeiClock(now);
         if (old && m.text === '已收回一則訊息' && !m.image) {
             if (old.image) {
                 m.text = old.text || '';
@@ -882,6 +891,13 @@ function selfCheck() {
     if (!typingOn.typing || !shownOn || !shownOn.typing || typingOff.typing || !shownOff || shownOff.typing) {
         throw new Error('knock relay 檢查失敗');
     }
+    const endTalks = new Map();
+    const endBody = { archive: { uid: 'user_endnote1', title: '甲', messages: [{ id: 'end-c1', text: '閒置時間過久', end: 'idle' }] } };
+    const endAt = Date.parse('2020-01-02T00:00:00Z');
+    if (!rememberTalk(endTalks, endBody, endAt)) throw new Error('knock relay 檢查失敗');
+    const endMsg = endTalks.get('user_endnote1').messages[0];
+    if (!endMsg || endMsg.end !== 'idle' || endMsg.text !== '閒置時間過久' || endMsg.time !== '2020/01/02 08:00') throw new Error('knock relay 檢查失敗');
+    if (rememberTalk(endTalks, endBody, endAt + 3600000) || endTalks.get('user_endnote1').messages.length !== 1) throw new Error('knock relay 檢查失敗');
     notePageActive('1', 1000);
     if (!pageOn(5000) || pageOn(9000)) throw new Error('knock relay 檢查失敗');
     notePageActive('0', 5000);
@@ -1547,6 +1563,10 @@ const PAGE = `<!DOCTYPE html>
   .people-pane .find-row { display:flex; align-items:center; gap:8px; }
   .people-pane .find-row select { flex:1; }
   .people-pane .find-row span { flex:none; color:#888; font-size:13px; }
+  .people-pane .pager { flex:none; display:flex; align-items:center; justify-content:center; gap:12px; padding:8px 12px; border-bottom:1px solid #333; background:#141414; }
+  .people-pane .pager button { padding:6px 12px; border:1px solid #444; border-radius:8px; background:#1c1c1c; color:#eee; cursor:pointer; }
+  .people-pane .pager button:disabled { opacity:0.4; }
+  .people-pane .pager span { color:#aaa; font-size:13px; }
   .people-pane .sheet { flex:1; min-height:0; overflow:auto; }
   .people-pane table { width:100%; min-width:720px; border-collapse:collapse; }
   .people-pane th, .people-pane td { text-align:left; padding:8px 10px; border-bottom:1px solid #2a2a2a; vertical-align:middle; }
@@ -1561,6 +1581,7 @@ const PAGE = `<!DOCTYPE html>
   .face-pane tr { cursor:default; }
   .gate { display:flex; flex-direction:column; gap:8px; }
   .muted { color:#888; }
+  .end-note { margin:14px 0; color:#888; font-size:13px; text-align:center; }
   .who { display:flex; gap:10px; align-items:center; }
   .face { width:40px; height:40px; border-radius:50%; object-fit:cover; background:#333; flex:none; }
   svg.face { display:block; fill:#9a9a9a; }
@@ -1632,6 +1653,8 @@ let peopleFindFocus = false;
 let peopleFindAt = 0;
 let peopleScroll = 0;
 let peopleScrollX = 0;
+let peoplePage = 0;
+const PEOPLE_PAGE = 50;
 let faceScroll = 0;
 let userOpen = false;
 let archiveMissing = '';
@@ -2241,6 +2264,33 @@ function peopleRank(list) {
   return rows;
 }
 
+function peopleWindow(rows) {
+  const pages = Math.max(1, Math.ceil(rows.length / PEOPLE_PAGE));
+  if (peoplePage > pages - 1) peoplePage = pages - 1;
+  if (peoplePage < 0) peoplePage = 0;
+  const start = peoplePage * PEOPLE_PAGE;
+  return { rows: rows.slice(start, start + PEOPLE_PAGE), page: peoplePage, pages: pages, total: rows.length };
+}
+
+function peoplePager(view) {
+  const bar = document.createElement('div');
+  bar.className = 'pager';
+  const prev = document.createElement('button');
+  prev.type = 'button';
+  prev.textContent = '上一頁';
+  prev.disabled = view.page <= 0;
+  prev.onclick = () => { peoplePage = view.page - 1; peopleScroll = 0; paint(); };
+  const label = document.createElement('span');
+  label.textContent = (view.page + 1) + ' / ' + view.pages;
+  const next = document.createElement('button');
+  next.type = 'button';
+  next.textContent = '下一頁';
+  next.disabled = view.page + 1 >= view.pages;
+  next.onclick = () => { peoplePage = view.page + 1; peopleScroll = 0; paint(); };
+  bar.append(prev, label, next);
+  return bar;
+}
+
 function peopleFind(picked) {
   const box = document.createElement('div');
   box.className = 'find';
@@ -2255,12 +2305,16 @@ function peopleFind(picked) {
   input.addEventListener('compositionend', () => {
     delete input.dataset.composing;
     peopleQuery = input.value;
+    peoplePage = 0;
+    peopleScroll = 0;
     paint();
   });
   input.oninput = () => {
     peopleQuery = input.value;
     peopleFindFocus = true;
     if (input.dataset.composing) return;
+    peoplePage = 0;
+    peopleScroll = 0;
     paint();
   };
   input.onfocus = () => { peopleFindFocus = true; };
@@ -2277,7 +2331,7 @@ function peopleFind(picked) {
     if (peopleSort === pair[0]) opt.selected = true;
     sort.append(opt);
   });
-  sort.onchange = () => { peopleSort = sort.value; paint(); };
+  sort.onchange = () => { peopleSort = sort.value; peoplePage = 0; peopleScroll = 0; paint(); };
   const filt = document.createElement('select');
   [['all', '全部'], ['on', '已過濾'], ['off', '未過濾']].forEach(pair => {
     const opt = document.createElement('option');
@@ -2286,7 +2340,7 @@ function peopleFind(picked) {
     if (peopleFilter === pair[0]) opt.selected = true;
     filt.append(opt);
   });
-  filt.onchange = () => { peopleFilter = filt.value; paint(); };
+  filt.onchange = () => { peopleFilter = filt.value; peoplePage = 0; peopleScroll = 0; paint(); };
   row.append(count, sort, filt);
   box.append(title, input, row);
   return box;
@@ -2441,24 +2495,30 @@ function paintPeople() {
   const keep = document.getElementById('people-find');
   if (peopleFindFocus && keep && document.activeElement === keep) {
     peopleQuery = keep.value;
-    const picked = peopleRank(people);
+    const ranked = peopleRank(people);
+    const view = peopleWindow(ranked);
     const pane = keep.closest('.people-pane');
-    const next = peopleTable(picked);
+    const next = peopleTable(view.rows);
     if (prev && prev.parentNode) prev.replaceWith(next);
     else if (pane) pane.append(next);
     const count = pane && pane.querySelector('.find-row span');
-    if (count) count.textContent = picked.length + ' 人';
+    if (count) count.textContent = view.total + ' 人';
+    const oldPager = pane && pane.querySelector('.pager');
+    const pager = peoplePager(view);
+    if (oldPager) oldPager.replaceWith(pager);
+    else if (next.parentNode) next.before(pager);
     next.scrollTop = peopleScroll;
     next.scrollLeft = peopleScrollX;
     return;
   }
   clearForm();
   paintBar('使用者管理');
-  const picked = peopleRank(people);
+  const ranked = peopleRank(people);
+  const view = peopleWindow(ranked);
   app.replaceChildren();
   const pane = document.createElement('div');
   pane.className = 'people-pane';
-  pane.append(peopleFind(picked), peopleTable(picked));
+  pane.append(peopleFind(ranked), peoplePager(view), peopleTable(view.rows));
   app.append(pane);
   const sheet = pane.querySelector('.sheet');
   if (sheet) {
@@ -2896,6 +2956,13 @@ function shownOpenings(s) {
 }
 
 function paintBubble(m) {
+  if (m && m.end) {
+    const note = document.createElement('p');
+    note.className = 'end-note';
+    note.textContent = m.text || (m.end === 'idle' ? '閒置時間過久' : m.end === 'them' ? '對方離開' : '我主動離開');
+    app.append(note);
+    return note;
+  }
   const wrap = document.createElement('div');
   wrap.className = 'bubble ' + (m.mine ? 'mine' : 'them');
   const row = document.createElement('div');

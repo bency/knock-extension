@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.112
+// @version      1.4.113
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -53,7 +53,7 @@
     const RELAY_TOKEN_KEY = 'knockRelayToken';
     const RELAY_TAB_KEY = 'knockRelayTabId';
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.112';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.113';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -1185,7 +1185,27 @@
         return button.textContent.includes('開始聊天');
     }
 
+    function chatEndPlan(idle, them, mine, prev) {
+        if (prev === 'idle' || idle) return 'idle';
+        if (prev === 'them' || prev === 'mine') return prev;
+        if (them) return 'them';
+        if (mine) return 'mine';
+        return '';
+    }
+
+    function noteChatEnd() {
+        const list = document.querySelector('ul[data-test="messages"]');
+        const idle = !!(list && list.textContent.indexOf('對話已閒置過久') >= 0);
+        const them = findButtons().some(isRematchButton);
+        const dialog = document.querySelector('[role="dialog"]');
+        const mine = !!(pendingRemoteLeave || pendingForcedLeave || (dialog && dialog.textContent.indexOf('離開聊天') >= 0));
+        const kind = chatEndPlan(idle, them, mine, currentConversation.endKind || '');
+        if (kind) currentConversation.endKind = kind;
+        return kind;
+    }
+
     function checkConversationEnd() {
+        noteChatEnd();
         if (currentConversation.ended) return;
         const conversationEnded = findButtons().some(b => isRematchButton(b) || isConfirmExitButton(b));
         if (!conversationEnded || currentConversation.messages.length === 0) return;
@@ -2652,22 +2672,34 @@
     }
 
     // 只送目前這場。舊的本地紀錄已同步過，不再每輪重讀。
+    function endArchiveRow(uid) {
+        const kind = noteChatEnd();
+        if (!kind || !uid) return null;
+        const channel = String(currentConversation.id || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 50);
+        if (!channel) return null;
+        const text = kind === 'idle' ? '閒置時間過久' : kind === 'them' ? '對方離開' : '我主動離開';
+        return { id: 'end-' + channel, text, quote: '', image: '', mine: false, end: kind, time: '' };
+    }
+
     function relayArchive() {
         notePartnerFromList();
         const uid = archiveUidOf(currentConversation);
         if (!uid) return null;
         const title = currentPartnerName() || '未命名';
         const next = nextArchive(archiveSources(currentConversation, title), relayArchived);
-        if (!next) return { uid, title, named: nameSet, messages: [] };
         const messages = [];
         const skip = [];
-        for (const m of next.messages) {
-            const row = relayArchiveRow(m);
-            if (row) messages.push(row);
-            else skip.push(m);
+        if (next) {
+            for (const m of next.messages) {
+                const row = relayArchiveRow(m);
+                if (row) messages.push(row);
+                else skip.push(m);
+            }
+            if (skip.length) rememberArchived(next.uid, skip);
         }
-        if (skip.length) rememberArchived(next.uid, skip);
-        return { uid: next.uid, title: next.title, named: nameSet, messages };
+        const note = endArchiveRow(uid);
+        if (note && !relayArchived.has(uid + ':' + note.id)) messages.push(note);
+        return { uid: (next && next.uid) || uid, title: (next && next.title) || title, named: nameSet, messages };
     }
 
     const relayHanded = new Set();
@@ -3629,7 +3661,12 @@
             || lockPlan('u1', '', 5000) !== 'leave'
             || !filterSkipsLock('u1', 'u1')
             || filterSkipsLock('u1', 'u2')
-            || filterSkipsLock('', 'u1')) {
+            || filterSkipsLock('', 'u1')
+            || chatEndPlan(true, true, true, '') !== 'idle'
+            || chatEndPlan(false, true, true, '') !== 'them'
+            || chatEndPlan(false, false, true, '') !== 'mine'
+            || chatEndPlan(true, false, false, 'them') !== 'idle'
+            || chatEndPlan(false, true, false, 'mine') !== 'mine') {
             console.error('knock: 鎖定使用者判斷失敗');
         }
     }
