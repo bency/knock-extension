@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.113
+// @version      1.4.114
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -53,7 +53,7 @@
     const RELAY_TOKEN_KEY = 'knockRelayToken';
     const RELAY_TAB_KEY = 'knockRelayTabId';
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.113';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.114';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -140,6 +140,7 @@
     let keepMax = 2.5;
     let lockSince = 0;
     let knownPeople = [];
+    let peopleRev = 0;
     let lockMenuSig = '';
     let keepAliveWaitMs = 0;
     let lastKeepAliveTryAt = 0;
@@ -2589,6 +2590,7 @@
             controls: relayControls(),
             script: SCRIPT_VERSION,
             typing: partnerTyping(),
+            peopleRev: peopleRev,
             archive: relayArchive()
         };
         if (!list) return base;
@@ -3214,6 +3216,7 @@
             remoteLeaveChat();
             if (data.filters) applyServerFilters(data.filters);
             if (Array.isArray(data.people)) noteKnownPeople(data.people);
+            if (typeof data.peopleRev === 'number' && data.peopleRev > 0) peopleRev = data.peopleRev;
             if (data.controls) applyRelayControls(data.controls);
             if (typeof data.pageOn === 'boolean') remotePageOn = data.pageOn;
             if (typeof data.notify === 'string' && data.notify) sendNtfy(data.notify);

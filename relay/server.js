@@ -207,7 +207,7 @@ function talkLastAt(messages) {
 
 function visibleTalks(talks) {
     return [...talks.values()]
-        .map(t => ({ uid: t.uid, title: t.title, avatar: t.avatar || '', updated: t.updated, lastAt: talkLastAt(t.messages) || t.lastAt || t.updated || 0, count: t.messages.length }))
+        .map(t => ({ uid: t.uid, title: t.title, avatar: t.avatar || '', updated: t.updated, lastAt: t.lastAt || t.updated || 0, count: (t.messages && t.messages.length) || 0 }))
         .sort((a, b) => b.lastAt - a.lastAt || b.updated - a.updated || (a.uid < b.uid ? -1 : 1));
 }
 
@@ -270,6 +270,7 @@ function saveTalks(talks) {
 
 // 對話刪掉也留這個人。ponytail: 一人一筆、不含訊息，檔案變大再拆。
 let people = new Map();
+let peopleRev = Date.now();
 
 function earliestAt(messages) {
     let at = 0;
@@ -340,7 +341,16 @@ function notePerson(box, spec, now) {
         filterMeet: stats.filterMeet,
         talkSeeded: stats.talkSeeded
     });
+    if (!prev || (prev.title || '未命名') !== title) peopleRev += 1;
     return true;
+}
+
+function heartPeople(box, seen) {
+    const rev = peopleRev;
+    const out = { peopleRev: rev };
+    if (typeof seen === 'number' && seen === rev) return out;
+    out.people = visiblePeople(box).map(p => ({ uid: p.uid, title: p.title || '未命名' }));
+    return out;
 }
 
 function faceRows(list) {
@@ -898,6 +908,19 @@ function selfCheck() {
     const endMsg = endTalks.get('user_endnote1').messages[0];
     if (!endMsg || endMsg.end !== 'idle' || endMsg.text !== '閒置時間過久' || endMsg.time !== '2020/01/02 08:00') throw new Error('knock relay 檢查失敗');
     if (rememberTalk(endTalks, endBody, endAt + 3600000) || endTalks.get('user_endnote1').messages.length !== 1) throw new Error('knock relay 檢查失敗');
+    const revBox = new Map();
+    const revBefore = peopleRev;
+    if (!notePerson(revBox, { uid: 'user_revA', title: '甲', messages: [] }, 1) || peopleRev === revBefore) throw new Error('knock relay 檢查失敗');
+    const listed = heartPeople(revBox, 0);
+    if (!listed.people || listed.people[0].uid !== 'user_revA' || listed.people[0].title !== '甲' || listed.peopleRev !== peopleRev) throw new Error('knock relay 檢查失敗');
+    const quietList = heartPeople(revBox, listed.peopleRev);
+    if (quietList.people || quietList.peopleRev !== listed.peopleRev) throw new Error('knock relay 檢查失敗');
+    const revHeld = peopleRev;
+    notePerson(revBox, { uid: 'user_revA', title: '甲', messages: [{ time: '2020/01/02 08:00' }] }, 2);
+    if (peopleRev !== revHeld) throw new Error('knock relay 檢查失敗');
+    notePerson(revBox, { uid: 'user_revA', title: '乙', named: true, messages: [] }, 3);
+    const renamed = heartPeople(revBox, quietList.peopleRev);
+    if (!renamed.people || renamed.people[0].title !== '乙' || renamed.peopleRev === quietList.peopleRev) throw new Error('knock relay 檢查失敗');
     notePageActive('1', 1000);
     if (!pageOn(5000) || pageOn(9000)) throw new Error('knock relay 檢查失敗');
     notePageActive('0', 5000);
@@ -3548,6 +3571,7 @@ async function tick() {
     const ask = [];
     if (pollWait) ask.push('wait=1');
     ask.push(document.hidden ? 'active=0' : 'active=1');
+    if (menu === 'users' || menu === 'faces') ask.push('people=1');
     const data = await api('/api/sessions?' + ask.join('&'));
     sessions = data.sessions || [];
     const otherPing = noteRooms(sessions);
@@ -3556,7 +3580,7 @@ async function tick() {
       if (!freshTalks.some(t => t.uid === uid)) droppedTalks.delete(uid);
     }
     talks = freshTalks.filter(t => !droppedTalks.has(t.uid));
-    people = data.people || [];
+    if (Array.isArray(data.people)) people = data.people;
     if (controlDraft) {
       const hit = sessions.find(s => s.tabId === controlDraft.tabId);
       if (hit && hit.controls && JSON.stringify(packControls(hit.controls)) === JSON.stringify(controlDraft.controls)) controlDraft = null;
@@ -3577,7 +3601,8 @@ async function tick() {
     if (!openLive) {
       hideJump();
       const leftOpen = menu === 'chats' && !showControls && !archiveUid && prevCurrent && !current;
-      if (leftOpen || (!app.childNodes.length && menu === 'chats')) paint();
+      const showPeople = (menu === 'users' || menu === 'faces') && Array.isArray(data.people) && !(userOpen && archiveUid);
+      if (showPeople || leftOpen || (!app.childNodes.length && menu === 'chats')) paint();
       else refreshList();
       return;
     }
@@ -3680,7 +3705,9 @@ function main() {
                     await waitUntil(POLL_MS, req, () => revision !== seen);
                 }
                 if (clientGone(req, res)) return;
-                return send(res, 200, { sessions: visibleSessions(sessions, Date.now(), WAIT_MS), talks: visibleTalks(talks), people: visiblePeople(people) });
+                const view = { sessions: visibleSessions(sessions, Date.now(), WAIT_MS), talks: visibleTalks(talks) };
+                if (url.searchParams.get('people') === '1') view.people = visiblePeople(people);
+                return send(res, 200, view);
             }
             const talkMatch = url.pathname.match(/^\/api\/talks\/([A-Za-z0-9_-]{6,128})$/);
             if (req.method === 'GET' && talkMatch) {
@@ -3742,7 +3769,10 @@ function main() {
                 if (outbox.dirty || patch.dirty || avatarPatch.dirty || userPatch.dirty || greetingPatch.dirty || startPatch.dirty || leavePatch.dirty || reloadPatch.dirty || notifyPatch.dirty) saveSessions(sessions);
                 const talkUid = cleanUid(body && body.archive && body.archive.uid);
                 const savedTalk = talkUid ? talks.get(talkUid) : null;
-                return send(res, 200, { ok: true, outbox: outbox.pending, controls: patch.controls, avatarOn: avatarPatch.avatarOn, userOn: userPatch.userOn, greeting: greetingPatch.greeting, start: startPatch.start, leave: leavePatch.leave, reload: reloadPatch.reload, notify: notifyPatch.notify, pageOn: pageOn(Date.now()), filters, people: visiblePeople(people).map(p => ({ uid: p.uid, title: p.title || '未命名' })), talkTitle: savedTalk ? savedTalk.title : '', rename: session.titleWanted || '' });
+                const listed = heartPeople(people, body && body.peopleRev);
+                const reply = { ok: true, outbox: outbox.pending, controls: patch.controls, avatarOn: avatarPatch.avatarOn, userOn: userPatch.userOn, greeting: greetingPatch.greeting, start: startPatch.start, leave: leavePatch.leave, reload: reloadPatch.reload, notify: notifyPatch.notify, pageOn: pageOn(Date.now()), filters, peopleRev: listed.peopleRev, talkTitle: savedTalk ? savedTalk.title : '', rename: session.titleWanted || '' };
+                if (listed.people) reply.people = listed.people;
+                return send(res, 200, reply);
             }
             const imgMatch = url.pathname.match(/^\/api\/images\/([a-z0-9]{8,40})$/);
             if (imgMatch && req.method === 'GET') {
