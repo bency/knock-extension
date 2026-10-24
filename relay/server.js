@@ -726,20 +726,30 @@ function cleanControls(raw) {
         keep: !!raw.keep,
         keepText: String(raw.keepText || '').trim().slice(0, 200) || '🎶',
         keepMin,
-        keepMax
+        keepMax,
+        opener: !!raw.opener,
+        openerText: String(raw.openerText || '').trim().slice(0, 200),
+        openerWhen: raw.openerWhen === 'id' ? 'id' : 'now'
     };
 }
 
 function keepControls(next, raw, prev) {
     if (!next) return (prev && prev.controls) || null;
     const old = prev && prev.controls;
-    if (!old || (raw && Object.prototype.hasOwnProperty.call(raw, 'keep'))) return next;
-    return Object.assign({}, next, {
-        keep: !!old.keep,
-        keepText: String(old.keepText || '').trim().slice(0, 200) || '🎶',
-        keepMin: old.keepMin,
-        keepMax: old.keepMax
-    });
+    if (!old) return next;
+    const kept = Object.assign({}, next);
+    if (!(raw && Object.prototype.hasOwnProperty.call(raw, 'keep'))) {
+        kept.keep = !!old.keep;
+        kept.keepText = String(old.keepText || '').trim().slice(0, 200) || '🎶';
+        kept.keepMin = old.keepMin;
+        kept.keepMax = old.keepMax;
+    }
+    if (!(raw && Object.prototype.hasOwnProperty.call(raw, 'openerWhen'))) {
+        kept.opener = !!old.opener;
+        kept.openerText = String(old.openerText || '').trim().slice(0, 200);
+        kept.openerWhen = old.openerWhen === 'id' ? 'id' : 'now';
+    }
+    return kept;
 }
 
 function sameControls(a, b) {
@@ -956,7 +966,17 @@ function selfCheck() {
     }
     const keptAlive = keepControls(cleanControls({ auto: 1, phoneTopic: 'knock-room' }), { auto: 1, phoneTopic: 'knock-room' }, { controls: wanted });
     if (!keptAlive || !keptAlive.keep || keptAlive.keepText !== '在嗎' || keptAlive.keepMin !== 1 || keptAlive.keepMax !== 2
-        || cleanControls({ keepText: '  ' }).keepText !== '🎶') {
+        || cleanControls({ keepText: '  ' }).keepText !== '🎶'
+        || cleanControls({ openerWhen: 'id', openerText: ' 早 ' }).openerWhen !== 'id'
+        || cleanControls({ openerText: ' 早 ' }).openerText !== '早'
+        || cleanControls({ openerWhen: 'later' }).openerWhen !== 'now') {
+        throw new Error('knock relay 檢查失敗');
+    }
+    const prevOpener = cleanControls({ opener: 1, openerText: '早', openerWhen: 'id', keep: 1, keepText: '在嗎', keepMin: 1, keepMax: 2, phoneTopic: 'ok' });
+    const keptOpener = keepControls(cleanControls({ auto: 1, phoneTopic: 'ok' }), { auto: 1, phoneTopic: 'ok' }, { controls: prevOpener });
+    const replacedOpener = keepControls(cleanControls({ opener: 0, openerText: '', openerWhen: 'now', phoneTopic: 'ok' }), { openerWhen: 'now', phoneTopic: 'ok' }, { controls: prevOpener });
+    if (!keptOpener || !keptOpener.opener || keptOpener.openerText !== '早' || keptOpener.openerWhen !== 'id'
+        || !keptOpener.keep || replacedOpener.opener || replacedOpener.openerWhen !== 'now' || replacedOpener.openerText) {
         throw new Error('knock relay 檢查失敗');
     }
     const firstOpen = applyHeartbeat(sessions, {
@@ -1489,9 +1509,8 @@ const PAGE = `<!DOCTYPE html>
   #nav button { position:relative; flex:none; box-sizing:border-box; height:var(--menu-item); display:flex; align-items:center; justify-content:center; border:none; border-bottom:1px solid #333; background:transparent; color:#888; font-size:16px; font-weight:700; line-height:1.35; cursor:pointer; padding:0 12px; }
   #nav button.on { color:#eee; background:#1c1c1c; box-shadow:inset 4px 0 #4CAF50; }
   #nav .dot { top:8px; right:12px; }
-  #rail { width:220px; flex:none; overflow:auto; border-right:1px solid #333; background:#111; }
+  #rail { width:220px; flex:none; overflow:auto; border-right:1px solid #333; background:#111; padding-top:8px; }
   body.users #rail, body.faces #rail { display:none; }
-  #rail .fold { display:flex; align-items:center; gap:6px; width:100%; margin:0; padding:10px 12px; border:none; background:transparent; color:#888; font-size:12px; font-weight:600; cursor:pointer; text-align:left; }
   #rail .card { width:calc(100% - 16px); box-sizing:border-box; margin:0 8px 4px; padding:4px 8px; }
   #rail .muted { margin:0 12px 8px; font-size:13px; }
   #rail .card.on { background:#1e3326; border-color:#2d5a3d; }
@@ -1510,7 +1529,7 @@ const PAGE = `<!DOCTYPE html>
   @media (max-width:760px) {
     #nav, #rail { position:fixed; left:0; width:min(280px, 86vw); transform:translateX(-110%); transition:transform .18s ease; }
     #nav { z-index:21; top:0; height:auto; }
-    #rail { z-index:20; top:calc(var(--menu-item) * 3); bottom:0; }
+    #rail { z-index:20; top:calc(var(--menu-item) * 4); bottom:0; }
     body.rail-open #nav, body.rail-open #rail { transform:none; }
     body.rail-open #shade { display:block; }
     .topbar .rail-btn { display:flex; }
@@ -1539,12 +1558,10 @@ const PAGE = `<!DOCTYPE html>
   #rail .card.has-face .face { width:100%; height:100%; }
   #rail .card.has-face .card-body { flex:1; min-width:0; }
   #rail .card small { margin-top:2px; }
-  #rail .fold { position:relative; }
   .rail-btn { position:relative; }
   .dot { position:absolute; width:8px; height:8px; border-radius:50%; background:#e53935; }
   .rail-btn .dot { top:8px; right:8px; }
   #rail .card .dot { top:6px; right:8px; }
-  #rail .fold .dot { top:50%; right:12px; margin-top:-4px; }
   .card small { display:block; color:#aaa; margin-top:4px; }
   .card small.preview { display:flex; gap:8px; align-items:baseline; color:#ffb74d; }
   .card small.preview .preview-text { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -1628,6 +1645,7 @@ const PAGE = `<!DOCTYPE html>
   .extra { display:flex; flex-direction:column; gap:8px; margin:-2px 0 8px; }
   .extra input { width:100%; box-sizing:border-box; padding:8px 10px; border:1px solid #444; border-radius:8px; background:#1a1a1a; color:#eee; }
   .extra button { padding:8px 12px; border:none; border-radius:8px; background:#2d4a6d; color:#eee; cursor:pointer; }
+  .extra button.on { background:#4CAF50; }
   .hours { display:flex; align-items:center; gap:6px; color:#aaa; }
   .hours input { width:72px; }
   .sw { width:40px; height:22px; border:none; padding:0; border-radius:11px; background:#555; position:relative; flex:none; cursor:pointer; }
@@ -1704,10 +1722,10 @@ let stickBottom = false;
 let showControls = false;
 let phoneOpen = false;
 let keepOpen = false;
+let openerOpen = false;
 let controlDraft = null;
 let avatarDraft = null;
 let userDraft = null;
-const railFold = { live: false, talks: true };
 const seenTail = {};
 
 function api(path, opts) {
@@ -1783,7 +1801,6 @@ function deleteTalk(uid) {
     archiveUid = older.uid;
     archiveTalk = null;
     archiveUpdated = 0;
-    railFold.talks = false;
     stickBottom = true;
     paint();
     loadArchive(older.uid);
@@ -1952,6 +1969,7 @@ function showJump(tabId) {
       showControls = false;
       archiveUid = '';
       archiveTalk = null;
+      if (current !== s.tabId) dropPending(current);
       current = s.tabId;
       delete roomUnread[s.tabId];
       stickBottom = true;
@@ -2026,21 +2044,6 @@ function trashIcon() {
   return svg;
 }
 
-function railSection(key, title, fill, alert) {
-  const head = document.createElement('button');
-  head.type = 'button';
-  head.className = 'fold';
-  const mark = document.createElement('span');
-  mark.textContent = railFold[key] ? '▸' : '▾';
-  const label = document.createElement('span');
-  label.textContent = title;
-  head.append(mark, label);
-  if (alert && railFold[key]) head.append(redDot());
-  head.onclick = () => { railFold[key] = !railFold[key]; paint(); };
-  rail.append(head);
-  if (!railFold[key]) fill();
-}
-
 function railEmpty(text) {
   const p = document.createElement('p');
   p.className = 'muted';
@@ -2097,6 +2100,7 @@ function liveCard(s) {
     showControls = false;
     archiveUid = '';
     archiveTalk = null;
+    if (current !== s.tabId) dropPending(current);
     current = s.tabId;
     delete roomUnread[s.tabId];
     stickBottom = true;
@@ -2133,6 +2137,7 @@ function talkCard(t) {
     archiveUid = t.uid;
     archiveTalk = null;
     archiveUpdated = 0;
+    dropPending(current);
     current = '';
     stickBottom = true;
     closeRail();
@@ -2165,10 +2170,14 @@ function menuBtn(key, label) {
   if (key === 'chats' && unreadLeft()) btn.append(redDot());
   btn.onclick = () => {
     if (menu === key) return;
+    if (menu === 'chats' && key !== 'chats') dropPending(current);
     menu = key;
-    if (key === 'users' || key === 'faces') {
-      showControls = false;
-      userOpen = false;
+    showControls = false;
+    userOpen = false;
+    if (key === 'chats') {
+      archiveUid = '';
+      archiveTalk = null;
+      archiveMissing = '';
     }
     closeRail();
     paint();
@@ -2256,6 +2265,7 @@ function openPerson(p) {
   const prev = document.querySelector('.people-pane .sheet');
   if (prev) peopleScroll = prev.scrollTop;
   showControls = false;
+  dropPending(current);
   current = '';
   userOpen = true;
   archiveUid = p.uid;
@@ -2557,21 +2567,20 @@ function paintPeople() {
 }
 
 function paintNav() {
-  nav.replaceChildren(menuBtn('chats', '對話'), menuBtn('users', '使用者管理'), menuBtn('faces', '大頭貼過濾'));
+  nav.replaceChildren(menuBtn('chats', '對話'), menuBtn('talks', '記錄'), menuBtn('users', '使用者管理'), menuBtn('faces', '大頭貼過濾'));
 }
 
 function paintRail() {
   const top = rail.scrollTop;
   rail.replaceChildren();
-  const live = sessions.filter(s => !s.waiting).sort(byRecent);
-  railSection('live', '連線中', () => {
-    if (!live.length) rail.append(railEmpty('沒有正在回報的對話'));
-    else live.forEach(s => rail.append(liveCard(s)));
-  }, live.some(s => roomUnread[s.tabId]));
-  railSection('talks', '記錄', () => {
+  if (menu === 'talks') {
     if (!talks.length) rail.append(railEmpty('還沒有對話記錄'));
     else talks.forEach(t => rail.append(talkCard(t)));
-  });
+  } else {
+    const live = sessions.filter(s => !s.waiting).sort(byRecent);
+    if (!live.length) rail.append(railEmpty('沒有正在回報的對話'));
+    else live.forEach(s => rail.append(liveCard(s)));
+  }
   rail.scrollTop = top;
 }
 
@@ -2790,7 +2799,10 @@ function packControls(c) {
     keep: !!c.keep,
     keepText: String(c.keepText || '').trim().slice(0, 200) || '🎶',
     keepMin: min,
-    keepMax: max
+    keepMax: max,
+    opener: !!c.opener,
+    openerText: String(c.openerText || '').trim().slice(0, 200),
+    openerWhen: c.openerWhen === 'id' ? 'id' : 'now'
   };
 }
 
@@ -2900,6 +2912,30 @@ function paintControls() {
     unit.textContent = '小時';
     hours.append(minInp, tilde, maxInp, unit);
     extra.append(sentence, hours);
+    app.append(extra);
+  }
+  const openerRow = controlRow('發語詞', c.opener, () => flip('opener'));
+  openerRow.onclick = () => { openerOpen = !openerOpen; paint(); };
+  app.append(openerRow);
+  if (openerOpen) {
+    const extra = document.createElement('div');
+    extra.className = 'extra';
+    const sentence = fieldInput(c.openerText, '連線後送出這句');
+    sentence.onchange = () => postControls(Object.assign({}, c, { openerText: sentence.value }));
+    const modes = document.createElement('div');
+    modes.className = 'hours';
+    const nowBtn = document.createElement('button');
+    nowBtn.type = 'button';
+    nowBtn.textContent = '連線成功就送';
+    if (c.openerWhen !== 'id') nowBtn.className = 'on';
+    nowBtn.onclick = () => postControls(Object.assign({}, c, { openerWhen: 'now' }));
+    const idBtn = document.createElement('button');
+    idBtn.type = 'button';
+    idBtn.textContent = '確認對方後再送';
+    if (c.openerWhen === 'id') idBtn.className = 'on';
+    idBtn.onclick = () => postControls(Object.assign({}, c, { openerWhen: 'id' }));
+    modes.append(nowBtn, idBtn);
+    extra.append(sentence, modes);
     app.append(extra);
   }
   app.append(userRow, avatarRow, browserRow, phoneRow);
@@ -3024,6 +3060,10 @@ function paintBubble(m) {
 
 function replayPending(tabId) {
   (pendingMine[tabId] || []).forEach(text => paintBubble({ text: text, mine: true, pending: true }));
+}
+
+function dropPending(tabId) {
+  if (tabId) delete pendingMine[tabId];
 }
 
 function showLocalMine(tabId, text) {
@@ -3295,6 +3335,24 @@ function paint() {
       const userFollow = stickBottom || nearBottom();
       paintUser(archiveTalk, userFollow, userY);
     } else paintPeople();
+    return;
+  }
+  if (menu === 'talks') {
+    hideJump();
+    paintRail();
+    if (archiveUid) {
+      const y = app.scrollTop;
+      const follow = stickBottom || nearBottom();
+      paintArchive(archiveTalk, follow, y);
+      return;
+    }
+    clearForm();
+    paintBar('記錄');
+    app.replaceChildren();
+    const p = document.createElement('p');
+    p.className = 'muted';
+    p.textContent = '選一筆記錄';
+    app.append(p);
     return;
   }
   paintRail();
@@ -3596,7 +3654,10 @@ async function tick() {
       else if (hit.openings && !!hit.openings.userOn === userDraft.on) userDraft = null;
     }
     const nextCurrent = sessions.find(s => s.tabId === current);
-    if (nextCurrent && nextCurrent.waiting) current = '';
+    if (nextCurrent && nextCurrent.waiting) {
+      dropPending(current);
+      current = '';
+    }
     const openLive = menu === 'chats' && current && !showControls && !archiveUid;
     if (!openLive) {
       hideJump();
