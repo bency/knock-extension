@@ -732,7 +732,10 @@ function cleanControls(raw) {
         keep: !!raw.keep,
         keepText: String(raw.keepText || '').trim().slice(0, 200) || '🎶',
         keepMin,
-        keepMax
+        keepMax,
+        opener: !!raw.opener,
+        openerText: String(raw.openerText || '').trim().slice(0, 200),
+        openerWhen: raw.openerWhen === 'id' ? 'id' : 'now'
     };
 }
 
@@ -746,6 +749,11 @@ function keepControls(next, raw, prev) {
         kept.keepText = String(old.keepText || '').trim().slice(0, 200) || '🎶';
         kept.keepMin = old.keepMin;
         kept.keepMax = old.keepMax;
+    }
+    if (!(raw && Object.prototype.hasOwnProperty.call(raw, 'openerWhen'))) {
+        kept.opener = !!old.opener;
+        kept.openerText = String(old.openerText || '').trim().slice(0, 200);
+        kept.openerWhen = old.openerWhen === 'id' ? 'id' : 'now';
     }
     return kept;
 }
@@ -964,7 +972,17 @@ function selfCheck() {
     }
     const keptAlive = keepControls(cleanControls({ auto: 1, phoneTopic: 'knock-room' }), { auto: 1, phoneTopic: 'knock-room' }, { controls: wanted });
     if (!keptAlive || !keptAlive.keep || keptAlive.keepText !== '在嗎' || keptAlive.keepMin !== 1 || keptAlive.keepMax !== 2
-        || cleanControls({ keepText: '  ' }).keepText !== '🎶') {
+        || cleanControls({ keepText: '  ' }).keepText !== '🎶'
+        || cleanControls({ openerWhen: 'id', openerText: ' 早 ' }).openerWhen !== 'id'
+        || cleanControls({ openerText: ' 早 ' }).openerText !== '早'
+        || cleanControls({ openerWhen: 'later' }).openerWhen !== 'now') {
+        throw new Error('knock relay 檢查失敗');
+    }
+    const prevOpener = cleanControls({ opener: 1, openerText: '早', openerWhen: 'id', keep: 1, keepText: '在嗎', keepMin: 1, keepMax: 2, phoneTopic: 'ok' });
+    const keptOpener = keepControls(cleanControls({ auto: 1, phoneTopic: 'ok' }), { auto: 1, phoneTopic: 'ok' }, { controls: prevOpener });
+    const replacedOpener = keepControls(cleanControls({ opener: 0, openerText: '', openerWhen: 'now', phoneTopic: 'ok' }), { openerWhen: 'now', phoneTopic: 'ok' }, { controls: prevOpener });
+    if (!keptOpener || !keptOpener.opener || keptOpener.openerText !== '早' || keptOpener.openerWhen !== 'id'
+        || !keptOpener.keep || replacedOpener.opener || replacedOpener.openerWhen !== 'now' || replacedOpener.openerText) {
         throw new Error('knock relay 檢查失敗');
     }
     const firstOpen = applyHeartbeat(sessions, {
@@ -1637,6 +1655,8 @@ const PAGE = `<!DOCTYPE html>
   .extra { display:flex; flex-direction:column; gap:8px; margin:-2px 0 8px; }
   .extra input { width:100%; box-sizing:border-box; padding:8px 10px; border:1px solid #444; border-radius:8px; background:#1a1a1a; color:#eee; }
   .extra button { padding:8px 12px; border:none; border-radius:8px; background:#2d4a6d; color:#eee; cursor:pointer; }
+  .pick { display:flex; align-items:center; gap:8px; color:#eee; cursor:pointer; }
+  .pick input { width:18px; height:18px; margin:0; accent-color:#eee; }
   .hours { display:flex; align-items:center; gap:6px; color:#aaa; }
   .hours input { width:72px; }
   .sw { width:40px; height:22px; border:none; padding:0; border-radius:11px; background:#555; position:relative; flex:none; cursor:pointer; }
@@ -1712,6 +1732,7 @@ let stickBottom = false;
 let showControls = false;
 let phoneOpen = false;
 let keepOpen = false;
+let openerOpen = false;
 let controlDraft = null;
 let avatarDraft = null;
 let userDraft = null;
@@ -2789,7 +2810,10 @@ function packControls(c) {
     keep: !!c.keep,
     keepText: String(c.keepText || '').trim().slice(0, 200) || '🎶',
     keepMin: min,
-    keepMax: max
+    keepMax: max,
+    opener: !!c.opener,
+    openerText: String(c.openerText || '').trim().slice(0, 200),
+    openerWhen: c.openerWhen === 'id' ? 'id' : 'now'
   };
 }
 
@@ -2899,6 +2923,30 @@ function paintControls() {
     unit.textContent = '小時';
     hours.append(minInp, tilde, maxInp, unit);
     extra.append(sentence, hours);
+    app.append(extra);
+  }
+  const openerRow = controlRow('發語詞', c.opener, () => flip('opener'));
+  openerRow.onclick = () => { openerOpen = !openerOpen; paint(); };
+  app.append(openerRow);
+  if (openerOpen) {
+    const extra = document.createElement('div');
+    extra.className = 'extra';
+    const sentence = fieldInput(c.openerText, '連線後送出這句');
+    sentence.onchange = () => postControls(Object.assign({}, c, { openerText: sentence.value }));
+    const modePick = (label, on, when) => {
+      const row = document.createElement('label');
+      row.className = 'pick';
+      const box = document.createElement('input');
+      box.type = 'checkbox';
+      box.checked = !!on;
+      row.append(box, document.createTextNode(label));
+      row.onclick = (ev) => {
+        ev.preventDefault();
+        postControls(Object.assign({}, c, { openerWhen: when }));
+      };
+      return row;
+    };
+    extra.append(sentence, modePick('連線成功就送', c.openerWhen !== 'id', 'now'), modePick('確認對方後再送', c.openerWhen === 'id', 'id'));
     app.append(extra);
   }
   app.append(userRow, avatarRow, browserRow, phoneRow);
