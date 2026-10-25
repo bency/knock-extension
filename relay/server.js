@@ -576,11 +576,13 @@ function applyHeartbeat(sessions, body, now) {
         lobby: !!body.lobby,
         greeting: body.lobby ? String(body.greeting || '').trim().slice(0, 200) : (prev && prev.greeting) || '',
         greetingWanted: prev && typeof prev.greetingWanted === 'string' ? prev.greetingWanted : null,
+        phase: String(body.phase || '').trim().slice(0, 80),
+        canStart: typeof body.canStart === 'boolean' ? body.canStart : null,
         startWanted: !!(prev && prev.startWanted),
         leaveWanted: !!(prev && prev.leaveWanted),
         reloadWanted: !!(prev && prev.reloadWanted),
         status: body.status === 'left' ? 'left' : 'live',
-        messages: body.lobby && !(body.messages && body.messages.length) && prev && prev.messages && prev.messages.length
+        messages: (body.lobby || body.phase) && !(body.messages && body.messages.length) && prev && prev.messages && prev.messages.length
             ? prev.messages
             : keepRecalled(cleanMessages(body.messages), prev && prev.messages),
         seen: now,
@@ -612,6 +614,8 @@ function visibleSessions(sessions, now, waitMs) {
             canType: s.canType,
             lobby: !!s.lobby,
             greeting: s.greeting || '',
+            phase: s.phase || '',
+            canStart: s.canStart === true ? true : s.canStart === false ? false : null,
             status: s.status,
             seen: s.seen,
             waiting: now - s.seen > waitMs,
@@ -642,6 +646,8 @@ function loadSessions() {
                 lobby: !!s.lobby,
                 greeting: String(s.greeting || '').slice(0, 200),
                 greetingWanted: typeof s.greetingWanted === 'string' ? String(s.greetingWanted).slice(0, 200) : null,
+                phase: String(s.phase || '').slice(0, 80),
+                canStart: s.canStart === true ? true : s.canStart === false ? false : null,
                 startWanted: !!s.startWanted,
                 leaveWanted: !!s.leaveWanted,
                 reloadWanted: !!s.reloadWanted,
@@ -726,10 +732,7 @@ function cleanControls(raw) {
         keep: !!raw.keep,
         keepText: String(raw.keepText || '').trim().slice(0, 200) || '🎶',
         keepMin,
-        keepMax,
-        opener: !!raw.opener,
-        openerText: String(raw.openerText || '').trim().slice(0, 200),
-        openerWhen: raw.openerWhen === 'id' ? 'id' : 'now'
+        keepMax
     };
 }
 
@@ -743,11 +746,6 @@ function keepControls(next, raw, prev) {
         kept.keepText = String(old.keepText || '').trim().slice(0, 200) || '🎶';
         kept.keepMin = old.keepMin;
         kept.keepMax = old.keepMax;
-    }
-    if (!(raw && Object.prototype.hasOwnProperty.call(raw, 'openerWhen'))) {
-        kept.opener = !!old.opener;
-        kept.openerText = String(old.openerText || '').trim().slice(0, 200);
-        kept.openerWhen = old.openerWhen === 'id' ? 'id' : 'now';
     }
     return kept;
 }
@@ -966,17 +964,7 @@ function selfCheck() {
     }
     const keptAlive = keepControls(cleanControls({ auto: 1, phoneTopic: 'knock-room' }), { auto: 1, phoneTopic: 'knock-room' }, { controls: wanted });
     if (!keptAlive || !keptAlive.keep || keptAlive.keepText !== '在嗎' || keptAlive.keepMin !== 1 || keptAlive.keepMax !== 2
-        || cleanControls({ keepText: '  ' }).keepText !== '🎶'
-        || cleanControls({ openerWhen: 'id', openerText: ' 早 ' }).openerWhen !== 'id'
-        || cleanControls({ openerText: ' 早 ' }).openerText !== '早'
-        || cleanControls({ openerWhen: 'later' }).openerWhen !== 'now') {
-        throw new Error('knock relay 檢查失敗');
-    }
-    const prevOpener = cleanControls({ opener: 1, openerText: '早', openerWhen: 'id', keep: 1, keepText: '在嗎', keepMin: 1, keepMax: 2, phoneTopic: 'ok' });
-    const keptOpener = keepControls(cleanControls({ auto: 1, phoneTopic: 'ok' }), { auto: 1, phoneTopic: 'ok' }, { controls: prevOpener });
-    const replacedOpener = keepControls(cleanControls({ opener: 0, openerText: '', openerWhen: 'now', phoneTopic: 'ok' }), { openerWhen: 'now', phoneTopic: 'ok' }, { controls: prevOpener });
-    if (!keptOpener || !keptOpener.opener || keptOpener.openerText !== '早' || keptOpener.openerWhen !== 'id'
-        || !keptOpener.keep || replacedOpener.opener || replacedOpener.openerWhen !== 'now' || replacedOpener.openerText) {
+        || cleanControls({ keepText: '  ' }).keepText !== '🎶') {
         throw new Error('knock relay 檢查失敗');
     }
     const firstOpen = applyHeartbeat(sessions, {
@@ -1019,7 +1007,7 @@ function selfCheck() {
         throw new Error('knock relay 檢查失敗');
     }
     const lobby = applyHeartbeat(sessions, {
-        tabId: 'abc12345', title: '大廳', canType: false, lobby: true, greeting: '你好'
+        tabId: 'abc12345', title: '大廳', canType: false, lobby: true, greeting: '你好', phase: '開始聊天', canStart: true
     }, 17000);
     lobby.greetingWanted = '在嗎';
     lobby.startWanted = true;
@@ -1033,7 +1021,8 @@ function selfCheck() {
     if (!heartbeatReady({ startWanted: true, greeting: '你好', greetingWanted: '在嗎', outbox: [] })
         || greet.greeting !== '在嗎' || !started.start || lobby.startWanted
         || greetDone.greeting !== null || lobby.greetingWanted !== null
-        || !leftLobby || leftLobby.startWanted || leftLobby.greeting !== '在嗎') {
+        || !leftLobby || leftLobby.startWanted || leftLobby.greeting !== '在嗎'
+        || lobby.phase !== '開始聊天' || lobby.canStart !== true) {
         throw new Error('knock relay 檢查失敗');
     }
     sessions.get('abc12345').startWanted = true;
@@ -1549,6 +1538,9 @@ const PAGE = `<!DOCTYPE html>
   .topbar .who .face { width:1em; height:1em; }
   .topbar .del { background:#e53935; border-color:#e53935; color:#fff; }
   main { flex:1; min-height:0; overflow:auto; padding:12px; }
+  main.thread { display:flex; flex-direction:column; }
+  main.thread::before { content:""; flex:1 0 auto; }
+  main.thread > * { flex:none; }
   button, input { font:inherit; color:#eee; }
   .card, .msg { background:#1c1c1c; border:1px solid #333; border-radius:10px; }
   .card { display:block; width:100%; text-align:left; padding:12px; margin:0 0 8px; cursor:pointer; }
@@ -1645,7 +1637,6 @@ const PAGE = `<!DOCTYPE html>
   .extra { display:flex; flex-direction:column; gap:8px; margin:-2px 0 8px; }
   .extra input { width:100%; box-sizing:border-box; padding:8px 10px; border:1px solid #444; border-radius:8px; background:#1a1a1a; color:#eee; }
   .extra button { padding:8px 12px; border:none; border-radius:8px; background:#2d4a6d; color:#eee; cursor:pointer; }
-  .extra button.on { background:#4CAF50; }
   .hours { display:flex; align-items:center; gap:6px; color:#aaa; }
   .hours input { width:72px; }
   .sw { width:40px; height:22px; border:none; padding:0; border-radius:11px; background:#555; position:relative; flex:none; cursor:pointer; }
@@ -1704,7 +1695,6 @@ let sending = false;
 let lastSentText = '';
 let lastSentAt = 0;
 const composeDrafts = {};
-const greetingDrafts = {};
 let formTab = '';
 const relayFile = document.createElement('input');
 relayFile.type = 'file';
@@ -1722,7 +1712,6 @@ let stickBottom = false;
 let showControls = false;
 let phoneOpen = false;
 let keepOpen = false;
-let openerOpen = false;
 let controlDraft = null;
 let avatarDraft = null;
 let userDraft = null;
@@ -1937,7 +1926,7 @@ function hideJump() {
 
 function glowInput() {
   const input = document.querySelector('form input:not([type=file])');
-  if (!input || input.dataset.kind === 'greeting') return;
+  if (!input || input.dataset.kind === 'phase') return;
   input.classList.remove('glow');
   void input.offsetWidth;
   input.classList.add('glow');
@@ -1952,7 +1941,7 @@ function jumpLine(tabId) {
 
 function showJump(tabId) {
   const input = document.querySelector('form input:not([type=file])');
-  if (!tabId || !input || input.dataset.kind === 'greeting') return;
+  if (!tabId || !input || input.dataset.kind === 'phase') return;
   jumpTab = tabId;
   const line = jumpLine(tabId);
   let btn = document.querySelector('.jump-room');
@@ -2609,6 +2598,7 @@ function paintArchive(talk, follow, y) {
     app.append(p);
     return;
   }
+  app.classList.add('thread');
   messages.forEach(paintBubble);
   placeThread({ tabId: 'talk:' + archiveUid, messages }, follow, y);
 }
@@ -2799,10 +2789,7 @@ function packControls(c) {
     keep: !!c.keep,
     keepText: String(c.keepText || '').trim().slice(0, 200) || '🎶',
     keepMin: min,
-    keepMax: max,
-    opener: !!c.opener,
-    openerText: String(c.openerText || '').trim().slice(0, 200),
-    openerWhen: c.openerWhen === 'id' ? 'id' : 'now'
+    keepMax: max
   };
 }
 
@@ -2912,30 +2899,6 @@ function paintControls() {
     unit.textContent = '小時';
     hours.append(minInp, tilde, maxInp, unit);
     extra.append(sentence, hours);
-    app.append(extra);
-  }
-  const openerRow = controlRow('發語詞', c.opener, () => flip('opener'));
-  openerRow.onclick = () => { openerOpen = !openerOpen; paint(); };
-  app.append(openerRow);
-  if (openerOpen) {
-    const extra = document.createElement('div');
-    extra.className = 'extra';
-    const sentence = fieldInput(c.openerText, '連線後送出這句');
-    sentence.onchange = () => postControls(Object.assign({}, c, { openerText: sentence.value }));
-    const modes = document.createElement('div');
-    modes.className = 'hours';
-    const nowBtn = document.createElement('button');
-    nowBtn.type = 'button';
-    nowBtn.textContent = '連線成功就送';
-    if (c.openerWhen !== 'id') nowBtn.className = 'on';
-    nowBtn.onclick = () => postControls(Object.assign({}, c, { openerWhen: 'now' }));
-    const idBtn = document.createElement('button');
-    idBtn.type = 'button';
-    idBtn.textContent = '確認對方後再送';
-    if (c.openerWhen === 'id') idBtn.className = 'on';
-    idBtn.onclick = () => postControls(Object.assign({}, c, { openerWhen: 'id' }));
-    modes.append(nowBtn, idBtn);
-    extra.append(sentence, modes);
     app.append(extra);
   }
   app.append(userRow, avatarRow, browserRow, phoneRow);
@@ -3243,22 +3206,47 @@ function startChat(s) {
   }).catch(err => toast(err.message || '開始失敗'));
 }
 
-function threadActions(s) {
-  const gear = controlsGear();
-  if (!s || (!s.lobby && s.status !== 'left')) return gear;
-  const box = document.createElement('div');
-  box.className = 'end';
-  box.dataset.side = '1';
-  box.style.cssText = 'display:flex;margin-left:auto;position:relative;z-index:1;';
-  const action = document.createElement('button');
-  action.type = 'button';
-  action.className = 'gear';
-  action.textContent = '開始';
-  action.onclick = () => startChat(s);
-  gear.classList.remove('end');
-  gear.style.marginLeft = '0';
-  box.append(action, gear);
-  return box;
+function beforeConnect(s) {
+  return !!(s && (s.lobby || s.status === 'left' || s.phase));
+}
+
+function showStart(s) {
+  if (!s) return false;
+  if (s.canStart === true || s.canStart === false) return s.canStart;
+  return !!(s.lobby || s.status === 'left');
+}
+
+function phaseText(s) {
+  if (!s) return '';
+  if (s.phase) return s.phase;
+  if (s.status === 'left') return '對方已離開對話';
+  if (s.lobby) return '開始聊天';
+  return '';
+}
+
+function startButton(s) {
+  const start = document.createElement('button');
+  start.type = 'button';
+  start.className = 'start';
+  start.textContent = '開始';
+  start.onclick = () => startChat(s);
+  return start;
+}
+
+function syncPhaseForm(s) {
+  const input = document.querySelector('form input[data-kind="phase"]');
+  if (!beforeConnect(s)) return !input;
+  if (!input) return false;
+  const text = phaseText(s);
+  if (input.value !== text) input.value = text;
+  const start = document.querySelector('form button.start');
+  if (showStart(s) && !start) input.before(startButton(s));
+  else if (!showStart(s) && start) start.remove();
+  return true;
+}
+
+function threadActions() {
+  return controlsGear();
 }
 
 function paintTyping(on) {
@@ -3300,6 +3288,7 @@ function paintThread(s, follow, y) {
     app.append(p);
     return;
   }
+  app.classList.add('thread');
   paintOpening(s);
   (s.messages || []).forEach(paintBubble);
   replayPending(s.tabId);
@@ -3315,6 +3304,7 @@ function paintThread(s, follow, y) {
 }
 
 function paint() {
+  app.classList.remove('thread');
   if (!token) { clearForm(); return gate(); }
   document.body.classList.remove('locked');
   document.body.classList.toggle('users', menu === 'users');
@@ -3375,22 +3365,20 @@ function paint() {
   }
   const y = app.scrollTop;
   const follow = stickBottom || (!!current && nearBottom());
-  const focused = document.activeElement && document.activeElement.closest && document.activeElement.closest('form');
+  const focused = document.activeElement && document.activeElement.closest && document.activeElement.closest('form')
+    && !(document.activeElement.dataset && document.activeElement.dataset.kind === 'phase');
   if (focused && current) {
     const s = sessions.find(x => x.tabId === current);
     paintThread(s, follow, y);
     paintQueued(s);
-    if (s && (s.lobby || s.status === 'left')) { hideJump(); return; }
+    if (s && beforeConnect(s)) { hideJump(); return; }
     const input = document.querySelector('form input');
     if (input) input.disabled = !canSend(s);
     document.querySelectorAll('form button').forEach(btn => { btn.disabled = sending || !canSend(s); });
     return;
   }
   const keepInput = document.querySelector('form input:not([type=file])');
-  if (keepInput && formTab) {
-    if (keepInput.dataset.kind === 'greeting') greetingDrafts[formTab] = keepInput.value;
-    else composeDrafts[formTab] = keepInput.value;
-  }
+  if (keepInput && formTab && keepInput.dataset.kind !== 'phase') composeDrafts[formTab] = keepInput.value;
   const draft = composeDrafts[current] || '';
   if (!current) {
     hideJump();
@@ -3407,32 +3395,18 @@ function paint() {
   const s = sessions.find(x => x.tabId === current);
   paintThread(s, follow, y);
   if (!s) return;
-  if (s.lobby || s.status === 'left') {
+  if (beforeConnect(s)) {
     hideJump();
     const form = document.createElement('form');
     const input = document.createElement('input');
-    input.maxLength = 200;
-    input.placeholder = '發語詞';
-    input.dataset.kind = 'greeting';
-    input.value = greetingDrafts[s.tabId] != null ? greetingDrafts[s.tabId] : (s.greeting || '');
-    const saveBtn = document.createElement('button');
-    saveBtn.type = 'submit';
-    saveBtn.textContent = '設定';
-    form.append(input, saveBtn);
-    form.onsubmit = (e) => {
-      e.preventDefault();
-      const text = input.value.trim();
-      if (!text || text === (s.greeting || '')) return;
-      greetingDrafts[s.tabId] = text;
-      api('/api/sessions/' + encodeURIComponent(s.tabId) + '/greeting', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: text })
-      }).catch(err => toast(err.message || '設定失敗'));
-    };
+    input.readOnly = true;
+    input.dataset.kind = 'phase';
+    input.value = phaseText(s);
+    if (showStart(s)) form.append(startButton(s));
+    form.append(input);
+    form.onsubmit = (e) => e.preventDefault();
     stage.append(form);
     formTab = s.tabId;
-    if (keepInput && document.activeElement === keepInput) input.focus();
     if (follow) scrollBottom();
     paintQueued(s);
     return;
@@ -3682,6 +3656,7 @@ async function tick() {
         stampEcho(plan.added);
         patchTimes(plan.times);
         retryPics();
+        if (!syncPhaseForm(nextCurrent)) quiet = false;
       }
     } else if (prevCurrent && nextCurrent && prevCurrent.channelId !== nextCurrent.channelId) {
       pendingMine[current] = [];
@@ -3694,7 +3669,7 @@ async function tick() {
       showJump(otherPing);
     }
     const composer = document.querySelector('form input:not([type=file])');
-    if (!composer || composer.dataset.kind === 'greeting') hideJump();
+    if (!composer || composer.dataset.kind === 'phase') hideJump();
   } catch (e) {
     if (!token) paint();
   } finally {

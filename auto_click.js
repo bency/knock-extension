@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.115
+// @version      1.4.116
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -53,7 +53,7 @@
     const RELAY_TOKEN_KEY = 'knockRelayToken';
     const RELAY_TAB_KEY = 'knockRelayTabId';
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.115';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.116';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -135,12 +135,7 @@
     let browserNotifyEnabled = storedOn(BROWSER_NOTIFY_ENABLED_KEY, true);
     let ntfyEnabled = storedOn(NTFY_ENABLED_KEY, true);
     let keepAliveEnabled = false;
-    let openerEnabled = false;
-    let openerText = '';
-    let openerWhen = 'now';
-    let openerSentChannel = '';
-    try { openerSentChannel = sessionStorage.getItem('knockOpenerChannel') || ''; } catch (e) {}
-    let openerTriedAt = 0;
+    let wasPairSurface = false;
     let keepAliveText = '';
     let keepMin = 1.5;
     let keepMax = 2.5;
@@ -2408,58 +2403,6 @@
         if (browserNotifyEnabled) showBrowserNotification(body, 'Knock 持續連線');
     }
 
-    function openerPlan(on, text, when, channel, sentChannel, ready, hasMine, uid, filtered) {
-        if (!on || !String(text || '').trim() || !channel || !ready) return 'skip';
-        if (sentChannel === channel || hasMine) return 'done';
-        if (when === 'id') {
-            if (!uid) return 'wait';
-            if (filtered) return 'skip';
-        }
-        return 'send';
-    }
-
-    function chatHasMine() {
-        const list = document.querySelector('ul[data-test="messages"]');
-        if (!list) return false;
-        for (const li of list.querySelectorAll('li.message-li')) {
-            if (!isMyMessageLi(li)) continue;
-            const messageDiv = li.querySelector('div[data-test="message"]');
-            if (!messageDiv || TYPING_RE.test(getMessageText(messageDiv))) continue;
-            return true;
-        }
-        return false;
-    }
-
-    function rememberOpenerChannel(channel) {
-        openerSentChannel = channel || '';
-        try {
-            if (openerSentChannel) sessionStorage.setItem('knockOpenerChannel', openerSentChannel);
-            else sessionStorage.removeItem('knockOpenerChannel');
-        } catch (e) {}
-    }
-
-    function tryOpener() {
-        const text = String(openerText || '').trim().slice(0, 200);
-        const channel = String(currentConversation.id || '');
-        const ready = !!document.querySelector('ul[data-test="messages"]')
-            && !!document.querySelector('[data-test="input-message"] textarea')
-            && !findButtons().some(b => isRematchButton(b) || isConfirmExitButton(b))
-            && !pendingForcedLeave;
-        const uid = screenPartnerUid() || String(currentConversation.partnerUid || '').trim();
-        const filtered = !!(firstFilterEnabled && uid && !filterSkipsLock(lockTarget(), uid) && isFirstMessageFiltered(uid, '', ''));
-        const plan = openerPlan(openerEnabled, text, openerWhen, channel, openerSentChannel, ready, chatHasMine(), uid, filtered);
-        if (plan === 'done') {
-            if (channel && openerSentChannel !== channel) rememberOpenerChannel(channel);
-            return;
-        }
-        if (plan !== 'send' || Date.now() - openerTriedAt < 3000) return;
-        openerTriedAt = Date.now();
-        rememberOpenerChannel(channel);
-        sendChatMessage(text, () => {}, () => {
-            if (openerSentChannel === channel) rememberOpenerChannel('');
-        });
-    }
-
     function tryKeepAlive() {
         if (!keepAliveEnabled) return;
         const text = keepSentence(keepAliveText);
@@ -2669,11 +2612,50 @@
         return false;
     }
 
+    function phaseTextPlan(cooling, startLabel, rematchLabel, hasList, holding) {
+        if (cooling) return String(cooling).slice(0, 80);
+        if (startLabel) return String(startLabel).slice(0, 80);
+        if (rematchLabel) return String(rematchLabel).slice(0, 80);
+        if (hasList) return '';
+        if (holding) return '配對中';
+        return '';
+    }
+
+    function buttonLabel(button, fallback) {
+        const text = String(button && (button.innerText || button.textContent) || '').replace(/\s+/g, ' ').trim();
+        return text || fallback;
+    }
+
+    function pairingPhase() {
+        const list = !!document.querySelector('ul[data-test="messages"]');
+        const start = findButtons().find(isStartChatButton);
+        const rematch = findButtons().find(isRematchButton);
+        if (start || rematch) wasPairSurface = true;
+        else if (list) wasPairSurface = false;
+        const cooling = cooldownUntil > Date.now() && cooldownLabel
+            ? (cooldownLabel + ' ' + Math.ceil((cooldownUntil - Date.now()) / 1000)).trim()
+            : '';
+        const holding = !list && !start && !rematch && wasPairSurface;
+        if (holding) wasPairSurface = true;
+        return phaseTextPlan(
+            cooling,
+            start ? buttonLabel(start, '開始聊天') : '',
+            rematch ? buttonLabel(rematch, '重新配對') : '',
+            list && !start && !rematch,
+            holding
+        );
+    }
+
+    function canManualStart() {
+        return findButtons().some(button => (isStartChatButton(button) || isRematchButton(button)) && !button.disabled);
+    }
+
     function relaySnapshot() {
+        const phase = pairingPhase();
         const list = document.querySelector('ul[data-test="messages"]');
         const lobby = findButtons().some(isStartChatButton);
         const left = findButtons().some(isRematchButton);
-        if (!list && !lobby && !left) return null;
+        if (!list && !lobby && !left && !phase) return null;
         autoNamePartner();
         const base = {
             tabId: relayTabId(),
@@ -2682,6 +2664,8 @@
             canType: false,
             lobby,
             greeting: lobby ? lobbyGreeting() : '',
+            phase,
+            canStart: canManualStart(),
             status: left ? 'left' : 'live',
             messages: [],
             openings: null,
@@ -2881,10 +2865,7 @@
             keep: keepAliveEnabled,
             keepText: keepSentence(keepAliveText),
             keepMin,
-            keepMax,
-            opener: openerEnabled,
-            openerText: String(openerText || '').trim().slice(0, 200),
-            openerWhen: openerWhen === 'id' ? 'id' : 'now'
+            keepMax
         };
     }
 
@@ -2893,8 +2874,6 @@
         const title = String(next.phoneTitle || '').trim() || 'Knock 新訊息';
         const hours = keepRange(next.keepMin, next.keepMax);
         const curHours = keepRange(cur.keepMin, cur.keepMax);
-        const when = next.openerWhen === 'id' ? 'id' : 'now';
-        const curWhen = cur.openerWhen === 'id' ? 'id' : 'now';
         return !!next.auto === !!cur.auto
             && !!next.userFilter === !!cur.userFilter
             && !!next.avatarFilter === !!cur.avatarFilter
@@ -2905,10 +2884,7 @@
             && !!next.keep === !!cur.keep
             && String(next.keepText || '').trim() === String(cur.keepText || '').trim()
             && hours.min === curHours.min
-            && hours.max === curHours.max
-            && !!next.opener === !!cur.opener
-            && String(next.openerText || '').trim() === String(cur.openerText || '').trim()
-            && when === curWhen;
+            && hours.max === curHours.max;
     }
 
     function applyRelayControls(c) {
@@ -2932,9 +2908,6 @@
         keepAliveText = keepSentence(c.keepText);
         keepMin = nextKeep.min;
         keepMax = nextKeep.max;
-        openerEnabled = !!c.opener;
-        openerText = String(c.openerText || '').trim().slice(0, 200);
-        openerWhen = c.openerWhen === 'id' ? 'id' : 'now';
         if (hoursChanged) keepAliveWaitMs = 0;
         saveRoomControls();
         const dock = el('knock-dock');
@@ -3581,7 +3554,6 @@
         checkConversationEnd();
         filterSilentLeave();
         tryKeepAlive();
-        tryOpener();
     }, 200);
 
     keepRelayAwake();
@@ -3742,14 +3714,12 @@
             || relayControlsMatch(ctrl, Object.assign({}, ctrl, { phone: false }))
             || relayControlsMatch(ctrl, Object.assign({}, ctrl, { phoneTopic: 'other' }))
             || relayControlsMatch(ctrl, Object.assign({}, ctrl, { keep: true }))
-            || openerPlan(false, '嗨', 'now', 'c1', '', true, false, '', false) !== 'skip'
-            || openerPlan(true, '', 'now', 'c1', '', true, false, '', false) !== 'skip'
-            || openerPlan(true, '嗨', 'now', 'c1', 'c1', true, false, '', false) !== 'done'
-            || openerPlan(true, '嗨', 'now', 'c1', '', true, true, '', false) !== 'done'
-            || openerPlan(true, '嗨', 'now', 'c1', '', true, false, '', false) !== 'send'
-            || openerPlan(true, '嗨', 'id', 'c1', '', true, false, '', false) !== 'wait'
-            || openerPlan(true, '嗨', 'id', 'c1', '', true, false, 'u1', true) !== 'skip'
-            || openerPlan(true, '嗨', 'id', 'c1', '', true, false, 'u1', false) !== 'send'
+            || phaseTextPlan('開始聊天 2', '', '', false, false) !== '開始聊天 2'
+            || phaseTextPlan('', '開始聊天', '', false, false) !== '開始聊天'
+            || phaseTextPlan('', '', '重新配對', true, false) !== '重新配對'
+            || phaseTextPlan('', '', '', true, true) !== ''
+            || phaseTextPlan('', '', '', false, true) !== '配對中'
+            || phaseTextPlan('', '', '', false, false) !== ''
             || silentLeavePlan('them', 'u1', false, false) !== 'filter'
             || silentLeavePlan('them', 'u1', true, false) !== 'skip'
             || silentLeavePlan('them', '', false, false) !== 'skip'
