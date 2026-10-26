@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.117
+// @version      1.4.118
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -53,7 +53,7 @@
     const RELAY_TOKEN_KEY = 'knockRelayToken';
     const RELAY_TAB_KEY = 'knockRelayTabId';
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.117';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.118';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -92,12 +92,6 @@
             return null;
         }
         return build();
-    }
-
-    function filterCardsByTerm(selector, term, displayOn) {
-        document.querySelectorAll(selector).forEach(card => {
-            card.style.display = card.textContent.toLowerCase().includes(term) ? displayOn : 'none';
-        });
     }
 
     function storageGet(key, fallback) {
@@ -149,6 +143,7 @@
     let knownPeople = [];
     let peopleRev = 0;
     let lockMenuSig = '';
+    let lockQuery = '';
     let keepAliveWaitMs = 0;
     let lastKeepAliveTryAt = 0;
     let lastKeepAliveSentAt = 0;
@@ -374,20 +369,6 @@
         return ok;
     }
 
-    function removeFirstMessageFilter(uid, text, avatarHash) {
-        const u = (uid || '').trim();
-        const t = (text || '').trim();
-        const a = avatarHash || '';
-        const next = getNormalizedFilters().filter(f => {
-            if (u && f.u === u) return false;
-            if (!u && t && !f.u && f.t === t && f.a === a) return false;
-            return true;
-        });
-        const ok = storageSet(FIRST_MSG_FILTER_KEY, next);
-        if (ok) pushFilters({ removeUsers: [{ u, t, a }] });
-        return ok;
-    }
-
     function forgetFirstMessageFilter(uid, text, avatarHash) {
         const u = (uid || '').trim();
         const t = (text || '').trim();
@@ -411,12 +392,6 @@
         legacy.u = u;
         storageSet(FIRST_MSG_FILTER_KEY, list);
         pushFilters({ addUsers: [{ u, t: legacy.t, a: legacy.a }] });
-    }
-
-    function clearFirstMessageFilters() {
-        const ok = storageSet(FIRST_MSG_FILTER_KEY, []);
-        if (ok) pushFilters({ clearUsers: true });
-        return ok;
     }
 
     function mergeStoredUsers(incoming) {
@@ -460,8 +435,6 @@
             const avatarHash = decodeURIComponent(btn.dataset.filterAvatar || '');
             paintRememberButton(btn, isFirstMessageFiltered(uid, text, avatarHash));
         });
-        const badge = el('knock-filter-count');
-        if (badge) badge.textContent = String(getNormalizedFilters().length);
     }
 
     function toggleFirstMessageFilter(uid, text, avatarHash) {
@@ -483,7 +456,6 @@
             pendingForcedLeave = false;
             namePartnerFromOpening(u, t);
             syncRememberButtons();
-            if (el('knock-first-filter-manager')) refreshFirstFilterManager();
             showToast('已加入使用者過濾');
             return true;
         }
@@ -1227,6 +1199,7 @@
     }
 
     function filterSilentLeave() {
+        if (!firstFilterEnabled) return;
         const uid = seenPartnerUid();
         const plan = silentLeavePlan(
             currentConversation.endKind || '',
@@ -1709,6 +1682,13 @@
         paintLockSelect();
     }
 
+    function lockHit(title, uid, query) {
+        const q = String(query || '').trim().toLowerCase();
+        if (!q) return true;
+        const name = String(title || '未命名').toLowerCase();
+        return name.includes(q) || String(uid || '').toLowerCase().includes(q);
+    }
+
     function paintLockSelect() {
         const sel = el('knock-lock-user');
         if (!sel) return;
@@ -1719,8 +1699,11 @@
             return a.uid < b.uid ? -1 : a.uid > b.uid ? 1 : 0;
         });
         const lock = lockTarget();
-        if (lock && !rows.some(p => p.uid === lock)) rows.unshift({ uid: lock, title: '未命名' });
-        const sig = lock + '\n' + rows.map(p => p.uid + '\0' + (p.title || '')).join('\n');
+        const shown = rows.filter(p => lockHit(p.title, p.uid, lockQuery));
+        if (lock && !shown.some(p => p.uid === lock)) {
+            shown.unshift(rows.find(p => p.uid === lock) || { uid: lock, title: '未命名' });
+        }
+        const sig = lockQuery + '\n' + lock + '\n' + shown.map(p => p.uid + '\0' + (p.title || '')).join('\n');
         if (sig === lockMenuSig && sel.options.length) return;
         lockMenuSig = sig;
         sel.replaceChildren();
@@ -1728,13 +1711,13 @@
         none.value = '';
         none.textContent = '不鎖定';
         sel.append(none);
-        rows.forEach(p => {
+        shown.forEach(p => {
             const opt = document.createElement('option');
             opt.value = p.uid;
             opt.textContent = (p.title || '未命名') + ' · ' + p.uid;
             sel.append(opt);
         });
-        sel.value = lock && rows.some(p => p.uid === lock) ? lock : '';
+        sel.value = lock && shown.some(p => p.uid === lock) ? lock : '';
     }
 
     function noteKnownPeople(list) {
@@ -1909,7 +1892,14 @@
     function queuePhoneNotify(body) {
         if (!ntfyEnabled) return;
         const topic = getNtfyTopic();
-        if (!topic || Date.now() < ntfyBackoffUntil) return;
+        if (!topic) {
+            reportPhoneFail('尚未設定主題');
+            return;
+        }
+        if (Date.now() < ntfyBackoffUntil) {
+            reportPhoneFail('HTTP 429：還在冷卻，請稍候再送');
+            return;
+        }
         const holding = !!(ntfyHold && ntfyHold.topic === topic);
         const plan = phoneNotifyPlan(holding, lastNtfyAt, Date.now(), NTFY_GAP_MS, remotePageOn);
         if (plan === 'quiet') {
@@ -1930,14 +1920,28 @@
         return `HTTP ${status}`;
     }
 
+    function reportPhoneFail(detail) {
+        if (!ntfyEnabled || !token) return;
+        const reason = String(detail || '送出失敗').trim().slice(0, 200);
+        if (!reason) return;
+        gmRequest({
+            method: 'POST',
+            url: `${RELAY_URL}/api/phone-alerts`,
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+            data: JSON.stringify({ reason })
+        }).catch(() => {});
+    }
+
     function sendNtfy(body, title) {
         return new Promise((resolve) => {
             const topic = getNtfyTopic();
             if (!topic) {
+                reportPhoneFail('尚未設定主題');
                 resolve({ ok: false, detail: '尚未設定主題' });
                 return;
             }
             if (Date.now() < ntfyBackoffUntil) {
+                reportPhoneFail('HTTP 429：還在冷卻，請稍候再送');
                 resolve({ ok: false, detail: 'HTTP 429：還在冷卻，請稍候再送' });
                 return;
             }
@@ -1949,6 +1953,7 @@
             const finish = (ok, detail, status) => {
                 if (status === 429) ntfyBackoffUntil = Date.now() + 60000;
                 if (ok) lastNtfyAt = Date.now();
+                else reportPhoneFail(detail);
                 resolve({ ok, detail });
             };
             const xhr = (typeof GM !== 'undefined' && GM.xmlHttpRequest)
@@ -2031,39 +2036,18 @@
         kickRelayImages();
     }
 
-    function onRememberRowClick(e) {
-        if (e.target.closest('a, [data-test="user-avatar"], .knock-remember-avatar, .knock-partner-name')) return;
-        const first = findFirstOtherMessage();
-        if (!first || first.li !== e.currentTarget) return;
-        toggleFirstMessageFilter(first.uid, first.filterKey, first.avatarHash);
-    }
-
     function decorateOtherMessages() {
         const list = document.querySelector('ul[data-test="messages"]');
         if (!list) return;
 
         const first = findFirstOtherMessage();
-        list.querySelectorAll('.knock-remember-first, .knock-remember-avatar').forEach(btn => {
+        list.querySelectorAll('.knock-remember-first').forEach(btn => btn.remove());
+        list.querySelectorAll('.knock-remember-avatar').forEach(btn => {
             if (!first || !first.li.contains(btn)) btn.remove();
         });
         if (!first) return;
 
         const row = first.li.firstElementChild || first.li;
-        let rememberBtn = first.li.querySelector('.knock-remember-first');
-        if (!rememberBtn) {
-            rememberBtn = document.createElement('button');
-            rememberBtn.type = 'button';
-            rememberBtn.className = 'knock-remember-first';
-            row.appendChild(rememberBtn);
-        }
-        const rememberSig = `${first.uid || ''}\0${first.filterKey}\0${first.avatarHash}`;
-        if (rememberBtn.dataset.knockSig !== rememberSig) {
-            rememberBtn.dataset.knockSig = rememberSig;
-            rememberBtn.dataset.filterUid = encodeURIComponent(first.uid || '');
-            rememberBtn.dataset.filterText = encodeURIComponent(first.filterKey);
-            rememberBtn.dataset.filterAvatar = encodeURIComponent(first.avatarHash);
-            paintRememberButton(rememberBtn, isFirstMessageFiltered(first.uid, first.filterKey, first.avatarHash));
-        }
         if (first.avatarUrl && !first.li.querySelector('.knock-remember-avatar')) {
             const avatarEl = first.li.querySelector('div[data-test="user-avatar"]');
             if (avatarEl) {
@@ -2087,12 +2071,6 @@
                 });
                 row.appendChild(btn);
             }
-        }
-
-        if (!first.li.dataset.knockRememberRow) {
-            first.li.dataset.knockRememberRow = '1';
-            first.li.style.cursor = 'pointer';
-            first.li.addEventListener('click', onRememberRowClick);
         }
     }
 
@@ -2184,15 +2162,12 @@
             showToast(token ? '已開啟遠端對話' : '已關閉遠端對話');
         });
 
-        const filterRow = dockRow(
-            `<span>使用者過濾</span><span id="knock-filter-count" style="background:#ff9800;border-radius:10px;padding:0 6px;font-size:12px;min-width:1.2em;text-align:center;">${getNormalizedFilters().length}</span>`
-        );
+        const filterRow = dockRow('<span>使用者過濾</span>');
         attachDockSwitch(filterRow, firstFilterEnabled, (v) => {
             firstFilterEnabled = v;
             localStorage.setItem(FIRST_FILTER_ENABLED_KEY, String(v));
             saveRoomControls();
-        }, true);
-        filterRow.addEventListener('click', (e) => { e.stopPropagation(); createFirstFilterManager(); });
+        });
 
         const avatarRow = dockRow(
             `<span>大頭貼過濾</span><span id="knock-avatar-filter-count" style="background:#ff9800;border-radius:10px;padding:0 6px;font-size:12px;min-width:1.2em;text-align:center;">${getAvatarFilters().length}</span>`
@@ -2241,12 +2216,25 @@
         row.style.cssText = DOCK_ROW + 'cursor:default;flex-direction:column;align-items:stretch;';
         const label = document.createElement('span');
         label.textContent = '鎖定使用者';
+        const search = document.createElement('input');
+        search.type = 'search';
+        search.placeholder = '搜尋名稱或 id';
+        search.setAttribute('aria-label', '搜尋鎖定使用者');
+        search.style.cssText = 'width:100%;margin-top:6px;padding:6px;border-radius:6px;border:1px solid #555;background:#333;color:#fff;font:inherit;font-size:12px;box-sizing:border-box;';
+        const stop = (e) => e.stopPropagation();
+        search.addEventListener('click', stop);
+        search.addEventListener('keydown', stop);
+        search.addEventListener('input', () => {
+            lockQuery = search.value;
+            lockMenuSig = '';
+            paintLockSelect();
+        });
         const sel = document.createElement('select');
         sel.id = 'knock-lock-user';
         sel.style.cssText = 'width:100%;margin-top:6px;padding:6px;border-radius:6px;border:1px solid #555;background:#333;color:#fff;font:inherit;font-size:12px;';
-        sel.addEventListener('click', (e) => e.stopPropagation());
+        sel.addEventListener('click', stop);
         sel.addEventListener('change', () => setLockTarget(sel.value));
-        row.append(label, sel);
+        row.append(label, search, sel);
         return row;
     }
 
@@ -3269,7 +3257,6 @@
             storageSet(FIRST_MSG_FILTER_KEY, users);
             changed = true;
             syncRememberButtons();
-            if (el('knock-first-filter-manager')) refreshFirstFilterManager();
         }
         if (avatars && JSON.stringify(avatars) !== JSON.stringify(getAvatarFilters())) {
             storageSet(AVATAR_FILTER_KEY, avatars);
@@ -3380,9 +3367,15 @@
             }
             if (typeof data.userOn === 'boolean') {
                 relayRecordUser = data.userOn;
-                const first = findFirstOtherMessage();
-                if (first && first.uid && isFirstMessageFiltered(first.uid, first.filterKey, first.avatarHash) !== data.userOn) {
-                    toggleFirstMessageFilter(first.uid, first.filterKey, first.avatarHash);
+                const first = findFirstOtherMessage(true);
+                const uid = (first && first.uid) || seenPartnerUid();
+                if (uid && isFirstMessageFiltered(uid, '', '') !== data.userOn) {
+                    if (data.userOn) {
+                        if (addFirstMessageFilter(uid, (first && first.filterKey) || '', (first && first.avatarHash) || '')) {
+                            skipFirstFilterFor = uid;
+                            pendingForcedLeave = false;
+                        }
+                    } else forgetFirstMessageFilter(uid, (first && first.filterKey) || '', (first && first.avatarHash) || '');
                 }
             }
             if (!relayImageBooted) {
@@ -3454,46 +3447,6 @@
         } catch (e) {}
     }
 
-    function refreshFirstFilterManager() {
-        const panel = el('knock-first-filter-manager');
-        if (!panel) return;
-        panel.remove();
-        createFirstFilterManager();
-    }
-
-    function createFirstFilterManager() {
-        const filters = getNormalizedFilters();
-        const panel = toggleOverlay('knock-first-filter-manager', () => makeOverlay('knock-first-filter-manager', 720, `
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;flex-wrap:wrap;">
-                <h2 style="margin:0;font-size:24px;">使用者過濾（${filters.length}）</h2>
-                <div style="display:flex;gap:8px;flex-wrap:wrap;">
-                    <button id="knock-clear-first-filters" style="${cssBtn('#d32f2f')}" ${filters.length ? '' : 'disabled'}>全部清空</button>
-                    <button id="knock-filter-manager-close" style="${cssBtn('#444')}">關閉</button>
-                </div>
-            </div>
-            <div style="font-size:13px;color:#888;margin-bottom:16px;">依使用者 id 自動離開。沒有 id 的舊項目，要發語詞與頭像都相同才會離開。</div>
-            <input type="text" id="knock-filter-search" placeholder="搜尋已記住的人..." style="${CSS_INP}margin-bottom:16px;">
-            <div id="knock-filter-list" style="display:flex;flex-direction:column;gap:8px;">
-                ${filters.length === 0
-                    ? '<div style="text-align:center;padding:40px;color:#888;">尚未過濾任何人</div>'
-                    : filters.map(f => `
-                        <div class="knock-filter-card" style="display:flex;gap:8px;align-items:flex-start;background:#222;border:1px solid #444;border-radius:8px;padding:12px;">
-                            <div style="flex:1;min-width:0;">
-                                <div style="font-size:14px;color:#ccc;white-space:pre-wrap;word-break:break-word;">${escapeHtml(f.t || '（沒有發語詞）')}</div>
-                                <div style="font-size:12px;color:#666;margin-top:4px;">${f.u
-                                    ? `id ${escapeHtml(f.u)}`
-                                    : '舊資料沒有 id，發語詞與頭像都相同才會離開'}</div>
-                            </div>
-                            <button type="button" class="knock-remove-first-filter" data-filter-uid="${encodeURIComponent(f.u)}" data-filter-text="${encodeURIComponent(f.t)}" data-filter-avatar="${encodeURIComponent(f.a)}" style="${cssBtn('#d32f2f', 'padding:6px 10px;border-radius:4px;font-size:12px;flex-shrink:0;')}">刪除</button>
-                        </div>`).join('')}
-            </div>`));
-        if (!panel) return;
-        el('knock-filter-manager-close').onclick = () => panel.remove();
-        el('knock-filter-search').addEventListener('input', (e) => {
-            filterCardsByTerm('.knock-filter-card', e.target.value.toLowerCase(), 'flex');
-        });
-    }
-
     function refreshAvatarFilterManager() {
         const panel = el('knock-avatar-filter-manager');
         if (!panel) return;
@@ -3537,26 +3490,6 @@
     }
 
     document.addEventListener('click', (e) => {
-        if (e.target.classList.contains('knock-remove-first-filter')) {
-            const uid = decodeURIComponent(e.target.dataset.filterUid || '');
-            const text = decodeURIComponent(e.target.dataset.filterText || '');
-            const avatarHash = decodeURIComponent(e.target.dataset.filterAvatar || '');
-            if (uid || text) {
-                removeFirstMessageFilter(uid, text, avatarHash);
-                syncRememberButtons();
-                refreshFirstFilterManager();
-            }
-            return;
-        }
-        const rememberBtn = e.target.closest?.('.knock-remember-first-saved');
-        if (rememberBtn) {
-            toggleFirstMessageFilter(
-                decodeURIComponent(rememberBtn.dataset.filterUid || ''),
-                decodeURIComponent(rememberBtn.dataset.filterText || ''),
-                decodeURIComponent(rememberBtn.dataset.filterAvatar || '')
-            );
-            return;
-        }
         if (e.target.classList.contains('knock-remove-avatar-filter')) {
             const url = decodeURIComponent(e.target.dataset.avatarUrl || '');
             if (url) {
@@ -3576,14 +3509,6 @@
                 clearAvatarFilters();
                 syncAvatarFilterButtons();
                 refreshAvatarFilterManager();
-            }
-            return;
-        }
-        if (e.target.id === 'knock-clear-first-filters') {
-            if (getNormalizedFilters().length && confirm('確定清空全部使用者過濾？')) {
-                clearFirstMessageFilters();
-                syncRememberButtons();
-                refreshFirstFilterManager();
             }
             return;
         }
@@ -3838,6 +3763,10 @@
             || !filterSkipsLock('u1', 'u1')
             || filterSkipsLock('u1', 'u2')
             || filterSkipsLock('', 'u1')
+            || !lockHit('阿明', 'uid1', '')
+            || !lockHit('阿明', 'uid1', '明')
+            || !lockHit('未命名', 'AbC', 'abc')
+            || lockHit('阿明', 'uid1', 'zzz')
             || chatEndPlan(true, true, true, '') !== 'idle'
             || chatEndPlan(false, true, true, '') !== 'them'
             || chatEndPlan(false, false, true, '') !== 'mine'

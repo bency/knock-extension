@@ -16,6 +16,7 @@ const FILTER_FILE = path.join(path.dirname(DATA), 'filters.json');
 const PEOPLE_FILE = path.join(path.dirname(DATA), 'people.json');
 const FILTER_KEEP = 2000;
 const IMG_DIR = path.join(path.dirname(DATA), 'images');
+const ALERT_FILE = path.join(path.dirname(DATA), 'phone-alerts.json');
 
 function tokenOk(header) {
     const got = String(header || '').startsWith('Bearer ') ? header.slice(7).trim() : '';
@@ -114,6 +115,7 @@ function archiveMessage(m) {
     const quote = String(m && m.quote || '').slice(0, 200);
     const image = /^[a-z0-9]{8,40}$/.test(m && m.image) ? m.image : '';
     const end = m && (m.end === 'idle' || m.end === 'them' || m.end === 'mine') ? m.end : '';
+    if (unsentStamp(m && m.time)) return null;
     const time = withYear(m && m.time);
     if (!id || !(text || quote || image || end)) return null;
     const row = { id, text, quote, image, mine: !!(m && m.mine), time };
@@ -209,6 +211,37 @@ function visibleTalks(talks) {
     return [...talks.values()]
         .map(t => ({ uid: t.uid, title: t.title, avatar: t.avatar || '', updated: t.updated, lastAt: t.lastAt || t.updated || 0, count: (t.messages && t.messages.length) || 0 }))
         .sort((a, b) => b.lastAt - a.lastAt || b.updated - a.updated || (a.uid < b.uid ? -1 : 1));
+}
+
+function searchTalks(talks, raw) {
+    const q = String(raw || '').trim().slice(0, 80).toLowerCase();
+    if (!q) return [];
+    const out = [];
+    for (const t of talks.values()) {
+        let matches = 0;
+        let sample = '';
+        for (const m of t.messages || []) {
+            const text = String(m.text || '');
+            const quote = String(m.quote || '');
+            if ((text + ' ' + quote).toLowerCase().indexOf(q) < 0) continue;
+            matches += 1;
+            if (!sample) sample = (text || quote).slice(0, 80);
+            if (matches >= 99) break;
+        }
+        const title = String(t.title || '');
+        if (!matches && title.toLowerCase().indexOf(q) < 0) continue;
+        out.push({
+            uid: t.uid,
+            title: t.title,
+            avatar: t.avatar || '',
+            lastAt: t.lastAt || t.updated || 0,
+            count: (t.messages && t.messages.length) || 0,
+            matches: matches || 1,
+            sample: sample || title
+        });
+    }
+    out.sort((a, b) => b.lastAt - a.lastAt || (a.uid < b.uid ? -1 : 1));
+    return out.slice(0, 200);
 }
 
 function loadTalks() {
@@ -520,6 +553,10 @@ function saveFilters() {
     fs.writeFileSync(FILTER_FILE, JSON.stringify(filters));
 }
 
+function unsentStamp(time) {
+    return String(time || '').trim() === '未傳送';
+}
+
 function cleanMessages(list) {
     if (!Array.isArray(list)) return [];
     return list.slice(-40).map(m => ({
@@ -529,7 +566,7 @@ function cleanMessages(list) {
         image: /^[a-z0-9]{8,40}$/.test(m && m.image) ? m.image : '',
         mine: !!(m && m.mine),
         time: String(m && m.time || '').slice(0, 32)
-    })).filter(m => m.id && (m.text || m.quote || m.image));
+    })).filter(m => m.id && (m.text || m.quote || m.image) && !unsentStamp(m.time));
 }
 
 function withRecall(text) {
@@ -809,6 +846,16 @@ function takeAvatarPatch(session) {
     return { avatarOn: session.avatarWanted, dirty: false };
 }
 
+function markSessionUser(session, on) {
+    const uid = cleanUid(session && session.partnerUid);
+    if (!uid) return false;
+    session.userWanted = !!on;
+    applyFilterPatch(filters, on
+        ? { addUsers: [{ u: uid, t: '', a: '' }] }
+        : { removeUsers: [{ u: uid, t: '', a: '' }] });
+    return true;
+}
+
 function takeUserPatch(session) {
     if (typeof session.userWanted !== 'boolean') return { userOn: null, dirty: false };
     const current = !!(session.openings && session.openings.userOn);
@@ -847,6 +894,11 @@ function takeReloadPatch(session) {
     return { reload: true, dirty: true };
 }
 
+function requestReload(session) {
+    session.reloadWanted = true;
+    session.outbox = [];
+}
+
 function latestThemText(session) {
     const list = session && session.messages || [];
     for (let i = list.length - 1; i >= 0; i--) {
@@ -867,6 +919,58 @@ function takeNotifyPatch(session) {
     const notify = session.notifyWanted;
     session.notifyWanted = null;
     return { notify, dirty: true };
+}
+
+let phoneAlerts = [];
+
+function cleanPhoneReason(raw) {
+    return String(raw || '').trim().slice(0, 200);
+}
+
+function addPhoneAlert(list, reason) {
+    const text = cleanPhoneReason(reason);
+    if (!text) return list;
+    if (list.some(a => a.reason === text)) return list;
+    const next = list.concat([{ id: crypto.randomBytes(4).toString('hex'), reason: text }]);
+    return next.length > 20 ? next.slice(-20) : next;
+}
+
+function dismissPhoneAlerts(list, ids) {
+    const drop = new Set((Array.isArray(ids) ? ids : []).map(id => String(id || '')).filter(id => /^[a-f0-9]{8}$/.test(id)));
+    if (!drop.size) return list;
+    return list.filter(a => !drop.has(a.id));
+}
+
+function loadPhoneAlerts() {
+    try {
+        const raw = JSON.parse(fs.readFileSync(ALERT_FILE, 'utf8'));
+        phoneAlerts = (Array.isArray(raw) ? raw : []).map(a => ({
+            id: /^[a-f0-9]{8}$/.test(a && a.id) ? a.id : '',
+            reason: cleanPhoneReason(a && a.reason)
+        })).filter(a => a.id && a.reason).slice(-20);
+    } catch (e) {
+        phoneAlerts = [];
+    }
+}
+
+function savePhoneAlerts() {
+    fs.writeFileSync(ALERT_FILE, JSON.stringify(phoneAlerts));
+}
+
+function notePhoneAlert(reason) {
+    const next = addPhoneAlert(phoneAlerts, reason);
+    if (next === phoneAlerts) return;
+    phoneAlerts = next;
+    savePhoneAlerts();
+    touch();
+}
+
+function clearPhoneAlerts(ids) {
+    const next = dismissPhoneAlerts(phoneAlerts, ids);
+    if (next.length === phoneAlerts.length) return;
+    phoneAlerts = next;
+    savePhoneAlerts();
+    touch();
 }
 
 function enqueue(session, text, now, image) {
@@ -944,12 +1048,15 @@ function selfCheck() {
     if (applyHeartbeat(sessions, { tabId: '../x', title: 'x' }, 2000)) throw new Error('knock relay 檢查失敗');
     const imgItem = enqueue(sessions.get('abc12345'), '', 30000, 'abcd1234');
     const withImg = cleanMessages([{ id: 'imgmsg01', text: '', quote: '原文', image: 'abcd1234' }]);
+    const droppedUnsent = cleanMessages([{ id: 'u1', text: '不會耶', mine: true, time: '未傳送' }, { id: 'u2', text: '嗨', mine: true, time: '10:01' }]);
     const beforeQueue = queuedLines(sessions.get('abc12345').outbox);
     const handed = pendingOutbox(sessions.get('abc12345'));
     const again = pendingOutbox(sessions.get('abc12345'));
     const kept = keptOutbox([{ text: 'a' }, { image: 'abcd1234' }, { text: 'b' }]);
     const shownQueue = queuedLines(sessions.get('abc12345').outbox);
     if (!imgItem || !imgItem.image || withImg.length !== 1 || withImg[0].quote !== '原文' || withImg[0].image !== 'abcd1234'
+        || droppedUnsent.length !== 1 || droppedUnsent[0].id !== 'u2'
+        || archiveMessage({ id: 'u1', text: '不會耶', mine: true, time: '未傳送' })
         || beforeQueue.length !== 2 || beforeQueue[1].text !== '圖片'
         || handed.pending.filter(item => item.image).length !== 1
         || again.pending.some(item => item.image)
@@ -1063,6 +1170,9 @@ function selfCheck() {
     if (!keptReload || !heartbeatReady({ reloadWanted: true, outbox: [] }) || !reloading.reload || keptReload.reloadWanted || takeReloadPatch(keptReload).reload) {
         throw new Error('knock relay 檢查失敗');
     }
+    const abandon = { reloadWanted: false, outbox: [{ id: 'pending1', text: '還沒送' }] };
+    requestReload(abandon);
+    if (!abandon.reloadWanted || abandon.outbox.length) throw new Error('knock relay 檢查失敗');
     const keptLobby = applyHeartbeat(sessions, {
         tabId: 'abc12345', title: '大廳', canType: false, lobby: true, greeting: '你好', messages: []
     }, 18600);
@@ -1079,6 +1189,11 @@ function selfCheck() {
         || once.notify !== '對方這句' || takeNotifyPatch(noted).notify) {
         throw new Error('knock relay 檢查失敗');
     }
+    const alertOnce = addPhoneAlert(addPhoneAlert([], 'HTTP 429：ntfy.sh 公開伺服器限流，請隔一分鐘再試'), 'HTTP 429：ntfy.sh 公開伺服器限流，請隔一分鐘再試');
+    if (alertOnce.length !== 1 || alertOnce[0].reason.indexOf('429') < 0 || dismissPhoneAlerts(alertOnce, [alertOnce[0].id]).length
+        || addPhoneAlert([], '').length) {
+        throw new Error('knock relay 檢查失敗');
+    }
     const talks = new Map();
     if (!rememberTalk(talks, { archive: { uid: 'user_one', title: '阿明', messages: [{ id: 'a', text: '嗨', mine: false, time: '10:01' }] } }, 1)
         || !rememberTalk(talks, { archive: { uid: 'user_one', title: '阿明', messages: [{ id: 'b', text: '在嗎', mine: true }] } }, 2)
@@ -1087,6 +1202,9 @@ function selfCheck() {
         || talks.size !== 1
         || talks.get('user_one').messages.map(m => m.id).join() !== 'a,b'
         || visibleTalks(talks)[0].count !== 2
+        || searchTalks(talks, '在嗎').length !== 1
+        || searchTalks(talks, '在嗎')[0].sample !== '在嗎'
+        || searchTalks(talks, '沒有這句').length
         || !dropTalk(talks, 'user_one')
         || talks.has('user_one')
         || rememberTalk(talks, { archive: { uid: 'user_one', title: '阿明', messages: [{ id: 'a', text: '嗨', mine: false }] } }, 5)
@@ -1182,6 +1300,10 @@ function selfCheck() {
     filters.users.push({ u: 'user_one', t: '', a: '' });
     const shownPeople = visiblePeople(folks);
     filters.users = filters.users.filter(x => x.u !== 'user_one');
+    const marked = { partnerUid: 'user_one' };
+    if (!markSessionUser(marked, true) || marked.userWanted !== true || !filters.users.some(x => x.u === 'user_one')
+        || !markSessionUser(marked, false) || filters.users.some(x => x.u === 'user_one')
+        || markSessionUser({ partnerUid: '' }, true)) throw new Error('knock relay 檢查失敗');
     filters.avatars.push('faceaaa1');
     notePerson(folks, { uid: 'user_face1', avatar: 'faceaaa1', title: '甲' }, 1);
     notePerson(folks, { uid: 'user_face2', avatar: 'faceaaa1', title: '乙' }, 1);
@@ -1540,7 +1662,27 @@ const PAGE = `<!DOCTYPE html>
     body.rail-open #nav, body.rail-open #rail { transform:none; }
     body.rail-open #shade { display:block; }
     .topbar .rail-btn { display:flex; }
+    #rail { display:none; }
   }
+  .pick-list { display:flex; flex-direction:column; gap:4px; }
+  .pick-list .card { position:relative; box-sizing:border-box; margin:0; padding:8px 10px; }
+  .pick-list .card.on { background:#1e3326; border-color:#2d5a3d; }
+  .pick-list .card.has-face { display:flex; align-items:center; gap:8px; }
+  .pick-list .card.has-face .face-box { flex:none; width:calc(2lh + 2px); height:calc(2lh + 2px); }
+  .pick-list .card.has-face .face { width:100%; height:100%; }
+  .pick-list .card.has-face .card-body { flex:1; min-width:0; }
+  .pick-list .card small { margin-top:2px; }
+  .pick-list .card .dot { top:6px; right:8px; }
+  .pick-list .talk { position:relative; }
+  .pick-list .talk .card { width:100%; }
+  .pick-list .talk .who { min-height:22px; padding-right:26px; }
+  .pick-list .talk .who span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .pick-list .bin { position:absolute; top:4px; right:8px; z-index:2; width:22px; height:22px; padding:0; border:none; background:transparent; color:#e53935; cursor:pointer; display:flex; align-items:center; justify-content:center; }
+  .pick-list .muted { margin:8px 4px; }
+  .board .pager { display:flex; align-items:center; justify-content:center; gap:12px; padding:4px 0 12px; }
+  .board .pager button { padding:6px 12px; border:1px solid #444; border-radius:8px; background:#1c1c1c; color:#eee; cursor:pointer; }
+  .board .pager button:disabled { opacity:0.4; }
+  .board .pager span { color:#aaa; font-size:13px; }
   body.locked { overflow:auto; }
   body.locked .shell, body.locked #shade { display:none; }
   .topbar { position:relative; flex:none; z-index:6; display:flex; justify-content:space-between; height:48px; background:#111; border-bottom:1px solid #333; }
@@ -1548,6 +1690,10 @@ const PAGE = `<!DOCTYPE html>
   .topbar .gear { position:relative; z-index:1; flex:none; width:auto; height:48px; padding:0 12px; border-radius:0; border:1px solid #333; background:#1c1c1c; cursor:pointer; }
   .topbar .gear.menu { width:48px; padding:0; }
   .topbar .end { margin-left:auto; }
+  .topbar .ver { position:relative; z-index:2; margin-left:auto; align-self:center; padding:0 12px 0 8px; color:#888; font-size:12px; white-space:nowrap; }
+  .topbar .end + .ver { margin-left:0; }
+  .topbar:has(.ver) .who { padding-right:96px; }
+  .topbar:has(.del):has(.ver) .who { padding-right:156px; }
   .topbar .who { position:absolute; left:0; right:0; top:0; height:48px; display:flex; align-items:center; justify-content:center; gap:8px; padding:0 72px; pointer-events:none; overflow:hidden; }
   .topbar .back { position:relative; z-index:2; display:flex; align-items:center; height:48px; padding:0 14px; border:none; border-right:1px solid #333; background:#1c1c1c; color:#eee; font-weight:700; cursor:pointer; }
   .topbar:has(.back) .who { padding-left:108px; }
@@ -1584,6 +1730,12 @@ const PAGE = `<!DOCTYPE html>
   .bubble { display:flex; margin:0 0 8px; }
   .bubble.mine { justify-content:flex-end; }
   .bubble.them { justify-content:flex-start; }
+  .talk-find { position:sticky; top:0; z-index:2; width:100%; box-sizing:border-box; margin:0 0 8px; padding:10px 12px; border:1px solid #444; border-radius:8px; background:#1a1a1a; color:#eee; font-size:16px; }
+  #rail .talk-find { width:calc(100% - 16px); margin:0 8px 8px; }
+  .hit-strip { flex:none; display:flex; gap:6px; overflow:auto; padding:8px 10px; background:#161616; border-bottom:1px solid #333; }
+  .hit-strip button { flex:none; max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:6px 10px; border:1px solid #444; border-radius:8px; background:#1c1c1c; color:#eee; cursor:pointer; }
+  .bubble.find .msg, .end-note.find { box-shadow:inset 3px 0 #ffb74d; }
+  .bubble.mark .msg, .end-note.mark { box-shadow:0 0 0 2px #ffb74d; }
   .bubble .msg { max-width:78%; margin:0; }
   .bubble.mine .msg { background:#2d5a3d; border-color:#2d5a3d; }
   .bubble.them .msg { background:#2d2d3d; }
@@ -1663,6 +1815,17 @@ const PAGE = `<!DOCTYPE html>
   .sw.on { background:#4CAF50; }
   .sw i { width:18px; height:18px; border-radius:50%; background:#fff; position:absolute; top:2px; left:2px; pointer-events:none; }
   .sw.on i { left:20px; }
+  .menu-dock { position:absolute; left:8px; bottom:8px; z-index:8; display:flex; flex-direction:column-reverse; align-items:flex-start; max-height:calc(100% - 16px); pointer-events:none; }
+  .menu-dock > * { pointer-events:auto; }
+  .menu-dock > .gear { width:48px; height:48px; padding:0; border-radius:10px; border:1px solid #333; background:#1c1c1c; cursor:pointer; display:flex; align-items:center; justify-content:center; }
+  .menu-dock > .gear.on { background:#2a2a2a; border-color:#666; }
+  .menu-dock .sheet { display:flex; flex-direction:column-reverse; align-items:stretch; gap:8px; width:min(300px, calc(100vw - 24px)); max-height:calc(100vh - 120px); overflow:auto; margin-bottom:8px; padding:8px; box-sizing:border-box; background:#161616; border:1px solid #333; border-radius:12px; }
+  .menu-dock .ctrl, .menu-dock .extra { margin:0; }
+  .stage:has(.menu-dock) form { padding-left:64px; }
+  .phone-alert { position:absolute; left:8px; right:8px; top:56px; z-index:12; display:flex; flex-direction:column; gap:6px; padding:10px 12px; background:#3a2416; border:1px solid #e53935; border-radius:10px; color:#eee; }
+  .phone-alert strong { font-size:14px; }
+  .phone-alert p { margin:0; color:#ffccbc; font-size:13px; white-space:pre-wrap; word-break:break-word; }
+  .phone-alert button { align-self:flex-end; padding:6px 12px; border:none; border-radius:8px; background:#e53935; color:#fff; cursor:pointer; }
 </style>
 </head>
 <body>
@@ -1684,7 +1847,7 @@ const stage = document.getElementById('stage');
 app.addEventListener('click', () => { if (jumpTab) hideJump(); });
 document.addEventListener('click', (e) => {
   if (!showControls) return;
-  if (e.target.closest('.ctrl, .extra, .gear')) return;
+  if (e.target.closest('.menu-dock, .phone-alert')) return;
   showControls = false;
   paint();
 });
@@ -1707,6 +1870,15 @@ let peopleScroll = 0;
 let peopleScrollX = 0;
 let peoplePage = 0;
 const PEOPLE_PAGE = 50;
+let talksPage = 0;
+const TALKS_PAGE = 50;
+let keepBoardScroll = false;
+let talkQuery = '';
+let talkHits = null;
+let talkFindFocus = false;
+let talkFindAt = 0;
+let talkSearchTimer = 0;
+let talkJumpKey = '';
 let faceScroll = 0;
 let userOpen = false;
 let archiveMissing = '';
@@ -1730,6 +1902,8 @@ document.body.append(relayFile);
 const picUrls = {};
 let stickBottom = false;
 let showControls = false;
+let controlHost = null;
+let phoneAlerts = [];
 let phoneOpen = false;
 let keepOpen = false;
 let openerOpen = false;
@@ -1795,6 +1969,41 @@ function toast(text) {
   el.textContent = msg;
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { if (el.isConnected) el.remove(); }, 2800);
+}
+
+function paintPhoneAlert() {
+  const sig = phoneAlerts.map(a => a.id + ' ' + a.reason).join(' | ');
+  const existing = document.querySelector('.phone-alert');
+  if (existing && existing.dataset.sig === sig) return;
+  document.querySelectorAll('.phone-alert').forEach(el => el.remove());
+  if (!token || !phoneAlerts.length) return;
+  const box = document.createElement('div');
+  box.className = 'phone-alert';
+  box.dataset.sig = sig;
+  const title = document.createElement('strong');
+  title.textContent = '手機通知沒送出';
+  box.append(title);
+  phoneAlerts.forEach(a => {
+    const line = document.createElement('p');
+    line.textContent = a.reason || '送出失敗';
+    box.append(line);
+  });
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.textContent = '知道了';
+  const ids = phoneAlerts.map(a => a.id);
+  btn.onclick = () => {
+    api('/api/phone-alerts/dismiss', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: ids })
+    }).then(() => {
+      phoneAlerts = phoneAlerts.filter(a => ids.indexOf(a.id) < 0);
+      paintPhoneAlert();
+    }).catch(err => toast(err.message || '沒關掉'));
+  };
+  box.append(btn);
+  stage.append(box);
 }
 
 function paintQueued() {
@@ -2021,20 +2230,71 @@ function paintBar(title, end, avatar, onRename) {
     };
   }
   who.append(whoText);
-  bar.append(railBtn, who);
+  const back = phoneBack();
+  if (back) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'back';
+    btn.textContent = '返回';
+    btn.onclick = back;
+    bar.append(btn, who);
+  } else bar.append(railBtn, who);
   if (end && end.dataset.side === '1') who.style.paddingRight = '120px';
   if (end) bar.append(end);
+  const mark = scriptMark();
+  if (mark) bar.append(mark);
   stage.insertBefore(bar, app);
+}
+
+function scriptMark() {
+  let best = '';
+  let bestSeen = -1;
+  sessions.forEach(s => {
+    if (!s || !s.script) return;
+    if (current && s.tabId === current) {
+      best = s.script;
+      bestSeen = Infinity;
+      return;
+    }
+    const seen = Number(s.seen) || 0;
+    if (seen < bestSeen) return;
+    best = s.script;
+    bestSeen = seen;
+  });
+  if (!best) return null;
+  const el = document.createElement('span');
+  el.className = 'ver';
+  el.textContent = best;
+  return el;
 }
 
 function controlsGear() {
   const gear = document.createElement('button');
   gear.type = 'button';
-  gear.className = 'gear menu end';
+  gear.className = 'gear menu';
   gear.setAttribute('aria-label', '控制');
   gear.append(barsIcon());
   gear.onclick = () => { showControls = !showControls; paint(); };
   return gear;
+}
+
+function paintDock() {
+  document.querySelectorAll('.menu-dock').forEach(el => el.remove());
+  if (menu !== 'chats' || !current || archiveUid) return;
+  const dock = document.createElement('div');
+  dock.className = 'menu-dock';
+  const gear = controlsGear();
+  if (showControls) gear.classList.add('on');
+  const sheet = document.createElement('div');
+  sheet.className = 'sheet';
+  if (showControls) {
+    controlHost = sheet;
+    paintControls();
+    controlHost = null;
+  }
+  dock.append(gear);
+  if (showControls) dock.append(sheet);
+  stage.append(dock);
 }
 
 function byRecent(a, b) {
@@ -2135,7 +2395,7 @@ function talkCard(t) {
   sub.className = 'preview';
   const label = document.createElement('span');
   label.className = 'preview-text';
-  label.textContent = (t.count || 0) + ' 則';
+  label.textContent = t.sample || ((t.count || 0) + ' 則');
   sub.append(label);
   const when = document.createElement('span');
   when.className = 'preview-time';
@@ -2149,7 +2409,7 @@ function talkCard(t) {
     archiveUpdated = 0;
     dropPending(current);
     current = '';
-    stickBottom = true;
+    stickBottom = !String(talkQuery || '').trim();
     closeRail();
     paint();
     loadArchive(t.uid);
@@ -2172,6 +2432,30 @@ function talkCard(t) {
   return row;
 }
 
+function phoneLayout() {
+  return window.matchMedia('(max-width:760px)').matches;
+}
+
+function phoneBack() {
+  if (!phoneLayout()) return null;
+  if (menu === 'chats' && showControls && current) return () => { showControls = false; paint(); };
+  if (menu === 'chats' && current) return () => {
+    dropPending(current);
+    current = '';
+    showControls = false;
+    app.scrollTop = 0;
+    paint();
+  };
+  if (menu === 'talks' && archiveUid) return () => {
+    archiveUid = '';
+    archiveTalk = null;
+    archiveMissing = '';
+    app.scrollTop = 0;
+    paint();
+  };
+  return null;
+}
+
 function menuBtn(key, label) {
   const btn = document.createElement('button');
   btn.type = 'button';
@@ -2179,8 +2463,11 @@ function menuBtn(key, label) {
   if (menu === key) btn.className = 'on';
   if (key === 'chats' && unreadLeft()) btn.append(redDot());
   btn.onclick = () => {
-    if (menu === key) return;
-    if (menu === 'chats' && key !== 'chats') dropPending(current);
+    const phoneList = phoneLayout() && (key === 'chats' || key === 'talks');
+    if (menu === key && !phoneList) return;
+    if (menu === 'chats' && (key !== 'chats' || phoneList)) dropPending(current);
+    if (phoneList && key === 'chats') current = '';
+    const entered = menu !== key;
     menu = key;
     showControls = false;
     userOpen = false;
@@ -2189,6 +2476,15 @@ function menuBtn(key, label) {
       archiveTalk = null;
       archiveMissing = '';
     }
+    if (key === 'talks') {
+      if (entered) talksPage = 0;
+      if (phoneLayout()) {
+        archiveUid = '';
+        archiveTalk = null;
+        archiveMissing = '';
+      }
+    }
+    if (phoneList) app.scrollTop = 0;
     closeRail();
     paint();
   };
@@ -2580,18 +2876,151 @@ function paintNav() {
   nav.replaceChildren(menuBtn('chats', '對話'), menuBtn('talks', '記錄'), menuBtn('users', '使用者管理'), menuBtn('faces', '大頭貼過濾'));
 }
 
+function queueTalkSearch() {
+  clearTimeout(talkSearchTimer);
+  const q = String(talkQuery || '').trim();
+  if (!q) {
+    talkHits = null;
+    talkJumpKey = '';
+    return;
+  }
+  talkSearchTimer = setTimeout(() => {
+    api('/api/talks-search?q=' + encodeURIComponent(q)).then(data => {
+      if (String(talkQuery || '').trim() !== q) return;
+      talkHits = data.talks || [];
+      talksPage = 0;
+      app.scrollTop = 0;
+      paint();
+    }).catch(err => toast(err.message || '搜尋失敗'));
+  }, 250);
+}
+
+function talkFind() {
+  const input = document.createElement('input');
+  input.className = 'talk-find';
+  input.placeholder = '搜尋對話記錄';
+  input.value = talkQuery;
+  input.addEventListener('compositionstart', () => { input.dataset.composing = '1'; });
+  input.addEventListener('compositionend', () => {
+    delete input.dataset.composing;
+    talkQuery = input.value;
+    talkFindAt = input.selectionStart || talkQuery.length;
+    talksPage = 0;
+    queueTalkSearch();
+    if (!String(talkQuery || '').trim()) paint();
+  });
+  input.addEventListener('input', () => {
+    talkQuery = input.value;
+    talkFindAt = input.selectionStart || talkQuery.length;
+    if (input.dataset.composing) return;
+    talksPage = 0;
+    queueTalkSearch();
+    if (!String(talkQuery || '').trim()) paint();
+  });
+  input.addEventListener('focus', () => { talkFindFocus = true; });
+  input.addEventListener('blur', () => { talkFindFocus = false; });
+  return input;
+}
+
+function restoreTalkFind() {
+  if (!talkFindFocus) return;
+  const el = document.querySelector('.talk-find');
+  if (!el) return;
+  el.focus();
+  const at = talkFindAt || 0;
+  el.setSelectionRange(at, at);
+}
+
+function shownTalks() {
+  if (String(talkQuery || '').trim()) return talkHits || [];
+  return talks;
+}
+
 function paintRail() {
   const top = rail.scrollTop;
   rail.replaceChildren();
   if (menu === 'talks') {
-    if (!talks.length) rail.append(railEmpty('還沒有對話記錄'));
-    else talks.forEach(t => rail.append(talkCard(t)));
+    rail.append(talkFind());
+    const q = String(talkQuery || '').trim();
+    const rows = shownTalks();
+    if (q && !talkHits) rail.append(railEmpty('搜尋中'));
+    else if (!rows.length) rail.append(railEmpty(q ? '沒有符合的記錄' : '還沒有對話記錄'));
+    else rows.forEach(t => rail.append(talkCard(t)));
+    restoreTalkFind();
+    if (q && !talkHits) queueTalkSearch();
   } else {
     const live = sessions.filter(s => !s.waiting).sort(byRecent);
     if (!live.length) rail.append(railEmpty('沒有正在回報的對話'));
     else live.forEach(s => rail.append(liveCard(s)));
   }
   rail.scrollTop = top;
+}
+
+function talkWindow(rows) {
+  const pages = Math.max(1, Math.ceil(rows.length / TALKS_PAGE));
+  if (talksPage > pages - 1) talksPage = pages - 1;
+  if (talksPage < 0) talksPage = 0;
+  const start = talksPage * TALKS_PAGE;
+  return { rows: rows.slice(start, start + TALKS_PAGE), page: talksPage, pages: pages, total: rows.length };
+}
+
+function talkPager(view) {
+  const bar = document.createElement('div');
+  bar.className = 'pager';
+  const prev = document.createElement('button');
+  prev.type = 'button';
+  prev.textContent = '上一頁';
+  prev.disabled = view.page <= 0;
+  prev.onclick = () => { talksPage = view.page - 1; app.scrollTop = 0; paint(); };
+  const label = document.createElement('span');
+  label.textContent = (view.page + 1) + ' / ' + view.pages + ' · ' + view.total + ' 筆';
+  const next = document.createElement('button');
+  next.type = 'button';
+  next.textContent = '下一頁';
+  next.disabled = view.page + 1 >= view.pages;
+  next.onclick = () => { talksPage = view.page + 1; app.scrollTop = 0; paint(); };
+  bar.append(prev, label, next);
+  return bar;
+}
+
+function paintLiveBoard() {
+  const y = keepBoardScroll ? app.scrollTop : 0;
+  keepBoardScroll = false;
+  clearForm();
+  paintBar('對話');
+  app.replaceChildren();
+  const list = document.createElement('div');
+  list.className = 'pick-list';
+  const live = sessions.filter(s => !s.waiting).sort(byRecent);
+  if (!live.length) list.append(railEmpty('沒有正在回報的對話'));
+  else live.forEach(s => list.append(liveCard(s)));
+  app.append(list);
+  app.scrollTop = y;
+}
+
+function paintTalkBoard() {
+  const y = keepBoardScroll ? app.scrollTop : 0;
+  keepBoardScroll = false;
+  clearForm();
+  paintBar('記錄');
+  app.replaceChildren();
+  const board = document.createElement('div');
+  board.className = 'board';
+  board.append(talkFind());
+  const q = String(talkQuery || '').trim();
+  const rows = shownTalks();
+  const view = talkWindow(rows);
+  if (view.pages > 1) board.append(talkPager(view));
+  const list = document.createElement('div');
+  list.className = 'pick-list';
+  if (q && !talkHits) list.append(railEmpty('搜尋中'));
+  else if (!rows.length) list.append(railEmpty(q ? '沒有符合的記錄' : '還沒有對話記錄'));
+  else view.rows.forEach(t => list.append(talkCard(t)));
+  board.append(list);
+  app.append(board);
+  app.scrollTop = y;
+  restoreTalkFind();
+  if (q && !talkHits) queueTalkSearch();
 }
 
 function paintArchive(talk, follow, y) {
@@ -2621,7 +3050,62 @@ function paintArchive(talk, follow, y) {
   }
   app.classList.add('thread');
   messages.forEach(paintBubble);
-  placeThread({ tabId: 'talk:' + archiveUid, messages }, follow, y);
+  const hits = talkHitsIn(talk, talkQuery);
+  paintHitStrip(hits);
+  placeThread({ tabId: 'talk:' + archiveUid, messages }, follow && !hits.length, y);
+  const key = archiveUid + ' ' + String(talkQuery || '').trim();
+  if (hits.length && talkJumpKey !== key) {
+    talkJumpKey = key;
+    jumpToMessage(hits[0].id);
+  }
+}
+
+function talkHitsIn(talk, q) {
+  const needle = String(q || '').trim().toLowerCase();
+  if (!needle || !talk) return [];
+  const hits = [];
+  (talk.messages || []).forEach(m => {
+    const text = String(m.text || '');
+    const quote = String(m.quote || '');
+    if ((text + ' ' + quote).toLowerCase().indexOf(needle) < 0) return;
+    hits.push({ id: m.id, label: (text || quote || '這則').slice(0, 40) });
+  });
+  return hits;
+}
+
+function messageNode(id) {
+  const nodes = app.querySelectorAll('[data-id]');
+  for (let i = 0; i < nodes.length; i++) if (nodes[i].dataset.id === id) return nodes[i];
+  return null;
+}
+
+function jumpToMessage(id) {
+  const node = messageNode(id);
+  if (!node) return;
+  app.querySelectorAll('.mark').forEach(el => el.classList.remove('mark'));
+  node.classList.add('mark');
+  const appRect = app.getBoundingClientRect();
+  const nodeRect = node.getBoundingClientRect();
+  app.scrollTop += nodeRect.top - appRect.top - (app.clientHeight - nodeRect.height) / 2;
+}
+
+function paintHitStrip(hits) {
+  document.querySelectorAll('.hit-strip').forEach(el => el.remove());
+  if (!hits.length) return;
+  hits.forEach(h => {
+    const node = messageNode(h.id);
+    if (node) node.classList.add('find');
+  });
+  const strip = document.createElement('div');
+  strip.className = 'hit-strip';
+  hits.forEach(h => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = h.label;
+    btn.onclick = () => jumpToMessage(h.id);
+    strip.append(btn);
+  });
+  stage.insertBefore(strip, app);
 }
 
 function paintUser(talk, follow, y) {
@@ -2750,7 +3234,7 @@ function canSend(s) {
 }
 
 function clearForm() { document.querySelectorAll('form').forEach(f => f.remove()); }
-function clearChrome() { document.querySelectorAll('.tabs,.back,.topbar,.new-msg').forEach(el => el.remove()); }
+function clearChrome() { document.querySelectorAll('.tabs,.back,.topbar,.new-msg,.hit-strip').forEach(el => el.remove()); }
 
 function placeThread(s, follow, y) {
   if (!s) return;
@@ -2864,22 +3348,20 @@ function fieldInput(value, placeholder) {
   return input;
 }
 
+function controlBox() {
+  return controlHost || app;
+}
+
 function paintControls() {
-  app.replaceChildren();
-  clearForm();
-  const room = sessions.find(x => x.tabId === current);
-  const ver = document.createElement('p');
-  ver.className = 'muted';
-  ver.style.margin = '0 0 12px';
-  ver.textContent = room && room.script ? '腳本 ' + room.script : '還沒回報腳本版本';
-  app.append(ver);
+  const host = controlBox();
+  host.replaceChildren();
   appendSendImage();
   const src = shownControls();
   if (!src) {
     const p = document.createElement('p');
     p.className = 'muted';
     p.textContent = '這個聊天室還沒回報設定。先讓那一頁開著。';
-    app.append(p);
+    host.append(p);
     appendReload();
     appendLeave();
     return;
@@ -2898,7 +3380,7 @@ function paintControls() {
   browserRow.onclick = () => flip('browser');
   const phoneRow = controlRow('手機通知', c.phone, () => flip('phone'));
   phoneRow.onclick = () => { phoneOpen = !phoneOpen; paint(); };
-  app.append(autoRow, keepRow);
+  host.append(autoRow, keepRow);
   if (keepOpen) {
     const extra = document.createElement('div');
     extra.className = 'extra';
@@ -2923,11 +3405,11 @@ function paintControls() {
     unit.textContent = '小時';
     hours.append(minInp, tilde, maxInp, unit);
     extra.append(sentence, hours);
-    app.append(extra);
+    host.append(extra);
   }
   const openerRow = controlRow('發語詞', c.opener, () => flip('opener'));
   openerRow.onclick = () => { openerOpen = !openerOpen; paint(); };
-  app.append(openerRow);
+  host.append(openerRow);
   if (openerOpen) {
     const extra = document.createElement('div');
     extra.className = 'extra';
@@ -2947,9 +3429,9 @@ function paintControls() {
       return row;
     };
     extra.append(sentence, modePick('連線成功就送', c.openerWhen !== 'id', 'now'), modePick('確認對方後再送', c.openerWhen === 'id', 'id'));
-    app.append(extra);
+    host.append(extra);
   }
-  app.append(userRow, avatarRow, browserRow, phoneRow);
+  host.append(userRow, avatarRow, browserRow, phoneRow);
   if (phoneOpen) {
     const extra = document.createElement('div');
     extra.className = 'extra';
@@ -2982,7 +3464,7 @@ function paintControls() {
       }).then(sendTest).catch(err => { controlDraft = null; toast(err.message || '測試失敗'); paint(); });
     };
     extra.append(topic, title, test);
-    app.append(extra);
+    host.append(extra);
   }
   appendReload();
   appendLeave();
@@ -3008,13 +3490,22 @@ function postAvatar(s, on) {
 
 function postUser(s, on) {
   if (!s || !s.openings) return;
+  if (!s.partnerUid) { toast('還沒讀到對方 id'); return; }
+  const person = people.find(p => p.uid === s.partnerUid);
+  const prev = person ? !!person.filtered : false;
+  if (person) person.filtered = !!on;
   userDraft = { tabId: s.tabId, channelId: s.channelId, on: !!on };
   paint();
   api('/api/sessions/' + encodeURIComponent(s.tabId) + '/user', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ on: !!on })
-  }).catch(err => { userDraft = null; toast(err.message || '設定失敗'); paint(); });
+  }).catch(err => {
+    userDraft = null;
+    if (person) person.filtered = prev;
+    toast(err.message || '設定失敗');
+    paint();
+  });
 }
 
 function shownOpenings(s) {
@@ -3030,6 +3521,7 @@ function paintBubble(m) {
     const note = document.createElement('p');
     note.className = 'end-note';
     note.textContent = m.text || (m.end === 'idle' ? '閒置時間過久' : m.end === 'them' ? '對方離開' : '我主動離開');
+    if (m.id) note.dataset.id = m.id;
     app.append(note);
     return note;
   }
@@ -3137,6 +3629,18 @@ function syncMenuDot() {
 
 function refreshList() {
   paintNav();
+  if (phoneLayout() && menu === 'chats' && !current && !showControls && !archiveUid) {
+    keepBoardScroll = true;
+    paintLiveBoard();
+    syncMenuDot();
+    return;
+  }
+  if (phoneLayout() && menu === 'talks' && !archiveUid) {
+    keepBoardScroll = true;
+    paintTalkBoard();
+    syncMenuDot();
+    return;
+  }
   paintRail();
   syncMenuDot();
   paintQueued();
@@ -3191,6 +3695,7 @@ function paintOpening(s) {
 function reloadPage(s) {
   if (!s) return;
   showControls = false;
+  dropPending(s.tabId);
   paint();
   api('/api/sessions/' + encodeURIComponent(s.tabId) + '/reload', { method: 'POST' })
     .catch(err => toast(err.message || '重新整理失敗'));
@@ -3209,7 +3714,7 @@ function appendSendImage() {
     paint();
     relayFile.click();
   };
-  app.append(btn);
+  (controlHost || app).append(btn);
 }
 
 function appendReload() {
@@ -3221,7 +3726,7 @@ function appendReload() {
   btn.textContent = '重新整理';
   btn.style.justifyContent = 'flex-start';
   btn.onclick = () => reloadPage(s);
-  app.append(btn);
+  (controlHost || app).append(btn);
 }
 
 function leaveChat(s) {
@@ -3242,7 +3747,7 @@ function appendLeave() {
   leave.style.color = '#e53935';
   leave.style.justifyContent = 'flex-start';
   leave.onclick = () => leaveChat(s);
-  app.append(leave);
+  (controlHost || app).append(leave);
 }
 
 function startChat(s) {
@@ -3294,7 +3799,7 @@ function syncPhaseForm(s) {
 }
 
 function threadActions() {
-  return controlsGear();
+  return null;
 }
 
 function paintTyping(on) {
@@ -3352,6 +3857,8 @@ function paintThread(s, follow, y) {
 }
 
 function paint() {
+  const keepDock = showControls && document.activeElement && document.activeElement.tagName === 'INPUT' && document.activeElement.closest && document.activeElement.closest('.menu-dock');
+  try {
   app.classList.remove('thread');
   if (!token) { clearForm(); return gate(); }
   document.body.classList.remove('locked');
@@ -3377,11 +3884,15 @@ function paint() {
   }
   if (menu === 'talks') {
     hideJump();
-    paintRail();
+    if (!phoneLayout()) paintRail();
     if (archiveUid) {
       const y = app.scrollTop;
       const follow = stickBottom || nearBottom();
       paintArchive(archiveTalk, follow, y);
+      return;
+    }
+    if (phoneLayout()) {
+      paintTalkBoard();
       return;
     }
     clearForm();
@@ -3393,15 +3904,10 @@ function paint() {
     app.append(p);
     return;
   }
-  paintRail();
-  if (showControls) {
+  if (!phoneLayout()) paintRail();
+  if (phoneLayout() && !showControls && !archiveUid && !current) {
     hideJump();
-    const editing = document.activeElement && document.activeElement.tagName === 'INPUT' && document.activeElement.closest && document.activeElement.closest('#app');
-    if (!editing) {
-      const s = sessions.find(x => x.tabId === current);
-      paintBar((s && s.title) || '控制', controlsGear());
-      paintControls();
-    }
+    paintLiveBoard();
     return;
   }
   if (archiveUid) {
@@ -3521,6 +4027,10 @@ function paint() {
   paintQueued(s);
   if (keepInput && document.activeElement === keepInput) input.focus();
   if (follow) scrollBottom();
+  } finally {
+    if (!keepDock) paintDock();
+    paintPhoneAlert();
+  }
 }
 
 function plainFace() {
@@ -3654,6 +4164,8 @@ async function tick() {
     if (menu === 'users' || menu === 'faces') ask.push('people=1');
     const data = await api('/api/sessions?' + ask.join('&'));
     sessions = data.sessions || [];
+    phoneAlerts = Array.isArray(data.phoneAlerts) ? data.phoneAlerts : [];
+    paintPhoneAlert();
     const otherPing = noteRooms(sessions);
     const freshTalks = data.talks || [];
     for (const uid of [...droppedTalks]) {
@@ -3680,7 +4192,7 @@ async function tick() {
       dropPending(current);
       current = '';
     }
-    const openLive = menu === 'chats' && current && !showControls && !archiveUid;
+    const openLive = menu === 'chats' && current && !archiveUid;
     if (!openLive) {
       hideJump();
       const leftOpen = menu === 'chats' && !showControls && !archiveUid && prevCurrent && !current;
@@ -3734,6 +4246,13 @@ async function loop() {
   }
 }
 document.addEventListener('visibilitychange', () => { tick(); });
+window.matchMedia('(max-width:760px)').addEventListener('change', () => { if (token) paint(); });
+window.addEventListener('pageshow', () => {
+  const ids = Object.keys(pendingMine);
+  if (!ids.length) return;
+  ids.forEach(dropPending);
+  paint();
+});
 document.getElementById('shade').onclick = () => closeRail();
 let edgeSwipe = null;
 document.addEventListener('pointerdown', (e) => {
@@ -3765,6 +4284,7 @@ function storedHasConv(file) {
 function main() {
     loadDropped();
     loadFilters();
+    loadPhoneAlerts();
     const sessions = loadSessions();
     const talks = loadTalks();
     if (talksNeedYear || storedHasConv(TALK_FILE)) saveTalks(talks);
@@ -3789,9 +4309,12 @@ function main() {
                     await waitUntil(POLL_MS, req, () => revision !== seen);
                 }
                 if (clientGone(req, res)) return;
-                const view = { sessions: visibleSessions(sessions, Date.now(), WAIT_MS), talks: visibleTalks(talks) };
+                const view = { sessions: visibleSessions(sessions, Date.now(), WAIT_MS), talks: visibleTalks(talks), phoneAlerts };
                 if (url.searchParams.get('people') === '1') view.people = visiblePeople(people);
                 return send(res, 200, view);
+            }
+            if (req.method === 'GET' && url.pathname === '/api/talks-search') {
+                return send(res, 200, { talks: searchTalks(talks, url.searchParams.get('q')) });
             }
             const talkMatch = url.pathname.match(/^\/api\/talks\/([A-Za-z0-9_-]{6,128})$/);
             if (req.method === 'GET' && talkMatch) {
@@ -3973,9 +4496,19 @@ function main() {
             if (req.method === 'POST' && reloadPost) {
                 const session = sessions.get(reloadPost[1]);
                 if (!session) return send(res, 404, { error: 'gone' });
-                session.reloadWanted = true;
+                requestReload(session);
                 touch();
                 saveSessions(sessions);
+                return send(res, 200, { ok: true });
+            }
+            if (req.method === 'POST' && url.pathname === '/api/phone-alerts') {
+                const body = await readBody(req);
+                notePhoneAlert(body && body.reason);
+                return send(res, 200, { ok: true });
+            }
+            if (req.method === 'POST' && url.pathname === '/api/phone-alerts/dismiss') {
+                const body = await readBody(req);
+                clearPhoneAlerts(body && body.ids);
                 return send(res, 200, { ok: true });
             }
             const notifyPost = url.pathname.match(/^\/api\/sessions\/([a-z0-9]{8,40})\/notify-test$/);
@@ -4015,7 +4548,8 @@ function main() {
                 const session = sessions.get(userPost[1]);
                 if (!session) return send(res, 404, { error: 'gone' });
                 const body = await readBody(req);
-                session.userWanted = !!body.on;
+                if (!markSessionUser(session, !!body.on)) return send(res, 409, { error: 'no user' });
+                saveFilters();
                 saveSessions(sessions);
                 touch();
                 return send(res, 200, { ok: true });
