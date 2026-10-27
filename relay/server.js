@@ -593,6 +593,54 @@ function cleanScriptVersion(raw) {
     return /^[0-9]+\.[0-9]+\.[0-9]+$/.test(s) ? s : '';
 }
 
+// ponytail: 配對頁沒有訊息列就清空這一輪畫面。舊對話留在記錄裡。
+function pairingSurface(body) {
+    return !!(body && (body.lobby || body.phase || body.status === 'left') && !(body.messages && body.messages.length));
+}
+
+// ponytail: 等待連線排最上面。有舊訊息的離開中排第二，進行中的對話依最後一則時間。
+function liveRank(s) {
+    const connect = !!(s && (s.lobby || s.status === 'left' || s.phase));
+    if (!connect) return 0;
+    return (s.messages && s.messages.length) ? 1 : 2;
+}
+
+function quoteKey(s) {
+    return String(s || '').replace(/\s+/g, ' ').trim();
+}
+
+// ponytail: 引用只存文字。全文對上最近的前一則；對不上才往前掃前綴，最壞每則引用都掃過整段。同樣文字有多則時跳到最近的前一則。圖片引用找最近一張沒有文字的圖。
+function quoteTargets(messages) {
+    const list = messages || [];
+    const seen = new Map();
+    const keys = [];
+    const out = [];
+    for (let i = 0; i < list.length; i++) {
+        const m = list[i] || {};
+        const q = quoteKey(m.quote);
+        let target = q && seen.has(q) ? seen.get(q) : '';
+        if (q && !target && q !== '圖片' && q.length >= 8) {
+            for (let j = i - 1; j >= 0; j--) {
+                const text = keys[j];
+                if (!text || text.length < 8) continue;
+                if (text.indexOf(q) === 0 || q.indexOf(text) === 0) {
+                    target = (list[j] && list[j].id) || '';
+                    break;
+                }
+            }
+        }
+        out.push(target || '');
+        const text = m.end ? '' : quoteKey(m.text);
+        keys.push(text);
+        if (m.end) continue;
+        if (text) {
+            seen.set(text, m.id || '');
+            if (text.length > 200) seen.set(text.slice(0, 200), m.id || '');
+        } else if (m.image) seen.set('圖片', m.id || '');
+    }
+    return out;
+}
+
 function applyHeartbeat(sessions, body, now) {
     const tabId = String(body && body.tabId || '').trim();
     if (!/^[a-z0-9]{8,40}$/.test(tabId)) return null;
@@ -619,13 +667,11 @@ function applyHeartbeat(sessions, body, now) {
         leaveWanted: !!(prev && prev.leaveWanted),
         reloadWanted: !!(prev && prev.reloadWanted),
         status: body.status === 'left' ? 'left' : 'live',
-        messages: (body.lobby || body.phase) && !(body.messages && body.messages.length) && prev && prev.messages && prev.messages.length
-            ? prev.messages
-            : keepRecalled(cleanMessages(body.messages), prev && prev.messages),
+        messages: pairingSurface(body) ? [] : keepRecalled(cleanMessages(body.messages), prev && prev.messages),
         seen: now,
-        openings: body.openings
+        openings: pairingSurface(body) ? null : (body.openings
             ? cleanOpenings(body.openings, sameChannel ? prev.openings : null, now)
-            : (sameChannel && prev && prev.openings) || null,
+            : (sameChannel && prev && prev.openings) || null),
         avatarWanted: sameChannel && prev && typeof prev.avatarWanted === 'boolean' ? prev.avatarWanted : null,
         userWanted: sameChannel && prev && typeof prev.userWanted === 'boolean' ? prev.userWanted : null,
         controls: keepControls(cleanControls(body.controls), body.controls, prev),
@@ -772,8 +818,12 @@ function cleanControls(raw) {
         keepMax,
         opener: !!raw.opener,
         openerText: String(raw.openerText || '').trim().slice(0, 200),
-        openerWhen: raw.openerWhen === 'id' ? 'id' : 'now'
+        openerWhen: openerMode(raw.openerWhen)
     };
+}
+
+function openerMode(when) {
+    return when === 'id' || when === 'off' ? when : 'now';
 }
 
 function keepControls(next, raw, prev) {
@@ -790,7 +840,7 @@ function keepControls(next, raw, prev) {
     if (!(raw && Object.prototype.hasOwnProperty.call(raw, 'openerWhen'))) {
         kept.opener = !!old.opener;
         kept.openerText = String(old.openerText || '').trim().slice(0, 200);
-        kept.openerWhen = old.openerWhen === 'id' ? 'id' : 'now';
+        kept.openerWhen = openerMode(old.openerWhen);
     }
     return kept;
 }
@@ -1027,6 +1077,19 @@ function selfCheck() {
     if (!rememberTalk(endTalks, endBody, endAt)) throw new Error('knock relay 檢查失敗');
     const endMsg = endTalks.get('user_endnote1').messages[0];
     if (!endMsg || endMsg.end !== 'idle' || endMsg.text !== '閒置時間過久' || endMsg.time !== '2020/01/02 08:00') throw new Error('knock relay 檢查失敗');
+    const quoteHits = quoteTargets([
+        { id: 'a', text: '你好啊今天' },
+        { id: 'b', text: '嗯', quote: '你好啊今天' },
+        { id: 'c', text: '', image: 'abcd1234' },
+        { id: 'd', text: '看', quote: '圖片' },
+        { id: 'e', text: '重複一句' },
+        { id: 'f', text: '重複一句' },
+        { id: 'g', text: '再', quote: '重複一句' },
+        { id: 'h', text: '這是一段比較長的句子用來當引用' },
+        { id: 'i', text: '回', quote: '這是一段比較長的' },
+        { id: 'j', text: '孤立', quote: '沒有這句' }
+    ]);
+    if (quoteHits.join() !== ',a,,c,,,f,,h,') throw new Error('knock relay 檢查失敗');
     if (rememberTalk(endTalks, endBody, endAt + 3600000) || endTalks.get('user_endnote1').messages.length !== 1) throw new Error('knock relay 檢查失敗');
     const revBox = new Map();
     const revBefore = peopleRev;
@@ -1082,14 +1145,17 @@ function selfCheck() {
         || cleanControls({ keepText: '  ' }).keepText !== '🎶'
         || cleanControls({ openerWhen: 'id', openerText: ' 早 ' }).openerWhen !== 'id'
         || cleanControls({ openerText: ' 早 ' }).openerText !== '早'
-        || cleanControls({ openerWhen: 'later' }).openerWhen !== 'now') {
+        || cleanControls({ openerWhen: 'later' }).openerWhen !== 'now'
+        || cleanControls({ openerWhen: 'off' }).openerWhen !== 'off') {
         throw new Error('knock relay 檢查失敗');
     }
     const prevOpener = cleanControls({ opener: 1, openerText: '早', openerWhen: 'id', keep: 1, keepText: '在嗎', keepMin: 1, keepMax: 2, phoneTopic: 'ok' });
     const keptOpener = keepControls(cleanControls({ auto: 1, phoneTopic: 'ok' }), { auto: 1, phoneTopic: 'ok' }, { controls: prevOpener });
     const replacedOpener = keepControls(cleanControls({ opener: 0, openerText: '', openerWhen: 'now', phoneTopic: 'ok' }), { openerWhen: 'now', phoneTopic: 'ok' }, { controls: prevOpener });
+    const keptOff = keepControls(cleanControls({ auto: 1, phoneTopic: 'ok' }), { auto: 1, phoneTopic: 'ok' }, { controls: cleanControls({ opener: 1, openerText: '早', openerWhen: 'off', phoneTopic: 'ok' }) });
     if (!keptOpener || !keptOpener.opener || keptOpener.openerText !== '早' || keptOpener.openerWhen !== 'id'
-        || !keptOpener.keep || replacedOpener.opener || replacedOpener.openerWhen !== 'now' || replacedOpener.openerText) {
+        || !keptOpener.keep || replacedOpener.opener || replacedOpener.openerWhen !== 'now' || replacedOpener.openerText
+        || !keptOff || keptOff.openerWhen !== 'off') {
         throw new Error('knock relay 檢查失敗');
     }
     const firstOpen = applyHeartbeat(sessions, {
@@ -1176,7 +1242,20 @@ function selfCheck() {
     const keptLobby = applyHeartbeat(sessions, {
         tabId: 'abc12345', title: '大廳', canType: false, lobby: true, greeting: '你好', messages: []
     }, 18600);
-    if (!keptLobby || !keptLobby.lobby || keptLobby.messages.length !== 1 || keptLobby.messages[0].text !== '嗨') {
+    const paired = applyHeartbeat(sessions, {
+        tabId: 'pairtab01', title: '甲', canType: true, channelId: 'c9',
+        messages: [{ id: 'm1', text: '嗨', mine: false }],
+        openings: { them: '嗨', mine: '早', avatar: 'abcd1234' }
+    }, 18650);
+    const clearedPair = applyHeartbeat(sessions, {
+        tabId: 'pairtab01', title: '甲', canType: false, channelId: 'c9', phase: '配對中', messages: []
+    }, 18700);
+    if (!keptLobby || !keptLobby.lobby || keptLobby.messages.length
+        || !paired || paired.messages.length !== 1 || !paired.openings
+        || !clearedPair || clearedPair.messages.length || clearedPair.openings
+        || liveRank(clearedPair) <= liveRank(paired)
+        || liveRank({ status: 'left', messages: [{ id: 'm1' }] }) <= liveRank({ canType: true, messages: [{ id: 'm1' }] })
+        || liveRank({ phase: '配對中', messages: [] }) <= liveRank({ status: 'left', messages: [{ id: 'm1' }] })) {
         throw new Error('knock relay 檢查失敗');
     }
     const noted = applyHeartbeat(sessions, {
@@ -1741,6 +1820,7 @@ const PAGE = `<!DOCTYPE html>
   .bubble.them .msg { background:#2d2d3d; }
   .msg { padding:8px 10px; white-space:pre-wrap; word-break:break-word; }
   .quote { font-size:12px; color:rgba(255,255,255,.7); border-left:2px solid rgba(255,255,255,.35); padding-left:6px; margin-bottom:6px; }
+  .quote.jump { cursor:pointer; }
   .msg img.pic { display:block; max-width:100%; max-height:240px; border-radius:6px; margin-top:6px; cursor:pointer; }
   #zoom.pic { padding:0; }
   #zoom.pic img { width:auto; height:auto; max-width:100%; max-height:100%; object-fit:contain; min-width:0; min-height:0; }
@@ -1819,6 +1899,7 @@ const PAGE = `<!DOCTYPE html>
   .menu-dock > * { pointer-events:auto; }
   .menu-dock > .gear { width:48px; height:48px; padding:0; border-radius:10px; border:1px solid #333; background:#1c1c1c; cursor:pointer; display:flex; align-items:center; justify-content:center; }
   .menu-dock > .gear.on { background:#2a2a2a; border-color:#666; }
+  .menu-dock .ctrl.on { border-color:#666; }
   .menu-dock .sheet { display:flex; flex-direction:column-reverse; align-items:stretch; gap:8px; width:min(300px, calc(100vw - 24px)); max-height:calc(100vh - 120px); overflow:auto; margin-bottom:8px; padding:8px; box-sizing:border-box; background:#161616; border:1px solid #333; border-radius:12px; }
   .menu-dock .ctrl, .menu-dock .extra { margin:0; }
   .stage:has(.menu-dock) form { padding-left:64px; }
@@ -1838,7 +1919,7 @@ const PAGE = `<!DOCTYPE html>
 </div>
 <button type="button" id="shade" aria-label="關閉列表"></button>
 <script>
-` + themTailId.toString() + '\n' + ownEchoPlan.toString() + '\n' + composerAlert.toString() + '\n' + faceRows.toString() + `
+` + themTailId.toString() + '\n' + ownEchoPlan.toString() + '\n' + composerAlert.toString() + '\n' + faceRows.toString() + '\n' + liveRank.toString() + '\n' + quoteKey.toString() + '\n' + quoteTargets.toString() + `
 const TOKEN_KEY = 'knockRelayPageToken';
 const app = document.getElementById('app');
 const nav = document.getElementById('nav');
@@ -1904,8 +1985,9 @@ let stickBottom = false;
 let showControls = false;
 let controlHost = null;
 let phoneAlerts = [];
-let phoneOpen = false;
 let keepOpen = false;
+let notifyOpen = false;
+let filterOpen = false;
 let openerOpen = false;
 let controlDraft = null;
 let avatarDraft = null;
@@ -2298,7 +2380,9 @@ function paintDock() {
 }
 
 function byRecent(a, b) {
-  return lastMessageAt(b) - lastMessageAt(a) || (a.tabId < b.tabId ? -1 : a.tabId > b.tabId ? 1 : 0);
+  const rank = liveRank(b) - liveRank(a);
+  if (rank) return rank;
+  return lastMessageAt(b) - lastMessageAt(a) || (b.seen || 0) - (a.seen || 0) || (a.tabId < b.tabId ? -1 : a.tabId > b.tabId ? 1 : 0);
 }
 
 function trashIcon() {
@@ -2439,13 +2523,7 @@ function phoneLayout() {
 function phoneBack() {
   if (!phoneLayout()) return null;
   if (menu === 'chats' && showControls && current) return () => { showControls = false; paint(); };
-  if (menu === 'chats' && current) return () => {
-    dropPending(current);
-    current = '';
-    showControls = false;
-    app.scrollTop = 0;
-    paint();
-  };
+  if (menu === 'chats' && current) return () => { leavePhoneChat(); };
   if (menu === 'talks' && archiveUid) return () => {
     archiveUid = '';
     archiveTalk = null;
@@ -2454,6 +2532,14 @@ function phoneBack() {
     paint();
   };
   return null;
+}
+
+function leavePhoneChat() {
+  dropPending(current);
+  current = '';
+  showControls = false;
+  app.scrollTop = 0;
+  paint();
 }
 
 function menuBtn(key, label) {
@@ -2712,7 +2798,7 @@ function peopleRow(p) {
   const flag = document.createElement('td');
   flag.append(filterSwitch(p, true));
   flag.onclick = (e) => e.stopPropagation();
-  tr.append(face, flag, name, id, when, meets, count);
+  tr.append(face, flag, count, name, id, when, meets);
   tr.onclick = () => openPerson(p);
   return tr;
 }
@@ -2737,7 +2823,7 @@ function peopleTable(rows) {
   const table = document.createElement('table');
   const head = document.createElement('thead');
   const hr = document.createElement('tr');
-  ['', '過濾使用者', '名稱', '使用者 id', '第一次', '遇到', '對話量'].forEach(text => {
+  ['', '過濾使用者', '對話量', '名稱', '使用者 id', '第一次', '遇到'].forEach(text => {
     const th = document.createElement('th');
     th.textContent = text;
     hr.append(th);
@@ -3049,7 +3135,7 @@ function paintArchive(talk, follow, y) {
     return;
   }
   app.classList.add('thread');
-  messages.forEach(paintBubble);
+  paintMessages(messages);
   const hits = talkHitsIn(talk, talkQuery);
   paintHitStrip(hits);
   placeThread({ tabId: 'talk:' + archiveUid, messages }, follow && !hits.length, y);
@@ -3171,7 +3257,7 @@ function paintUser(talk, follow, y) {
     app.append(p);
     return;
   }
-  messages.forEach(paintBubble);
+  paintMessages(messages);
   placeThread({ tabId: 'talk:' + uid, messages }, follow, y);
 }
 
@@ -3297,7 +3383,7 @@ function packControls(c) {
     keepMax: max,
     opener: !!c.opener,
     openerText: String(c.openerText || '').trim().slice(0, 200),
-    openerWhen: c.openerWhen === 'id' ? 'id' : 'now'
+    openerWhen: c.openerWhen === 'id' || c.openerWhen === 'off' ? c.openerWhen : 'now'
   };
 }
 
@@ -3348,6 +3434,19 @@ function fieldInput(value, placeholder) {
   return input;
 }
 
+function folderRow(label, open) {
+  const row = document.createElement('button');
+  row.type = 'button';
+  row.className = 'ctrl' + (open ? ' on' : '');
+  const name = document.createElement('span');
+  name.textContent = label;
+  const mark = document.createElement('span');
+  mark.textContent = open ? '收合' : '展開';
+  mark.style.color = '#888';
+  row.append(name, mark);
+  return row;
+}
+
 function controlBox() {
   return controlHost || app;
 }
@@ -3356,13 +3455,13 @@ function paintControls() {
   const host = controlBox();
   host.replaceChildren();
   appendSendImage();
+  appendReload();
   const src = shownControls();
   if (!src) {
     const p = document.createElement('p');
     p.className = 'muted';
     p.textContent = '這個聊天室還沒回報設定。先讓那一頁開著。';
     host.append(p);
-    appendReload();
     appendLeave();
     return;
   }
@@ -3379,7 +3478,7 @@ function paintControls() {
   const browserRow = controlRow('瀏覽器通知', c.browser, () => flip('browser'));
   browserRow.onclick = () => flip('browser');
   const phoneRow = controlRow('手機通知', c.phone, () => flip('phone'));
-  phoneRow.onclick = () => { phoneOpen = !phoneOpen; paint(); };
+  phoneRow.onclick = () => flip('phone');
   host.append(autoRow, keepRow);
   if (keepOpen) {
     const extra = document.createElement('div');
@@ -3407,12 +3506,14 @@ function paintControls() {
     extra.append(sentence, hours);
     host.append(extra);
   }
-  const openerRow = controlRow('發語詞', c.opener, () => flip('opener'));
+  const openerRow = folderRow('發語詞', openerOpen);
   openerRow.onclick = () => { openerOpen = !openerOpen; paint(); };
   host.append(openerRow);
   if (openerOpen) {
     const extra = document.createElement('div');
     extra.className = 'extra';
+    const onRow = controlRow('開啟', c.opener, () => flip('opener'));
+    onRow.onclick = () => flip('opener');
     const sentence = fieldInput(c.openerText, '連線後送出這句');
     sentence.onchange = () => postControls(Object.assign({}, c, { openerText: sentence.value }));
     const modePick = (label, on, when) => {
@@ -3424,15 +3525,46 @@ function paintControls() {
       row.append(box, document.createTextNode(label));
       row.onclick = (ev) => {
         ev.preventDefault();
-        postControls(Object.assign({}, c, { openerWhen: when }));
+        postControls(Object.assign({}, c, { openerWhen: on ? 'off' : when }));
       };
       return row;
     };
-    extra.append(sentence, modePick('連線成功就送', c.openerWhen !== 'id', 'now'), modePick('確認對方後再送', c.openerWhen === 'id', 'id'));
+    const sendNow = document.createElement('button');
+    sendNow.type = 'button';
+    sendNow.textContent = '現在送出';
+    sendNow.onclick = () => {
+      const room = sessions.find(x => x.tabId === current);
+      const text = sentence.value.trim();
+      if (!text) { toast('請先寫發語詞'); return; }
+      if (!room || !canSend(room)) { toast('現在不能送'); return; }
+      showLocalMine(room.tabId, text);
+      if (text !== c.openerText) postControls(Object.assign({}, c, { openerText: text }));
+      else paint();
+      api('/api/sessions/' + encodeURIComponent(room.tabId) + '/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: text })
+      }).catch(err => {
+        undoLocalMine(room.tabId);
+        toast(err.message || '送出失敗');
+      });
+    };
+    extra.append(onRow, sentence, modePick('連線成功就送', c.openerWhen === 'now', 'now'), modePick('確認對方後再送', c.openerWhen === 'id', 'id'), sendNow);
     host.append(extra);
   }
-  host.append(userRow, avatarRow, browserRow, phoneRow);
-  if (phoneOpen) {
+  const filterRow = folderRow('過濾', filterOpen);
+  filterRow.onclick = () => { filterOpen = !filterOpen; paint(); };
+  host.append(filterRow);
+  if (filterOpen) {
+    const extra = document.createElement('div');
+    extra.className = 'extra';
+    extra.append(userRow, avatarRow);
+    host.append(extra);
+  }
+  const notifyRow = folderRow('通知', notifyOpen);
+  notifyRow.onclick = () => { notifyOpen = !notifyOpen; paint(); };
+  host.append(notifyRow);
+  if (notifyOpen) {
     const extra = document.createElement('div');
     extra.className = 'extra';
     const topic = fieldInput(c.phoneTopic, 'ntfy 主題');
@@ -3463,10 +3595,9 @@ function paintControls() {
         body: JSON.stringify(packed)
       }).then(sendTest).catch(err => { controlDraft = null; toast(err.message || '測試失敗'); paint(); });
     };
-    extra.append(topic, title, test);
+    extra.append(browserRow, phoneRow, topic, title, test);
     host.append(extra);
   }
-  appendReload();
   appendLeave();
 }
 
@@ -3516,11 +3647,22 @@ function shownOpenings(s) {
   return o;
 }
 
-function paintBubble(m) {
+function paintMessages(list) {
+  const targets = quoteTargets(list || []);
+  (list || []).forEach((m, i) => paintBubble(m, targets[i]));
+}
+
+function paintBubble(m, quoteId) {
   if (m && m.end) {
     const note = document.createElement('p');
     note.className = 'end-note';
     note.textContent = m.text || (m.end === 'idle' ? '閒置時間過久' : m.end === 'them' ? '對方離開' : '我主動離開');
+    if (m.time) {
+      const time = document.createElement('span');
+      time.className = 'time';
+      time.textContent = m.time;
+      note.append(time);
+    }
     if (m.id) note.dataset.id = m.id;
     app.append(note);
     return note;
@@ -3531,8 +3673,9 @@ function paintBubble(m) {
   row.className = 'msg';
   if (m.quote) {
     const quote = document.createElement('div');
-    quote.className = 'quote';
+    quote.className = 'quote' + (quoteId ? ' jump' : '');
     quote.textContent = m.quote;
+    if (quoteId) quote.onclick = () => jumpToMessage(quoteId);
     row.append(quote);
   }
   if (m.text) {
@@ -3843,7 +3986,7 @@ function paintThread(s, follow, y) {
   }
   app.classList.add('thread');
   paintOpening(s);
-  (s.messages || []).forEach(paintBubble);
+  paintMessages(s.messages || []);
   replayPending(s.tabId);
   if (s.status === 'left') {
     const note = document.createElement('p');
@@ -4264,7 +4407,12 @@ document.addEventListener('pointerup', (e) => {
   const dx = e.clientX - edgeSwipe.x;
   const dy = e.clientY - edgeSwipe.y;
   edgeSwipe = null;
-  if (dx >= 48 && dx > Math.abs(dy)) document.body.classList.add('rail-open');
+  if (dx < 48 || dx <= Math.abs(dy)) return;
+  if (phoneLayout() && menu === 'chats' && current) {
+    leavePhoneChat();
+    return;
+  }
+  document.body.classList.add('rail-open');
 });
 document.addEventListener('pointercancel', () => { edgeSwipe = null; });
 loop();

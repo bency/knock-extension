@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Knock.tw Auto Clicker
 // @namespace    http://tampermonkey.net/
-// @version      1.4.118
+// @version      1.4.119
 // @description  Automatically click the "Re-match" and "Confirm Exit" buttons on Knock.tw, with conversation blacklist, avatar matching, and conversation saving features
 // @author       Antigravity
 // @match        https://knock.tw/*
@@ -53,7 +53,7 @@
     const RELAY_TOKEN_KEY = 'knockRelayToken';
     const RELAY_TAB_KEY = 'knockRelayTabId';
     const TYPING_RE = /對方正在輸入|正在輸入|typing/i;
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.118';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.119';
     const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     const DOCK_OPEN_KEY = 'knockDockOpen';
     const OLD_FLOAT_IDS = [
@@ -2397,8 +2397,12 @@
         if (browserNotifyEnabled) showBrowserNotification(body, 'Knock 持續連線');
     }
 
+    function openerMode(when) {
+        return when === 'id' || when === 'off' ? when : 'now';
+    }
+
     function openerPlan(on, text, when, channel, sentChannel, ready, hasMine, uid, filtered) {
-        if (!on || !String(text || '').trim() || !channel || !ready) return 'skip';
+        if (!on || !String(text || '').trim() || !channel || !ready || when === 'off') return 'skip';
         if (sentChannel === channel || hasMine) return 'done';
         if (when === 'id') {
             if (!uid) return 'wait';
@@ -2914,7 +2918,7 @@
             keepMax,
             opener: openerEnabled,
             openerText: String(openerText || '').trim().slice(0, 200),
-            openerWhen: openerWhen === 'id' ? 'id' : 'now'
+            openerWhen: openerMode(openerWhen)
         };
     }
 
@@ -2923,8 +2927,8 @@
         const title = String(next.phoneTitle || '').trim() || 'Knock 新訊息';
         const hours = keepRange(next.keepMin, next.keepMax);
         const curHours = keepRange(cur.keepMin, cur.keepMax);
-        const when = next.openerWhen === 'id' ? 'id' : 'now';
-        const curWhen = cur.openerWhen === 'id' ? 'id' : 'now';
+        const when = openerMode(next.openerWhen);
+        const curWhen = openerMode(cur.openerWhen);
         return !!next.auto === !!cur.auto
             && !!next.userFilter === !!cur.userFilter
             && !!next.avatarFilter === !!cur.avatarFilter
@@ -2964,7 +2968,7 @@
         keepMax = nextKeep.max;
         openerEnabled = !!c.opener;
         openerText = String(c.openerText || '').trim().slice(0, 200);
-        openerWhen = c.openerWhen === 'id' ? 'id' : 'now';
+        openerWhen = openerMode(c.openerWhen);
         if (hoursChanged) keepAliveWaitMs = 0;
         saveRoomControls();
         const dock = el('knock-dock');
@@ -3717,6 +3721,7 @@
             || openerPlan(true, '嗨', 'id', 'c1', '', true, false, '', false) !== 'wait'
             || openerPlan(true, '嗨', 'id', 'c1', '', true, false, 'u1', true) !== 'skip'
             || openerPlan(true, '嗨', 'id', 'c1', '', true, false, 'u1', false) !== 'send'
+            || openerPlan(true, '嗨', 'off', 'c1', '', true, false, 'u1', false) !== 'skip'
             || phaseTextPlan('開始聊天 2', '', '', false, false) !== '開始聊天 2'
             || phaseTextPlan('', '開始聊天', '', false, false) !== '開始聊天'
             || phaseTextPlan('', '', '重新配對', true, false) !== '重新配對'
